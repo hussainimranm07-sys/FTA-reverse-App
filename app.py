@@ -138,6 +138,31 @@ def is_active_file(name):
 def export_json(nodes):
     return json.dumps(nodes, indent=2).encode("utf-8")
 
+def sanitize_xl(val):
+    """Make any value safe for openpyxl cell writes.
+    Uses openpyxl's own ILLEGAL_CHARACTERS_RE to strip bad chars,
+    then falls back to ASCII-only encoding if anything remains problematic.
+    Numbers are passed through unchanged.
+    """
+    if val is None:
+        return "-"
+    if isinstance(val, (int, float)):
+        return val  # numbers always safe
+    s = str(val)
+    try:
+        # Use openpyxl's own checker to strip illegal chars
+        from openpyxl.utils.exceptions import IllegalCharacterError
+        from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+        s = ILLEGAL_CHARACTERS_RE.sub('', s)
+    except ImportError:
+        pass
+    # Final fallback: encode to ascii, replacing anything non-ascii
+    try:
+        s.encode('utf-8')
+    except Exception:
+        s = s.encode('ascii', 'replace').decode('ascii')
+    return s or "-"
+
 def export_excel(nodes):
     try:
         import openpyxl
@@ -182,17 +207,17 @@ def export_excel(nodes):
             is_shared = len(node.get("parentIds") or []) > 1
             values = [
                 LEVEL_ORDER.index(level) + 1,
-                node["type"],
-                node["name"],
-                node["gate"],
-                node.get("calculatedValue"),
-                parent_names or "-",
-                child_names  or "-",
+                sanitize_xl(node["type"]),
+                sanitize_xl(node["name"]),
+                sanitize_xl(node["gate"]),
+                node.get("calculatedValue"),   # float — safe
+                sanitize_xl(parent_names or "-"),
+                sanitize_xl(child_names  or "-"),
                 "YES" if is_shared else "NO",
             ]
             fill_hex = col_fills.get(level, "FF333333")
             for ci, val in enumerate(values, 1):
-                cell           = ws1.cell(row=row, column=ci, value=val)
+                cell           = ws1.cell(row=row, column=ci, value=sanitize_xl(val) if isinstance(val, str) else val)
                 cell.font      = Font(name="Courier New", size=10,
                                       color="FF111111" if level == "FF" else "FFFFFFFF")
                 cell.fill      = PatternFill("solid", fgColor=fill_hex)
@@ -235,10 +260,10 @@ def export_excel(nodes):
         gate_label = f"[{node['gate']}]" if depth < 3 else ""
         shared_tag = " [SHARED]" if is_shared else ""
 
-        c1 = ws2.cell(row=row, column=1, value=label)
-        c2 = ws2.cell(row=row, column=2, value=node["type"] + gate_label)
-        c3 = ws2.cell(row=row, column=3, value=val_str)
-        c4 = ws2.cell(row=row, column=4, value=shared_tag)
+        c1 = ws2.cell(row=row, column=1, value=sanitize_xl(label))
+        c2 = ws2.cell(row=row, column=2, value=sanitize_xl(node["type"] + gate_label))
+        c3 = ws2.cell(row=row, column=3, value=sanitize_xl(val_str))
+        c4 = ws2.cell(row=row, column=4, value=sanitize_xl(shared_tag))
 
         fill_hex = col_fills.get(node["type"], "FF222222")
         for c in [c1, c2, c3, c4]:
