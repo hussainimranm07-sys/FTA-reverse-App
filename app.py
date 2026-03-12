@@ -114,8 +114,15 @@ def recalculate(nodes):
     return updated
 
 def fmt(v):
+    """Safe format for Excel/JSON - ASCII only."""
     if v is None or (isinstance(v, float) and math.isnan(v)):
-        return "—"
+        return "-"
+    return f"{v:.2e}"
+
+def fmtd(v):
+    """Display format for HTML - uses em-dash."""
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return "&mdash;"
     return f"{v:.2e}"
 
 def now_str():
@@ -179,8 +186,8 @@ def export_excel(nodes):
                 node["name"],
                 node["gate"],
                 node.get("calculatedValue"),
-                parent_names or "—",
-                child_names  or "—",
+                parent_names or "-",
+                child_names  or "-",
                 "YES" if is_shared else "NO",
             ]
             fill_hex = col_fills.get(level, "FF333333")
@@ -201,7 +208,7 @@ def export_excel(nodes):
     ws2 = wb.create_sheet("Hierarchy")
     ws2.sheet_view.showGridLines = False
 
-    ws2.cell(row=1, column=1, value="FTA HIERARCHY — TOP TO BOTTOM").font = Font(
+    ws2.cell(row=1, column=1, value="FTA HIERARCHY - TOP TO BOTTOM").font = Font(
         bold=True, size=14, name="Courier New", color="FFE94560")
     ws2.cell(row=2, column=1, value=f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}").font = Font(
         size=9, name="Courier New", color="FF888888")
@@ -224,9 +231,9 @@ def export_excel(nodes):
         indent     = "    " * depth
         val_str    = fmt(node.get("calculatedValue"))
         is_shared  = len(node.get("parentIds") or []) > 1
-        label      = f"{indent}{'└─ ' if depth > 0 else ''}{node['name']}"
+        label      = f"{indent}{'  -> ' if depth > 0 else ''}{node['name']}"
         gate_label = f"[{node['gate']}]" if depth < 3 else ""
-        shared_tag = " ◈ SHARED" if is_shared else ""
+        shared_tag = " [SHARED]" if is_shared else ""
 
         c1 = ws2.cell(row=row, column=1, value=label)
         c2 = ws2.cell(row=row, column=2, value=node["type"] + gate_label)
