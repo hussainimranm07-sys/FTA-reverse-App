@@ -295,16 +295,16 @@ def export_excel(nodes):
 
 # ── HTML Tree builder ─────────────────────────────────────────────────────
 def build_html_tree(nodes, selected_id=None):
-    """Build a pure HTML/CSS/JS interactive tree visualization."""
+    """Build an interactive HTML/CSS/JS tree with zoom + right-click pan."""
     if not nodes:
         return ""
 
-    by_id    = {n["id"]: n for n in nodes}
-    hazards  = [n for n in nodes if n["type"] == "HAZARD"]
+    by_id   = {n["id"]: n for n in nodes}
+    hazards = [n for n in nodes if n["type"] == "HAZARD"]
     if not hazards:
         return ""
 
-    def node_html(node, depth=0):
+    def node_html(node):
         nid       = node["id"]
         color     = LEVEL_COLORS.get(node["type"], "#888")
         tcolor    = LEVEL_TEXT.get(node["type"], "#fff")
@@ -321,46 +321,39 @@ def build_html_tree(nodes, selected_id=None):
             'border-radius:6px;font-weight:700;margin-left:4px;">SHARED</span>'
             if is_shared else ""
         )
-        sel_outline = f"box-shadow:0 0 0 3px #e94560, 0 0 20px #e9456066;" if is_sel else ""
+        sel_outline = "box-shadow:0 0 0 3px #e94560,0 0 20px #e9456066;" if is_sel else ""
 
-        tooltip = (
-            f"Type: {node['type']} | Gate: {node['gate']} | Value: {val}\\n"
-            f"Parents: {', '.join(pnames) or '—'}\\n"
-            f"Children: {', '.join(cnames) or '—'}"
-            + (" | SHARED NODE" if is_shared else "")
-        )
-
-        # Gate symbol below node (if has children)
         gate_html = ""
         if children:
             gate_html = f"""
-            <div style="display:flex;flex-direction:column;align-items:center;margin-top:0;">
-              <div style="width:2px;height:10px;background:#333;"></div>
+            <div style="display:flex;flex-direction:column;align-items:center;">
+              <div style="width:2px;height:12px;background:#333;"></div>
               <div style="background:#1a1a1a;border:1px solid {gate_col};border-radius:4px;
-                          padding:1px 6px;font-size:9px;color:{gate_col};font-weight:700;
-                          font-family:monospace;">{node['gate']}</div>
-              <div style="width:2px;height:10px;background:#333;"></div>
+                          padding:1px 7px;font-size:9px;color:{gate_col};font-weight:700;
+                          font-family:monospace;letter-spacing:1px;">{node['gate']}</div>
+              <div style="width:2px;height:12px;background:#333;"></div>
             </div>"""
 
         node_box = f"""
         <div style="display:flex;flex-direction:column;align-items:center;">
           <div class="fta-node" data-id="{nid}"
-               title="{tooltip}"
-               onclick="selectNode('{nid}')"
+               onclick="selectNode(event,'{nid}')"
                style="background:{color};color:{tcolor};border-radius:8px;
-                      padding:8px 12px;min-width:120px;max-width:160px;
-                      cursor:pointer;user-select:none;position:relative;
-                      border:2px solid {color};transition:all 0.15s;{sel_outline}">
-            <div style="font-size:8px;opacity:0.7;letter-spacing:1px;margin-bottom:2px;">
+                      padding:8px 14px;min-width:130px;max-width:170px;
+                      cursor:pointer;user-select:none;
+                      border:2px solid {color};transition:filter 0.15s,box-shadow 0.15s;
+                      {sel_outline}">
+            <div style="font-size:8px;opacity:0.75;letter-spacing:1px;margin-bottom:3px;
+                        display:flex;align-items:center;justify-content:center;gap:4px;">
               {node['type']}{shared_badge}
             </div>
             <div style="font-size:11px;font-weight:700;line-height:1.3;
-                        word-break:break-word;text-align:center;margin-bottom:4px;">
+                        word-break:break-word;text-align:center;margin-bottom:5px;">
               {node['name']}
             </div>
-            <div style="background:rgba(0,0,0,0.25);border-radius:4px;
-                        padding:2px 6px;font-size:12px;font-weight:700;
-                        text-align:center;font-family:monospace;">
+            <div style="background:rgba(0,0,0,0.28);border-radius:4px;
+                        padding:3px 6px;font-size:12px;font-weight:700;
+                        text-align:center;font-family:monospace;letter-spacing:0.5px;">
               {val}
             </div>
           </div>
@@ -368,17 +361,14 @@ def build_html_tree(nodes, selected_id=None):
         </div>"""
 
         if not children:
-            return f'<div style="display:inline-flex;flex-direction:column;align-items:center;margin:0 6px;">{node_box}</div>'
+            return f'<div class="tree-node-wrap" style="display:inline-flex;flex-direction:column;align-items:center;margin:0 8px;">{node_box}</div>'
 
-        # Render children row
-        children_html = "".join(node_html(c, depth + 1) for c in children)
+        children_html = "".join(node_html(c) for c in children)
         return f"""
-        <div style="display:inline-flex;flex-direction:column;align-items:center;margin:0 6px;">
+        <div class="tree-node-wrap" style="display:inline-flex;flex-direction:column;align-items:center;margin:0 8px;">
           {node_box}
-          <div style="display:flex;flex-direction:row;align-items:flex-start;
-                      position:relative;padding-top:0;">
-            <div class="connector-row" style="display:flex;flex-direction:row;
-                 align-items:flex-start;position:relative;">
+          <div style="display:flex;flex-direction:row;align-items:flex-start;">
+            <div class="connector-row" style="display:flex;flex-direction:row;align-items:flex-start;position:relative;">
               {children_html}
             </div>
           </div>
@@ -386,175 +376,260 @@ def build_html_tree(nodes, selected_id=None):
 
     tree_html = "".join(node_html(h) for h in hazards)
 
-    # Detail panel data for JS
     nodes_js = json.dumps({
         n["id"]: {
-            "name":   n["name"],
-            "type":   n["type"],
-            "gate":   n["gate"],
-            "value":  fmt(n.get("calculatedValue")),
-            "parents": [by_id[p]["name"] for p in (n.get("parentIds") or []) if p in by_id],
+            "name":     n["name"],
+            "type":     n["type"],
+            "gate":     n["gate"],
+            "value":    fmt(n.get("calculatedValue")),
+            "parents":  [by_id[p]["name"] for p in (n.get("parentIds") or []) if p in by_id],
             "children": [c["name"] for c in nodes if n["id"] in (c.get("parentIds") or [])],
-            "shared": len(n.get("parentIds") or []) > 1,
-            "color":  LEVEL_COLORS.get(n["type"], "#888"),
-            "tcolor": LEVEL_TEXT.get(n["type"], "#fff"),
+            "shared":   len(n.get("parentIds") or []) > 1,
+            "color":    LEVEL_COLORS.get(n["type"], "#888"),
+            "tcolor":   LEVEL_TEXT.get(n["type"], "#fff"),
         }
         for n in nodes
     })
 
-    init_sel = f'selectNode("{selected_id}");' if selected_id else ""
+    init_sel = f'selectNode(null,"{selected_id}");' if selected_id else ""
 
-    html = f"""
-<!DOCTYPE html>
+    html = f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{
-    background: #0a0a0a;
-    font-family: 'JetBrains Mono', 'Fira Code', monospace;
-    color: #e0e0e0;
-    overflow-x: auto;
+  *{{box-sizing:border-box;margin:0;padding:0;}}
+  body{{
+    background:#0a0a0a;
+    font-family:'JetBrains Mono','Fira Code',monospace;
+    color:#e0e0e0;
+    overflow:hidden;
+    height:100vh;
+    display:flex;flex-direction:column;
   }}
-  .fta-node:hover {{
-    filter: brightness(1.15);
-    transform: translateY(-2px);
-    box-shadow: 0 4px 16px rgba(0,0,0,0.5) !important;
+
+  /* ── toolbar ── */
+  #toolbar{{
+    display:flex;align-items:center;gap:8px;
+    padding:6px 12px;
+    background:#111;border-bottom:1px solid #1e1e1e;
+    flex-shrink:0;font-size:10px;color:#555;letter-spacing:1px;
+    user-select:none;
   }}
-  #tree-container {{
-    padding: 20px;
-    overflow-x: auto;
-    min-height: 400px;
-    display: flex;
-    justify-content: center;
+  .tb-btn{{
+    background:#1a1a1a;border:1px solid #333;color:#aaa;
+    border-radius:4px;padding:3px 10px;cursor:pointer;
+    font-family:inherit;font-size:10px;letter-spacing:1px;
+    transition:background 0.1s;
   }}
-  #detail-panel {{
-    margin: 0 16px 16px 16px;
-    background: #141414;
-    border-radius: 10px;
-    padding: 14px 18px;
-    display: none;
-    border: 2px solid #333;
+  .tb-btn:hover{{background:#252525;color:#fff;}}
+  #zoom-label{{color:#666;font-size:10px;min-width:42px;text-align:center;}}
+
+  /* ── viewport ── */
+  #viewport{{
+    flex:1;overflow:hidden;position:relative;
+    cursor:grab;
   }}
-  .detail-grid {{
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 8px;
-    margin: 10px 0;
+  #viewport.dragging{{cursor:grabbing;}}
+  #canvas{{
+    position:absolute;
+    transform-origin:0 0;
+    padding:40px 60px 80px 60px;
+    will-change:transform;
   }}
-  .detail-card {{
-    background: #0a0a0a;
-    border-radius: 6px;
-    padding: 8px;
-    text-align: center;
+
+  /* ── nodes ── */
+  .fta-node:hover{{
+    filter:brightness(1.18);
+    box-shadow:0 6px 20px rgba(0,0,0,0.6) !important;
   }}
-  .detail-card-label {{
-    font-size: 7px;
-    color: #555;
-    letter-spacing: 2px;
-    margin-bottom: 3px;
+  .connector-row>div{{position:relative;}}
+  .connector-row>div:not(:only-child)::before{{
+    content:'';position:absolute;top:0;left:50%;width:100%;
+    border-top:2px solid #2a2a2a;
   }}
-  .detail-card-value {{
-    font-size: 13px;
-    font-weight: 700;
+  .connector-row>div:first-child:not(:only-child)::before{{left:50%;width:50%;}}
+  .connector-row>div:last-child:not(:only-child)::before{{left:0;width:50%;}}
+
+  /* ── detail panel ── */
+  #detail-panel{{
+    position:fixed;bottom:0;left:0;right:0;
+    background:#141414ee;border-top:2px solid #333;
+    padding:10px 16px;display:none;
+    backdrop-filter:blur(8px);
+    z-index:100;
   }}
-  .detail-row {{
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 8px;
-    margin-top: 8px;
+  .detail-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:8px 0 6px;}}
+  .dc{{background:#0a0a0a;border-radius:6px;padding:6px;text-align:center;}}
+  .dcl{{font-size:7px;color:#555;letter-spacing:2px;margin-bottom:2px;}}
+  .dcv{{font-size:12px;font-weight:700;}}
+  .detail-row{{display:grid;grid-template-columns:1fr 1fr;gap:8px;}}
+  .ds{{background:#0a0a0a;border-radius:6px;padding:6px;}}
+  .dsl{{font-size:7px;color:#555;letter-spacing:2px;margin-bottom:3px;}}
+  .dsv{{font-size:10px;color:#ccc;}}
+  #close-detail{{
+    position:absolute;top:8px;right:12px;
+    background:none;border:none;color:#555;font-size:16px;
+    cursor:pointer;font-family:inherit;
   }}
-  .detail-section {{
-    background: #0a0a0a;
-    border-radius: 6px;
-    padding: 8px;
-  }}
-  .detail-section-label {{
-    font-size: 7px;
-    color: #555;
-    letter-spacing: 2px;
-    margin-bottom: 4px;
-  }}
-  .detail-section-value {{
-    font-size: 10px;
-    color: #ccc;
-  }}
-  /* connector lines between parent and children */
-  .connector-row > div {{
-    position: relative;
-  }}
-  .connector-row > div:not(:only-child)::before {{
-    content: '';
-    position: absolute;
-    top: 0;
-    left: 50%;
-    width: 100%;
-    border-top: 2px solid #2a2a2a;
-  }}
-  .connector-row > div:first-child:not(:only-child)::before {{
-    left: 50%; width: 50%;
-  }}
-  .connector-row > div:last-child:not(:only-child)::before {{
-    left: 0; width: 50%;
-  }}
+  #close-detail:hover{{color:#fff;}}
 </style>
 </head>
 <body>
 
-<div id="tree-container">
-  {tree_html}
+<!-- toolbar -->
+<div id="toolbar">
+  <button class="tb-btn" onclick="zoom(0.15)">＋ Zoom In</button>
+  <button class="tb-btn" onclick="zoom(-0.15)">－ Zoom Out</button>
+  <button class="tb-btn" onclick="resetView()">⌂ Reset</button>
+  <span id="zoom-label">100%</span>
+  <span style="margin-left:8px;">Scroll to zoom &nbsp;·&nbsp; Right-click drag to pan &nbsp;·&nbsp; Click node to inspect</span>
 </div>
 
-<div id="detail-panel">
-  <div style="font-size:9px;color:#888;letter-spacing:3px;margin-bottom:6px;">
-    SELECTED NODE
+<!-- zoomable viewport -->
+<div id="viewport">
+  <div id="canvas">
+    {tree_html}
   </div>
-  <div id="detail-title" style="font-size:15px;font-weight:700;margin-bottom:8px;"></div>
+</div>
+
+<!-- detail panel (fixed bottom) -->
+<div id="detail-panel">
+  <button id="close-detail" onclick="closeDetail()">✕</button>
+  <div style="font-size:8px;color:#888;letter-spacing:3px;margin-bottom:4px;">SELECTED NODE</div>
+  <div id="detail-title" style="font-size:14px;font-weight:700;margin-bottom:4px;"></div>
   <div class="detail-grid">
-    <div class="detail-card">
-      <div class="detail-card-label">TYPE</div>
-      <div class="detail-card-value" id="d-type"></div>
-    </div>
-    <div class="detail-card">
-      <div class="detail-card-label">GATE</div>
-      <div class="detail-card-value" id="d-gate"></div>
-    </div>
-    <div class="detail-card">
-      <div class="detail-card-label">VALUE</div>
-      <div class="detail-card-value" id="d-value"></div>
-    </div>
-    <div class="detail-card">
-      <div class="detail-card-label">SHARED</div>
-      <div class="detail-card-value" id="d-shared"></div>
-    </div>
+    <div class="dc"><div class="dcl">TYPE</div><div class="dcv" id="d-type"></div></div>
+    <div class="dc"><div class="dcl">GATE</div><div class="dcv" id="d-gate"></div></div>
+    <div class="dc"><div class="dcl">VALUE</div><div class="dcv" id="d-value"></div></div>
+    <div class="dc"><div class="dcl">SHARED</div><div class="dcv" id="d-shared"></div></div>
   </div>
   <div class="detail-row">
-    <div class="detail-section">
-      <div class="detail-section-label">PARENTS</div>
-      <div class="detail-section-value" id="d-parents"></div>
-    </div>
-    <div class="detail-section">
-      <div class="detail-section-label">CHILDREN</div>
-      <div class="detail-section-value" id="d-children"></div>
-    </div>
+    <div class="ds"><div class="dsl">PARENTS</div><div class="dsv" id="d-parents"></div></div>
+    <div class="ds"><div class="dsl">CHILDREN</div><div class="dsv" id="d-children"></div></div>
   </div>
 </div>
 
 <script>
 const NODES = {nodes_js};
+
+// ── transform state ──
+let scale  = 1.0;
+let tx     = 0;
+let ty     = 0;
+const MIN_SCALE = 0.15;
+const MAX_SCALE = 3.0;
+const canvas    = document.getElementById('canvas');
+const viewport  = document.getElementById('viewport');
+
+function applyTransform() {{
+  canvas.style.transform = `translate(${{tx}}px,${{ty}}px) scale(${{scale}})`;
+  document.getElementById('zoom-label').textContent = Math.round(scale*100)+'%';
+}}
+
+function zoom(delta, cx, cy) {{
+  const vr  = viewport.getBoundingClientRect();
+  const ocx = (cx !== undefined) ? cx - vr.left : vr.width  / 2;
+  const ocy = (cy !== undefined) ? cy - vr.top  : vr.height / 2;
+  const newScale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, scale + delta));
+  const ratio    = newScale / scale;
+  tx = ocx - ratio * (ocx - tx);
+  ty = ocy - ratio * (ocy - ty);
+  scale = newScale;
+  applyTransform();
+}}
+
+function resetView() {{
+  scale = 1.0; tx = 0; ty = 0;
+  applyTransform();
+}}
+
+// ── scroll to zoom ──
+viewport.addEventListener('wheel', e => {{
+  e.preventDefault();
+  const delta = e.deltaY < 0 ? 0.1 : -0.1;
+  zoom(delta, e.clientX, e.clientY);
+}}, {{ passive: false }});
+
+// ── right-click drag to pan ──
+let isPanning = false;
+let panStart  = {{ x:0, y:0 }};
+
+viewport.addEventListener('mousedown', e => {{
+  if (e.button === 2) {{
+    isPanning = true;
+    panStart  = {{ x: e.clientX - tx, y: e.clientY - ty }};
+    viewport.classList.add('dragging');
+    e.preventDefault();
+  }}
+}});
+
+window.addEventListener('mousemove', e => {{
+  if (!isPanning) return;
+  tx = e.clientX - panStart.x;
+  ty = e.clientY - panStart.y;
+  applyTransform();
+}});
+
+window.addEventListener('mouseup', e => {{
+  if (e.button === 2) {{
+    isPanning = false;
+    viewport.classList.remove('dragging');
+  }}
+}});
+
+// Disable right-click context menu on viewport
+viewport.addEventListener('contextmenu', e => e.preventDefault());
+
+// ── touch pinch-to-zoom + drag ──
+let lastTouchDist = null;
+let lastTouchMid  = null;
+
+viewport.addEventListener('touchstart', e => {{
+  if (e.touches.length === 2) {{
+    const dx = e.touches[0].clientX - e.touches[1].clientX;
+    const dy = e.touches[0].clientY - e.touches[1].clientY;
+    lastTouchDist = Math.hypot(dx, dy);
+    lastTouchMid  = {{
+      x: (e.touches[0].clientX + e.touches[1].clientX) / 2,
+      y: (e.touches[0].clientY + e.touches[1].clientY) / 2,
+    }};
+  }}
+}}, {{ passive: true }});
+
+viewport.addEventListener('touchmove', e => {{
+  if (e.touches.length === 2) {{
+    const dx   = e.touches[0].clientX - e.touches[1].clientX;
+    const dy   = e.touches[0].clientY - e.touches[1].clientY;
+    const dist = Math.hypot(dx, dy);
+    const mid  = {{
+      x: (e.touches[0].clientX + e.touches[1].clientX) / 2,
+      y: (e.touches[0].clientY + e.touches[1].clientY) / 2,
+    }};
+    if (lastTouchDist) {{
+      const delta = (dist - lastTouchDist) * 0.01;
+      zoom(delta, mid.x, mid.y);
+    }}
+    lastTouchDist = dist;
+    lastTouchMid  = mid;
+    e.preventDefault();
+  }}
+}}, {{ passive: false }});
+
+// ── node selection ──
 let selectedId = null;
 
-function selectNode(id) {{
-  // Deselect all
+function selectNode(event, id) {{
+  // Don't trigger if we were panning
+  if (isPanning) return;
+
   document.querySelectorAll('.fta-node').forEach(el => {{
     el.style.boxShadow = '';
-    el.style.outline   = '';
   }});
 
   if (selectedId === id) {{
     selectedId = null;
-    document.getElementById('detail-panel').style.display = 'none';
+    closeDetail();
     return;
   }}
 
@@ -562,46 +637,59 @@ function selectNode(id) {{
   const node = NODES[id];
   if (!node) return;
 
-  // Highlight selected
+  // Highlight selected node
   const el = document.querySelector(`[data-id="${{id}}"]`);
-  if (el) el.style.boxShadow = '0 0 0 3px #e94560, 0 0 20px #e9456066';
+  if (el) el.style.boxShadow = '0 0 0 3px #e94560,0 0 22px #e9456077';
 
-  // Highlight connected (parents + children)
-  const allIds = Object.keys(NODES);
-  allIds.forEach(nid => {{
-    const n = NODES[nid];
-    const isParent   = node.parents.includes(n.name);
-    const isChild    = node.children.includes(n.name);
-    if ((isParent || isChild) && nid !== id) {{
+  // Highlight connected nodes
+  Object.entries(NODES).forEach(([nid, n]) => {{
+    if (nid === id) return;
+    const isParent = node.parents.includes(n.name);
+    const isChild  = node.children.includes(n.name);
+    if (isParent || isChild) {{
       const cel = document.querySelector(`[data-id="${{nid}}"]`);
-      if (cel) cel.style.boxShadow = '0 0 0 2px #ff8c42, 0 0 12px #ff8c4244';
+      if (cel) cel.style.boxShadow = '0 0 0 2px #ff8c42,0 0 14px #ff8c4255';
     }}
   }});
 
   // Show detail panel
   const panel = document.getElementById('detail-panel');
-  panel.style.display = 'block';
-  panel.style.borderColor = node.color;
+  panel.style.display  = 'block';
+  panel.style.borderTopColor = node.color;
 
   document.getElementById('detail-title').innerHTML =
     `<span style="color:${{node.color}}">${{node.name}}</span>` +
-    (node.shared ? ' <span style="background:#f5c518;color:#111;font-size:8px;padding:2px 6px;border-radius:8px;font-weight:700;">SHARED</span>' : '');
+    (node.shared
+      ? ' <span style="background:#f5c518;color:#111;font-size:8px;padding:1px 6px;border-radius:6px;font-weight:700;">SHARED</span>'
+      : '');
 
-  document.getElementById('d-type').style.color    = node.color;
-  document.getElementById('d-type').textContent    = node.type;
-  document.getElementById('d-gate').style.color    = node.gate === 'OR' ? '#4fc3f7' : '#ffb74d';
-  document.getElementById('d-gate').textContent    = node.gate;
-  document.getElementById('d-value').style.color   = node.color;
-  document.getElementById('d-value').textContent   = node.value;
-  document.getElementById('d-shared').textContent  = node.shared ? 'YES' : 'NO';
-  document.getElementById('d-shared').style.color  = node.shared ? '#f5c518' : '#555';
-
-  document.getElementById('d-parents').textContent  = node.parents.join(' · ') || '— (top event)';
-  document.getElementById('d-children').textContent = node.children.join(' · ') || '— (leaf node)';
+  document.getElementById('d-type').style.color   = node.color;
+  document.getElementById('d-type').textContent   = node.type;
+  document.getElementById('d-gate').style.color   = node.gate === 'OR' ? '#4fc3f7' : '#ffb74d';
+  document.getElementById('d-gate').textContent   = node.gate;
+  document.getElementById('d-value').style.color  = node.color;
+  document.getElementById('d-value').textContent  = node.value;
+  document.getElementById('d-shared').textContent = node.shared ? 'YES' : 'NO';
+  document.getElementById('d-shared').style.color = node.shared ? '#f5c518' : '#555';
+  document.getElementById('d-parents').textContent  = node.parents.join(' · ') || '(top event)';
+  document.getElementById('d-children').textContent = node.children.join(' · ') || '(leaf node)';
 }}
 
-// Auto-select if passed from Python
-{init_sel}
+function closeDetail() {{
+  document.getElementById('detail-panel').style.display = 'none';
+  document.querySelectorAll('.fta-node').forEach(el => el.style.boxShadow = '');
+  selectedId = null;
+}}
+
+// centre tree on load
+window.addEventListener('load', () => {{
+  const vr = viewport.getBoundingClientRect();
+  const cr = canvas.getBoundingClientRect();
+  tx = (vr.width  - cr.width)  / 2;
+  ty = 20;
+  applyTransform();
+  {init_sel}
+}});
 </script>
 </body>
 </html>"""
@@ -981,7 +1069,7 @@ with tab_tree:
             unsafe_allow_html=True
         )
         tree_html = build_html_tree(nodes, st.session_state.selected_id)
-        components.html(tree_html, height=620, scrolling=True)
+        components.html(tree_html, height=680, scrolling=False)
 
 # ── TAB 2: Hierarchy panel ────────────────────────────────────────────────
 with tab_hier:
