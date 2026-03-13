@@ -858,12 +858,12 @@ def build_hierarchy_rows(nodes, filter_hazard_id=None):
 DEFS = {"nodes":[],"save_status":"idle","save_msg":"","gist_loaded":False,
         "active_file":"my_tree.json","file_list":[],"selected_id":None,
         "tree_filter":"ALL",
-        # Persistent tree viewport state — survives reruns
+        "nodes_since_calc": 0,   # how many nodes added without recalculating
         "tree_state": {
             "scale": 1.0, "tx": 0, "ty": 0,
-            "collapsed": [],      # list of collapsed node IDs
-            "positions": {},      # id -> {x, y} overrides from dragging
-            "focus_id": None,     # node/hazard to centre on after rerun
+            "collapsed": [],
+            "positions": {},
+            "focus_id": None,
         }
         }
 for k,v in DEFS.items():
@@ -907,7 +907,12 @@ def save_current(nodes=None, filename=None, status_label=None):
     st.session_state.save_msg = "Gist not configured"
     return False
 
-def set_nodes(n):
+def set_nodes(n, recalc=False):
+    """Save nodes. By default does NOT recalculate — call with recalc=True or
+    use CALCULATE button. This prevents unwanted tree thrashing while building."""
+    if recalc:
+        n = recalculate(n)
+        st.session_state.nodes_since_calc = 0
     st.session_state.nodes = n
     save_current(n)
 
@@ -955,7 +960,17 @@ if not configured:
     st.warning("Gist not configured — data resets on refresh. Add GITHUB_TOKEN + GIST_ID to Streamlit secrets.")
 
 # ── Sidebar ───────────────────────────────────────────────────────────────
-with st.sidebar:
+@st.fragment
+def render_sidebar():
+    """
+    @st.fragment means this function reruns in isolation when its buttons are
+    clicked — the main page (and the tree iframe) is NOT re-rendered.
+    The tree only re-renders when the user explicitly presses CALCULATE or
+    switches the hazard filter dropdown on the main page.
+    """
+    nodes  = st.session_state.nodes
+    by_id  = {n["id"]: n for n in nodes}
+    hazards = [n for n in nodes if n["type"] == "HAZARD"]
 
     # FILE MANAGER
     with st.expander("📁 FILE MANAGER", expanded=False):
@@ -968,14 +983,14 @@ with st.sidebar:
                 if fn:
                     if not fn.endswith(".json"): fn += ".json"
                     if save_current(filename=fn, status_label=f"Saved as '{fn}' at {datetime.now().strftime('%H:%M:%S')}"):
-                        st.session_state.active_file = fn; st.rerun()
+                        st.session_state.active_file = fn; st.rerun(scope="app")
         with c2:
             if st.button("📸 Snapshot", use_container_width=True):
                 snap = f"snapshot_{now_str()}.json"
-                save_current(filename=snap, status_label=f"Snapshot: {snap}"); st.rerun()
+                save_current(filename=snap, status_label=f"Snapshot: {snap}"); st.rerun(scope="app")
         if configured:
             if st.button("🔄 Refresh", use_container_width=True):
-                st.session_state.file_list = list_gist_files(GITHUB_TOKEN, GIST_ID); st.rerun()
+                st.session_state.file_list = list_gist_files(GITHUB_TOKEN, GIST_ID); st.rerun(scope="app")
             named = [f for f in st.session_state.file_list if is_named(f)]
             snaps = sorted([f for f in st.session_state.file_list if is_snap(f)], reverse=True)
             if named:
@@ -990,11 +1005,13 @@ with st.sidebar:
                             st.session_state.active_file = fn
                             st.session_state.save_status = "loaded"
                             st.session_state.save_msg = f"Loaded '{fn}'"
-                            st.session_state.selected_id = None; st.rerun()
+                            st.session_state.selected_id = None
+                            st.session_state.nodes_since_calc = 0
+                            st.rerun(scope="app")
                     with cc:
                         if not ia and st.button("Del", key=f"d_{fn}"):
                             del_gist_file(GITHUB_TOKEN, GIST_ID, fn)
-                            st.session_state.file_list = list_gist_files(GITHUB_TOKEN, GIST_ID); st.rerun()
+                            st.session_state.file_list = list_gist_files(GITHUB_TOKEN, GIST_ID); st.rerun(scope="app")
             if snaps:
                 st.markdown("<div style='font-size:9px;color:#4fc3f7;margin:8px 0 3px;'>SNAPSHOTS (last 5)</div>", unsafe_allow_html=True)
                 for fn in snaps[:5]:
@@ -1007,10 +1024,13 @@ with st.sidebar:
                             st.session_state.active_file = fn
                             st.session_state.save_status = "loaded"
                             st.session_state.save_msg = f"Loaded snapshot '{fn}'"
-                            st.session_state.selected_id = None; st.rerun()
+                            st.session_state.selected_id = None
+                            st.session_state.nodes_since_calc = 0
+                            st.rerun(scope="app")
                     with cc:
                         if st.button("Del", key=f"d_{fn}"):
-                            del_gist_file(GITHUB_TOKEN, GIST_ID, fn); st.session_state.file_list = list_gist_files(GITHUB_TOKEN, GIST_ID); st.rerun()
+                            del_gist_file(GITHUB_TOKEN, GIST_ID, fn)
+                            st.session_state.file_list = list_gist_files(GITHUB_TOKEN, GIST_ID); st.rerun(scope="app")
 
     st.markdown("---")
 
@@ -1019,7 +1039,7 @@ with st.sidebar:
     tab_add, tab_edit = st.tabs(["➕ ADD", "✏️ EDIT"])
 
     with tab_add:
-        # Add Hazard section (always available)
+        # Add Hazard
         st.markdown("<div style='font-size:9px;color:#ff4d4d;letter-spacing:2px;margin-bottom:4px;'>ADD HAZARD</div>", unsafe_allow_html=True)
         h_name = st.text_input("Hazard Name", placeholder="e.g. Engine Fire", key="h_name")
         h_val  = st.text_input("Target Rate", placeholder="e.g. 1e-7", key="h_val")
@@ -1028,13 +1048,13 @@ with st.sidebar:
                 try:
                     val = float(h_val)
                     nid = str(uuid.uuid4())[:7]
-                    node = {"id":nid,"name":h_name.strip(),
-                            "type":"HAZARD","gate":"OR",
-                            "targetValue":val,"calculatedValue":val,"parentIds":[]}
-                    # Focus tree on the new hazard and switch filter to it
+                    node = {"id": nid, "nodeId": nid, "name": h_name.strip(),
+                            "type": "HAZARD", "gate": "OR",
+                            "targetValue": val, "calculatedValue": val, "parentIds": []}
                     st.session_state.tree_state["focus_id"] = nid
                     st.session_state.tree_filter = nid
-                    set_nodes(nodes + [node]); st.rerun()
+                    set_nodes(nodes + [node])  # no recalc needed for HAZARD
+                    st.rerun()
                 except ValueError:
                     st.error("Invalid rate — use e.g. 1e-7")
             else:
@@ -1044,146 +1064,121 @@ with st.sidebar:
             st.markdown("---")
             st.markdown("<div style='font-size:9px;color:#ff8c42;letter-spacing:2px;margin-bottom:4px;'>ADD CHILD NODE</div>", unsafe_allow_html=True)
 
-            # Modelling guide
-            with st.expander("💡 How to model mixed AND/OR gates"):
+            with st.expander("💡 Mixed AND/OR gate guide"):
                 st.markdown("""
 **Use a GROUP node for Combined Faults:**
 
-*SF-14 (OR) with two AND groups:*
-- SF-14 → gate=OR
-- "Combined Faults A" → type=GROUP, gate=AND, parent=SF-14 → FF-01, FF-02
-- "Combined Faults B" → type=GROUP, gate=AND, parent=SF-14 → IF-016, IF-208
+*SF-14 (OR) → two AND groups:*
+- SF-14 gate=OR
+- "Combined Faults A" type=GROUP, gate=AND, parent=SF-14 → FF-01, FF-02
+- "Combined Faults B" type=GROUP, gate=AND, parent=SF-14 → IF-016, IF-208
 
 *FF-05 (mixed):*
-- FF-05 → gate=OR
-- IF-286, IF-287, IF-288 → direct children of FF-05
-- "Combined Faults" → type=GROUP, gate=AND, parent=FF-05 → IF-293, IF-289
+- FF-05 gate=OR, direct children: IF-286, IF-287, IF-288
+- "Combined Faults" type=GROUP, gate=AND, parent=FF-05 → IF-293, IF-289
 
-GROUP nodes = purple ovals. AND edges = dashed lines. Shared edges = faint yellow dashes.
+GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                 """)
 
             node_name  = st.text_input("Node Name", placeholder="e.g. Power Failure", key="add_name")
             custom_id  = st.text_input("Node ID (optional)", placeholder="e.g. FF-01, IF-286",
                                        key="add_cid",
-                                       help="Your own reference ID. If this ID already exists in the tree, you'll be prompted to link it as a shared node instead of creating a new one.")
-            parent_opts = {f"[{n['type']}] {n['name']}": n["id"]
+                                       help="If this ID already exists, you'll be asked to link as shared.")
+            parent_opts = {f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name']}": n["id"]
                            for n in nodes if n["type"] in VALID_PARENT_TYPES}
-            sel_labels  = st.multiselect("Parent Node(s)", list(parent_opts.keys()),
-                                         help="Multiple = shared node.", key="add_par")
+            sel_labels  = st.multiselect("Parent Node(s)", list(parent_opts.keys()), key="add_par")
             sel_pids    = [parent_opts[l] for l in sel_labels]
             node_type   = st.selectbox("Type", VALID_CHILD_TYPES, key="add_type",
                                        help="GROUP = Combined Faults oval")
-            gate        = st.radio("Gate", ["OR","AND"], horizontal=True, key="add_gate",
-                                   help="OR: any child fails → parent fails. AND: ALL children must fail.")
+            gate        = st.radio("Gate", ["OR","AND"], horizontal=True, key="add_gate")
 
-            # ── Duplicate ID detection ────────────────────────────────
+            # Duplicate ID detection
             cid_clean = custom_id.strip()
             existing_with_id = [n for n in nodes if n.get("nodeId","") == cid_clean and cid_clean != ""]
             duplicate_found  = len(existing_with_id) > 0
 
             if duplicate_found:
                 ex = existing_with_id[0]
-                ex_color = LEVEL_COLORS.get(ex["type"], "#888")
+                ex_color  = LEVEL_COLORS.get(ex["type"], "#888")
                 ex_parents = " · ".join(by_id[p]["name"] for p in (ex.get("parentIds") or []) if p in by_id) or "none"
                 st.markdown(f"""
                 <div style="background:#1a1200;border:2px solid #f5c518;border-radius:8px;padding:10px 12px;margin:8px 0;">
                   <div style="font-size:9px;color:#f5c518;font-weight:700;letter-spacing:1px;margin-bottom:4px;">
-                    ⚠ NODE ID ALREADY EXISTS IN TREE
+                    ⚠ NODE ID ALREADY EXISTS
                   </div>
                   <div style="font-size:10px;color:#ddd;">
-                    <b style="color:{ex_color};">{ex['name']}</b>
-                    &nbsp;[{ex['type']} · {ex['gate']}]
+                    <b style="color:{ex_color};">{ex['name']}</b> [{ex['type']} · {ex['gate']}]
                   </div>
                   <div style="font-size:9px;color:#888;margin-top:3px;">
-                    Current parents: {ex_parents}<br>
-                    Value: <span style="color:{ex_color};font-family:monospace;">{fmt(ex.get('calculatedValue'))}</span>
-                  </div>
-                  <div style="font-size:9px;color:#aaa;margin-top:5px;">
-                    Choose: add new parents to this existing node (shared node),
-                    or create a separate new node with the same ID label.
+                    Parents: {ex_parents} · Value: <span style="color:{ex_color};font-family:monospace;">{fmt(ex.get('calculatedValue'))}</span>
                   </div>
                 </div>""", unsafe_allow_html=True)
-
                 col_share, col_new = st.columns(2)
                 with col_share:
-                    if st.button("🔗 LINK AS SHARED", use_container_width=True, type="primary",
-                                 help="Add the selected parents to the existing node. Recalculates entire tree."):
+                    if st.button("🔗 LINK SHARED", use_container_width=True, type="primary"):
                         if not sel_pids:
-                            st.error("Select at least one parent to link to")
+                            st.error("Select at least one parent")
                         else:
-                            # Merge new parents into existing node
                             updated = []
                             for n in nodes:
                                 if n["id"] == ex["id"]:
                                     n = dict(n)
                                     existing_pids = list(n.get("parentIds") or [])
-                                    new_pids = [p for p in sel_pids if p not in existing_pids]
-                                    n["parentIds"] = existing_pids + new_pids
+                                    new_pids_to_add = [p for p in sel_pids if p not in existing_pids]
+                                    n["parentIds"] = existing_pids + new_pids_to_add
                                 updated.append(n)
-                            # Full recalculate to cascade through all shared locations
-                            updated = recalculate(updated)
-                            # Set focus to the shared node
                             st.session_state.tree_state["focus_id"] = ex["id"]
-                            set_nodes(updated)
-                            st.success(f"Linked '{ex['name']}' as shared — added {len(new_pids)} new parent(s). Recalculated.")
+                            st.session_state.nodes_since_calc += 1
+                            set_nodes(updated)  # no auto-recalc
+                            st.success(f"Linked as shared. Press CALCULATE to update values.")
                             st.rerun()
                 with col_new:
-                    if st.button("➕ CREATE NEW NODE", use_container_width=True,
-                                 help="Create a completely new node that happens to share the same ID label"):
-                        if not node_name.strip():
-                            st.error("Enter node name")
-                        elif not sel_pids:
-                            st.error("Select at least one parent")
+                    if st.button("➕ NEW NODE", use_container_width=True):
+                        if not node_name.strip(): st.error("Enter node name")
+                        elif not sel_pids:        st.error("Select at least one parent")
                         else:
                             nid = str(uuid.uuid4())[:7]
                             new_node = {"id": nid, "nodeId": cid_clean,
                                         "name": node_name.strip(), "type": node_type, "gate": gate,
                                         "targetValue": None, "calculatedValue": None, "parentIds": sel_pids}
-                            updated = recalculate(nodes + [new_node])
                             st.session_state.tree_state["focus_id"] = nid
-                            set_nodes(updated)
+                            st.session_state.nodes_since_calc += 1
+                            set_nodes(nodes + [new_node])
                             st.rerun()
             else:
                 if st.button("✅ ADD NODE", use_container_width=True, type="primary"):
-                    if not node_name.strip():
-                        st.error("Enter node name")
-                    elif not sel_pids:
-                        st.error("Select at least one parent")
+                    if not node_name.strip(): st.error("Enter node name")
+                    elif not sel_pids:        st.error("Select at least one parent")
                     else:
-                        nid = cid_clean if cid_clean else str(uuid.uuid4())[:7]
-                        # Avoid collision with internal UUIDs
-                        if any(n["id"] == nid for n in nodes):
-                            nid = str(uuid.uuid4())[:7]
+                        nid = cid_clean if cid_clean and not any(n["id"]==cid_clean for n in nodes) else str(uuid.uuid4())[:7]
                         new_node = {"id": nid, "nodeId": cid_clean or nid,
                                     "name": node_name.strip(), "type": node_type, "gate": gate,
                                     "targetValue": None, "calculatedValue": None, "parentIds": sel_pids}
-                        updated = recalculate(nodes + [new_node])
-                        # Focus tree on the newly added node's first parent (keep working context)
+                        # Keep tree focused on the parent being worked on
                         st.session_state.tree_state["focus_id"] = sel_pids[0] if sel_pids else nid
-                        set_nodes(updated)
+                        st.session_state.nodes_since_calc += 1
+                        set_nodes(nodes + [new_node])  # NO recalculate — user presses CALCULATE
                         st.rerun()
 
             st.markdown("---")
+            # Delete node
             del_opts = {f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name']}": n["id"]
                         for n in nodes if n["type"] != "HAZARD"}
             if del_opts:
                 dl = st.selectbox("Delete Node", ["— select —"] + list(del_opts.keys()), key="del_sel")
                 if dl != "— select —":
                     del_id = del_opts[dl]
-                    del_node = by_id.get(del_id)
                     is_shared_child = any(
                         del_id in (n.get("parentIds") or []) and len(n.get("parentIds") or []) > 1
                         for n in nodes
                     )
                     if is_shared_child:
                         st.markdown(
-                            "<div style='font-size:9px;color:#f5c518;background:#1a1200;border:1px solid #f5c51844;"
-                            "border-radius:5px;padding:5px 8px;margin:4px 0;'>"
-                            "⚠ Some children of this node are shared (have other parents). "
-                            "They will be kept with their remaining parents — only orphaned children are removed."
-                            "</div>", unsafe_allow_html=True)
+                            "<div style='font-size:9px;color:#f5c518;background:#1a1200;"
+                            "border:1px solid #f5c51844;border-radius:5px;padding:5px 8px;margin:4px 0;'>"
+                            "⚠ Shared children will keep their other parents.</div>",
+                            unsafe_allow_html=True)
                     if st.button("🗑 DELETE NODE", use_container_width=True):
-                        # Smart delete: strip parentId, only remove truly orphaned nodes
                         temp_nodes = [dict(n) for n in nodes if n["id"] != del_id]
                         for n in temp_nodes:
                             if del_id in (n.get("parentIds") or []):
@@ -1200,14 +1195,20 @@ GROUP nodes = purple ovals. AND edges = dashed lines. Shared edges = faint yello
                                     n["parentIds"] = [p for p in (n.get("parentIds") or []) if p not in orphan_ids]
                                     if len(n.get("parentIds") or []) != before:
                                         changed = True
-                        temp_nodes = recalculate(temp_nodes)
-                        set_nodes(temp_nodes); st.rerun()
+                        st.session_state.nodes_since_calc += 1
+                        set_nodes(temp_nodes)
+                        st.rerun()
 
             st.markdown("---")
             if st.button("🗑 CLEAR ALL NODES", use_container_width=True):
-                set_nodes([]); st.session_state.selected_id = None; st.rerun()
+                set_nodes([])
+                st.session_state.selected_id = None
+                st.session_state.nodes_since_calc = 0
+                st.rerun(scope="app")
 
     with tab_edit:
+        nodes = st.session_state.nodes  # re-read — may have changed
+        by_id = {n["id"]: n for n in nodes}
         if not nodes:
             st.markdown("<div style='color:#555;font-size:11px;'>No nodes yet.</div>", unsafe_allow_html=True)
         else:
@@ -1224,12 +1225,9 @@ GROUP nodes = purple ovals. AND edges = dashed lines. Shared edges = faint yello
                       <div style="font-weight:700;color:{color};">{en['name']}</div>
                       <div style="font-size:9px;color:#666;">{en['type']} · {en['gate']}
                         {'&nbsp;<span style="background:#f5c518;color:#111;font-size:7px;padding:1px 4px;border-radius:3px;font-weight:700;">SHARED</span>' if is_shared else ''}
-                      </div>
-                    </div>""", unsafe_allow_html=True)
+                      </div></div>""", unsafe_allow_html=True)
                     new_name    = st.text_input("Name", value=en["name"], key="en_name")
-                    new_node_id = st.text_input("Node ID", value=en.get("nodeId", en["id"]),
-                                                key="en_nid",
-                                                help="Your reference ID e.g. FF-01. Changing this won't break existing connections.")
+                    new_node_id = st.text_input("Node ID", value=en.get("nodeId", en["id"]), key="en_nid")
                     new_gate    = st.radio("Gate", ["OR","AND"], index=0 if en["gate"]=="OR" else 1,
                                            horizontal=True, key="en_gate")
                     if en["type"] != "HAZARD":
@@ -1239,7 +1237,7 @@ GROUP nodes = purple ovals. AND edges = dashed lines. Shared edges = faint yello
                                     for n in nodes if n["type"] in VALID_PARENT_TYPES and n["id"] != eid}
                         cur_pl   = [lbl for lbl,pid in avail_p.items() if pid in (en.get("parentIds") or [])]
                         new_pl   = st.multiselect("Parents", list(avail_p.keys()), default=cur_pl, key="en_par",
-                                                   help="Add/remove parents here to link this as a shared node or unlink it.")
+                                                   help="Add/remove parents to link as shared node.")
                         new_pids = [avail_p[l] for l in new_pl]
                     else:
                         new_type = "HAZARD"; new_pids = []
@@ -1264,25 +1262,18 @@ GROUP nodes = purple ovals. AND edges = dashed lines. Shared edges = faint yello
                                             n["targetValue"] = tv; n["calculatedValue"] = tv
                                         except: pass
                                 upd.append(n)
-                            upd = recalculate(upd)
                             st.session_state.tree_state["focus_id"] = eid
-                            set_nodes(upd)
-                            st.success(f"Updated '{new_name}'")
+                            st.session_state.nodes_since_calc += 1
+                            set_nodes(upd)  # no auto-recalc
+                            st.success("Updated. Press CALCULATE to refresh values.")
                             st.rerun()
                     with c2:
                         if en["type"] != "HAZARD":
-                            if st.button("🗑 DELETE", use_container_width=True,
-                                         help="Removes this node. Shared-node children (multiple parents) keep their other parents. Orphaned children are also removed."):
-                                to_del = {eid}
-                                changed = True
-                                # Build updated parentIds for shared children: remove eid from their parents
-                                # Only fully delete children that become completely orphaned
+                            if st.button("🗑 DELETE", use_container_width=True):
                                 temp_nodes = [dict(n) for n in nodes if n["id"] != eid]
-                                # Strip eid from all parentIds
                                 for n in temp_nodes:
                                     if eid in (n.get("parentIds") or []):
                                         n["parentIds"] = [p for p in n["parentIds"] if p != eid]
-                                # Remove truly orphaned non-HAZARD nodes (no parents left and not a HAZARD)
                                 changed = True
                                 while changed:
                                     changed = False
@@ -1290,27 +1281,50 @@ GROUP nodes = purple ovals. AND edges = dashed lines. Shared edges = faint yello
                                                   if n["type"] != "HAZARD" and not n.get("parentIds")}
                                     if orphan_ids:
                                         temp_nodes = [n for n in temp_nodes if n["id"] not in orphan_ids]
-                                        # Strip orphan refs from others
                                         for n in temp_nodes:
                                             before = len(n.get("parentIds") or [])
                                             n["parentIds"] = [p for p in (n.get("parentIds") or []) if p not in orphan_ids]
                                             if len(n.get("parentIds") or []) != before:
                                                 changed = True
-                                temp_nodes = recalculate(temp_nodes)
+                                st.session_state.nodes_since_calc += 1
                                 st.session_state.tree_state["focus_id"] = None
                                 set_nodes(temp_nodes)
                                 st.rerun()
 
+with st.sidebar:
+    render_sidebar()
+
 # ── Action bar ────────────────────────────────────────────────────────────
+nsc = st.session_state.nodes_since_calc
+
+# Warning banner when nodes added without calculating
+if nsc > 0:
+    warn_color  = "#ff4d4d" if nsc >= 10 else "#f5c518"
+    warn_bg     = "#1a0000" if nsc >= 10 else "#1a1200"
+    warn_icon   = "🔴" if nsc >= 10 else "🟡"
+    warn_msg    = (f"{warn_icon} **{nsc} node{'s' if nsc!=1 else ''} added without calculating** — "
+                   f"values shown are stale. Press **▶ CALCULATE** to update.")
+    if nsc >= 10:
+        warn_msg += f"  \n⚠ {nsc} nodes is a lot to add without calculating — please press CALCULATE now."
+    st.markdown(
+        f'<div style="background:{warn_bg};border:2px solid {warn_color};border-radius:8px;'
+        f'padding:9px 14px;margin-bottom:8px;font-size:11px;color:{warn_color};">'
+        f'{warn_msg}</div>',
+        unsafe_allow_html=True)
+
 a1,a2,a3,a4,a5 = st.columns([1,1,1,1,2])
 with a1:
-    if st.button("▶ CALCULATE", type="primary", use_container_width=True):
+    calc_label = f"▶ CALCULATE{f' ({nsc}✱)' if nsc>0 else ''}"
+    if st.button(calc_label, type="primary", use_container_width=True,
+                 help="Run top-down reverse distribution across the full tree"):
         if nodes:
             new_nodes = recalculate(nodes)
             snap = f"snapshot_{now_str()}.json"
             save_current(new_nodes, filename=snap, status_label=f"Calculated + snap: {snap}")
             save_current(new_nodes)
-            st.session_state.nodes = new_nodes; st.rerun()
+            st.session_state.nodes = new_nodes
+            st.session_state.nodes_since_calc = 0
+            st.rerun()
 with a2:
     if st.button("💾 SAVE", use_container_width=True): save_current(); st.rerun()
 with a3:
