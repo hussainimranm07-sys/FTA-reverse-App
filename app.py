@@ -7,11 +7,17 @@ st.set_page_config(page_title="FTA Reverse Engineer", page_icon="⚠️",
                    layout="wide", initial_sidebar_state="expanded")
 
 # ── Constants ─────────────────────────────────────────────────────────────
-LEVEL_ORDER        = ["HAZARD", "SF", "FF", "IF"]
-LEVEL_COLORS       = {"HAZARD":"#ff4d4d","SF":"#ff8c42","FF":"#f5c518","IF":"#4caf7d"}
-LEVEL_TEXT         = {"HAZARD":"#fff","SF":"#fff","FF":"#111","IF":"#fff"}
-VALID_PARENT_TYPES = ["HAZARD","SF","FF"]
-VALID_CHILD_TYPES  = ["SF","FF","IF"]
+# GROUP = "Combined Faults" oval — an intermediate AND/OR gate node.
+# It has no independent failure meaning; it just groups children under a
+# specific gate before feeding into its parent via the parent's gate.
+# Visually rendered as an oval (like in standard FTA diagrams).
+LEVEL_ORDER        = ["HAZARD", "SF", "FF", "IF", "GROUP"]
+LEVEL_COLORS       = {"HAZARD":"#ff4d4d","SF":"#ff8c42","FF":"#f5c518","IF":"#4caf7d","GROUP":"#7e57c2"}
+LEVEL_TEXT         = {"HAZARD":"#fff","SF":"#fff","FF":"#111","IF":"#fff","GROUP":"#fff"}
+VALID_PARENT_TYPES = ["HAZARD","SF","FF","GROUP"]
+VALID_CHILD_TYPES  = ["SF","FF","IF","GROUP"]
+# For display ordering (GROUP shown between FF and IF)
+DISPLAY_ORDER      = ["HAZARD","SF","FF","IF","GROUP"]
 
 # ── Gist helpers ──────────────────────────────────────────────────────────
 def gh(token): return {"Authorization":f"token {token}","Accept":"application/vnd.github+json"}
@@ -47,19 +53,54 @@ def del_gist_file(token, gid, fname):
 
 # ── Calculation ───────────────────────────────────────────────────────────
 def reverse_distribute(parent_val, gate, n):
+    """
+    Reverse-distribute a parent's required failure rate to its n children.
+
+    OR gate:  children are independent alternatives.
+              Each child needs: parent_val / n
+              (sum approximation: λ_parent ≈ Σ λ_children for small rates)
+
+    AND gate: children must ALL fail simultaneously (combined fault).
+              Each child needs: parent_val ^ (1/n)
+              (product law: λ_parent ≈ Π λ_children for independent events)
+
+    GROUP nodes (Combined Faults ovals) use their own gate to distribute
+    down to their children, then pass their own calculated value up to their
+    parent via the parent's gate — exactly like any other node.
+    """
     if n == 0: return parent_val
     return parent_val / n if gate == "OR" else parent_val ** (1.0 / n)
 
 def recalculate(nodes):
     """
-    Robust BFS top-down reverse distribution.
-    - Supports multiple HAZARDs
-    - Shared nodes receive WORST (MAX) value from all parent paths
-    - Handles cycles gracefully via visit count limit
-    - Scales to 500+ nodes
+    Robust multi-pass BFS top-down reverse distribution.
+
+    Supports:
+    - Multiple HAZARDs
+    - GROUP nodes (intermediate AND/OR gates, the 'Combined Faults' ovals)
+    - Mixed OR+AND in the same tree at any level
+    - Shared nodes (receive WORST = MAX value from all parent paths)
+    - Cycles (visit count guard)
+    - 500+ nodes
+
+    How GROUP nodes work:
+      SF-14 (OR gate) → CombinedFaults1 (AND gate) → FF-01, FF-02
+                      → CombinedFaults2 (AND gate) → IF-016, IF-208
+
+      1. SF-14 distributes via OR → each GROUP child gets sf14_val/2
+      2. CombinedFaults1 distributes via AND → FF-01,FF-02 each get (sf14_val/2)^0.5
+      3. CombinedFaults2 distributes via AND → IF-016,IF-208 each get (sf14_val/2)^0.5
+
+      FF-05 (OR gate) → IF-286 (direct)
+                      → IF-287 (direct)
+                      → IF-288 (direct)
+                      → CombinedFaults (AND gate) → IF-293, IF-289
+
+      FF-05 has 4 children via OR. CombinedFaults gets ff05_val/4,
+      then distributes via AND → IF-293,IF-289 each get (ff05_val/4)^0.5
     """
-    updated  = [dict(n) for n in nodes]
-    by_id    = {n["id"]: n for n in updated}
+    updated     = [dict(n) for n in nodes]
+    by_id       = {n["id"]: n for n in updated}
 
     # Reset all non-HAZARD calculated values
     for n in updated:
@@ -67,29 +108,27 @@ def recalculate(nodes):
             n["calculatedValue"] = None
 
     # BFS from all HAZARDs simultaneously
-    queue    = [n for n in updated if n["type"] == "HAZARD"]
-    # Track how many times each node has been visited (cycle guard)
+    queue       = [n for n in updated if n["type"] == "HAZARD"]
     visit_count = {}
+    max_visits  = len(updated) * 2 + 10  # generous limit handles complex shared nets
 
     while queue:
         parent = queue.pop(0)
         pid    = parent["id"]
         visit_count[pid] = visit_count.get(pid, 0) + 1
-        if visit_count[pid] > len(updated) + 1:
-            # cycle detected — skip to prevent infinite loop
-            continue
+        if visit_count[pid] > max_visits:
+            continue  # cycle guard
 
         children = [n for n in updated if pid in (n.get("parentIds") or [])]
         if not children:
             continue
 
-        # Use the node's own calculated value (already set from its parents)
         if parent["type"] == "HAZARD":
             parent_val = parent.get("targetValue") or 1e-7
         else:
             parent_val = parent.get("calculatedValue")
             if parent_val is None:
-                # Parent not yet resolved — re-queue at end
+                # Not yet resolved — defer until parent is calculated
                 queue.append(parent)
                 continue
 
@@ -97,7 +136,7 @@ def recalculate(nodes):
 
         for child in children:
             existing = child.get("calculatedValue")
-            # Shared nodes: WORST (MAX) value — highest failure rate is most conservative
+            # Shared nodes: WORST (MAX) — highest failure rate is most conservative
             if existing is None:
                 child["calculatedValue"] = child_val
             else:
@@ -265,16 +304,17 @@ def export_excel(nodes):
 # ── Tree HTML builder ─────────────────────────────────────────────────────
 def build_html_tree(nodes, filter_hazard_id=None):
     """
-    Build interactive zoomable/pannable/draggable tree.
-    filter_hazard_id=None  → full tree (all hazards)
-    filter_hazard_id=<id>  → only that hazard subtree
+    Interactive tree with:
+    - Zoom (scroll), Pan (right-drag), Move nodes (left-drag)
+    - Collapse/expand subtrees
+    - Click to highlight full ancestor+descendant path
+    - GROUP nodes rendered as ovals (Combined Faults)
+    - Search: highlights matching nodes across the tree
     """
     if not nodes: return ""
     by_id   = {n["id"]: n for n in nodes}
 
-    # Determine which nodes to show
     if filter_hazard_id:
-        # BFS from chosen hazard to collect all reachable nodes
         visible = set()
         q = [filter_hazard_id]
         while q:
@@ -290,7 +330,7 @@ def build_html_tree(nodes, filter_hazard_id=None):
     hazards = [n for n in show_nodes if n["type"] == "HAZARD"]
     if not hazards: return ""
 
-    nodes_js = json.dumps({
+    nodes_js = __import__("json").dumps({
         n["id"]: {
             "name":      n["name"],
             "type":      n["type"],
@@ -301,18 +341,19 @@ def build_html_tree(nodes, filter_hazard_id=None):
             "childNames":[c["name"] for c in show_nodes if n["id"] in (c.get("parentIds") or [])],
             "parents":   [by_id[p]["name"] for p in (n.get("parentIds") or []) if p in by_id],
             "shared":    len(n.get("parentIds") or []) > 1,
-            "color":     LEVEL_COLORS.get(n["type"], "#888"),
+            "color":     LEVEL_COLORS.get(n["type"], "#7e57c2"),
             "tcolor":    LEVEL_TEXT.get(n["type"], "#fff"),
+            "isGroup":   n["type"] == "GROUP",
         }
         for n in show_nodes
     })
-    edges_js = json.dumps([
+    edges_js = __import__("json").dumps([
         [pid, n["id"]]
         for n in show_nodes
         for pid in (n.get("parentIds") or [])
         if pid in by_id and pid in {x["id"] for x in show_nodes}
     ])
-    level_groups_js = json.dumps({
+    level_groups_js = __import__("json").dumps({
         lvl: [n["id"] for n in show_nodes if n["type"] == lvl]
         for lvl in LEVEL_ORDER
     })
@@ -326,14 +367,25 @@ body{{background:#0a0a0a;font-family:'JetBrains Mono','Fira Code',monospace;colo
 .tb-btn{{background:#1a1a1a;border:1px solid #2a2a2a;color:#aaa;border-radius:4px;padding:3px 9px;cursor:pointer;font-family:inherit;font-size:10px;transition:all 0.1s;white-space:nowrap;}}
 .tb-btn:hover{{background:#252525;color:#fff;border-color:#555;}}
 #zoom-lbl{{color:#555;min-width:36px;text-align:center;}}
+#search-box{{background:#1a1a1a;border:1px solid #2a2a2a;color:#ccc;border-radius:4px;padding:3px 8px;font-family:inherit;font-size:10px;width:160px;outline:none;}}
+#search-box:focus{{border-color:#e94560;}}
+#search-box::placeholder{{color:#444;}}
+#search-info{{color:#666;font-size:9px;min-width:60px;}}
 #hint{{color:#2a2a2a;font-size:9px;margin-left:4px;}}
 #viewport{{flex:1;overflow:hidden;position:relative;cursor:default;}}
 #canvas{{position:absolute;top:0;left:0;transform-origin:0 0;will-change:transform;}}
 svg#edges{{position:absolute;top:0;left:0;pointer-events:none;overflow:visible;}}
-.nw{{position:absolute;display:flex;flex-direction:column;align-items:center;cursor:grab;transition:opacity 0.2s;}}
-.fn{{border-radius:8px;padding:7px 11px;min-width:125px;max-width:160px;user-select:none;border:2px solid transparent;transition:filter 0.12s,box-shadow 0.12s;}}
+/* rectangular nodes */
+.nw{{position:absolute;display:flex;flex-direction:column;align-items:center;cursor:grab;}}
+.fn{{border-radius:8px;padding:7px 11px;min-width:128px;max-width:162px;user-select:none;border:2px solid transparent;transition:filter 0.12s,box-shadow 0.12s;}}
 .fn:hover{{filter:brightness(1.18);}}
-.fn.dimmed{{opacity:0.2;}}
+.fn.dimmed{{opacity:0.18;}}
+/* oval GROUP nodes */
+.fn-group{{border-radius:50%;padding:10px 16px;min-width:100px;max-width:130px;text-align:center;user-select:none;border:2px solid transparent;transition:filter 0.12s,box-shadow 0.12s;}}
+.fn-group:hover{{filter:brightness(1.18);}}
+.fn-group.dimmed{{opacity:0.18;}}
+/* search highlight */
+.fn.search-match,.fn-group.search-match{{outline:2px solid #f5c518;outline-offset:2px;}}
 .gt{{font-size:8px;font-weight:700;padding:1px 6px;border-radius:3px;margin-top:3px;border:1px solid;letter-spacing:1px;background:#0d0d0d;}}
 .cb{{width:18px;height:18px;border-radius:50%;border:1px solid #333;background:#1a1a1a;color:#888;font-size:9px;cursor:pointer;display:flex;align-items:center;justify-content:center;margin-top:2px;transition:all 0.1s;flex-shrink:0;font-family:monospace;font-weight:700;}}
 .cb:hover{{background:#252525;color:#fff;border-color:#555;}}
@@ -358,7 +410,12 @@ svg#edges{{position:absolute;top:0;left:0;pointer-events:none;overflow:visible;}
   <button class="tb-btn" onclick="expandAll()">⊞ Expand</button>
   <button class="tb-btn" onclick="collapseAll()">⊟ Collapse</button>
   <button class="tb-btn" onclick="clearHL()">✕ Clear</button>
-  <span id="hint">Scroll=zoom · Right-drag=pan · Left-drag=move node · Click=inspect · ▼=collapse subtree</span>
+  <span style="color:#2a2a2a">|</span>
+  <input id="search-box" type="text" placeholder="Search nodes..." oninput="doSearch(this.value)" />
+  <button class="tb-btn" onclick="searchNext()">&#x25BC; Next</button>
+  <button class="tb-btn" onclick="searchPrev()">&#x25B2; Prev</button>
+  <span id="search-info"></span>
+  <span id="hint">Scroll=zoom · Right-drag=pan · Left-drag=move · Click=inspect</span>
 </div>
 <div id="viewport"><div id="canvas"><svg id="edges"></svg></div></div>
 <div id="dp">
@@ -380,31 +437,38 @@ svg#edges{{position:absolute;top:0;left:0;pointer-events:none;overflow:visible;}
 const NODES={nodes_js};
 const EDGES={edges_js};
 const LEVELS={level_groups_js};
-const NW=145,NH=82,HGAP=28,VGAP=110;
-const LCOLORS={{HAZARD:"#ff4d4d",SF:"#ff8c42",FF:"#f5c518",IF:"#4caf7d"}};
+// Node dimensions (GROUP nodes are smaller/oval)
+const NW=145,NH=82,GW=118,GH=64;
+const HGAP=28,VGAP=120;
 const GCOLORS={{OR:"#4fc3f7",AND:"#ffb74d"}};
 let scale=1,tx=0,ty=0,pos={{}};
 let collapsed=new Set(),selId=null;
 let panning=false,panSt={{x:0,y:0}};
 let dragId=null,dragOff={{x:0,y:0}},didDrag=false;
+// Search state
+let searchMatches=[],searchIdx=0;
 const canvas=document.getElementById("canvas");
 const vp=document.getElementById("viewport");
 const svg=document.getElementById("edges");
 
+function nodeW(id){{return NODES[id]?.isGroup?GW:NW;}}
+function nodeH(id){{return NODES[id]?.isGroup?GH:NH;}}
+
 // ── layout ────────────────────────────────────────────────────────────
 function buildLayout(){{
-  const LYS={{HAZARD:30,SF:210,FF:390,IF:570}};
-  ["HAZARD","SF","FF","IF"].forEach(lvl=>{{
+  // Assign Y by FTA level; X spread evenly
+  const LYS={{HAZARD:30,SF:200,FF:370,GROUP:450,IF:540}};
+  ["HAZARD","SF","FF","GROUP","IF"].forEach(lvl=>{{
     const ids=LEVELS[lvl]||[];
     ids.forEach((id,i)=>{{
-      pos[id]={{x:60+i*(NW+HGAP),y:LYS[lvl]}};
+      pos[id]={{x:60+i*(NW+HGAP), y:LYS[lvl]||400}};
     }});
   }});
-  // centre each hazard over its direct children
+  // Centre each hazard over its direct children
   (LEVELS.HAZARD||[]).forEach(hid=>{{
     const kids=EDGES.filter(e=>e[0]===hid).map(e=>e[1]);
     if(kids.length){{
-      const xs=kids.map(k=>pos[k]?pos[k].x+NW/2:400);
+      const xs=kids.map(k=>(pos[k]?pos[k].x+nodeW(k)/2:400));
       pos[hid].x=(xs.reduce((a,b)=>a+b,0)/xs.length)-NW/2;
     }}
   }});
@@ -425,9 +489,10 @@ function zoomBy(d,cx,cy){{
 function resetView(){{
   scale=1;
   const vr=vp.getBoundingClientRect();
-  const allX=Object.values(pos).map(p=>p.x+NW);
-  const treeW=Math.max(...allX)-Math.min(...Object.values(pos).map(p=>p.x));
-  tx=Math.max(20,(vr.width-treeW)/2); ty=20; applyT();
+  const allX=Object.keys(pos).map(id=>pos[id].x+nodeW(id));
+  const minX=Math.min(...Object.values(pos).map(p=>p.x));
+  const treeW=Math.max(...allX)-minX;
+  tx=Math.max(20,(vr.width-treeW)/2)-minX; ty=20; applyT();
 }}
 vp.addEventListener("wheel",e=>{{e.preventDefault();zoomBy(e.deltaY<0?0.1:-0.1,e.clientX,e.clientY);}},{{passive:false}});
 vp.addEventListener("mousedown",e=>{{
@@ -447,10 +512,7 @@ window.addEventListener("mousemove",e=>{{
 }});
 window.addEventListener("mouseup",e=>{{
   if(e.button===2){{panning=false;vp.style.cursor="default";}}
-  if(e.button===0&&dragId){{
-    const id=dragId; dragId=null; document.body.style.userSelect="";
-    if(!didDrag) selectNode(id);
-  }}
+  if(e.button===0&&dragId){{const id=dragId;dragId=null;document.body.style.userSelect="";if(!didDrag)selectNode(id);}}
 }});
 vp.addEventListener("contextmenu",e=>e.preventDefault());
 
@@ -460,8 +522,7 @@ vp.addEventListener("touchstart",e=>{{if(e.touches.length===2)ltd=Math.hypot(e.t
 vp.addEventListener("touchmove",e=>{{
   if(e.touches.length===2&&ltd){{
     const d=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY);
-    const mx=(e.touches[0].clientX+e.touches[1].clientX)/2;
-    const my=(e.touches[0].clientY+e.touches[1].clientY)/2;
+    const mx=(e.touches[0].clientX+e.touches[1].clientX)/2,my=(e.touches[0].clientY+e.touches[1].clientY)/2;
     zoomBy((d-ltd)*0.008,mx,my); ltd=d; e.preventDefault();
   }}
 }},{{passive:false}});
@@ -477,29 +538,58 @@ function getAnc(id){{
   while(q.length){{const c=q.shift();(NODES[c]?.parentIds||[]).forEach(p=>{{if(!r.has(p)){{r.add(p);q.push(p);}}}});}};
   return r;
 }}
-function toggleCollapse(e,id){{
-  e.stopPropagation();
-  collapsed.has(id)?collapsed.delete(id):collapsed.add(id);
-  updateVis(); drawEdges();
-}}
+function toggleCollapse(e,id){{e.stopPropagation();collapsed.has(id)?collapsed.delete(id):collapsed.add(id);updateVis();drawEdges();}}
 function updateVis(){{
-  const hidden=new Set();
-  collapsed.forEach(cid=>getDesc(cid).forEach(d=>hidden.add(d)));
+  const hidden=new Set();collapsed.forEach(cid=>getDesc(cid).forEach(d=>hidden.add(d)));
   Object.keys(NODES).forEach(id=>{{
-    const el=document.getElementById("nw-"+id);
-    if(!el) return;
-    el.style.opacity=hidden.has(id)?"0":"1";
-    el.style.pointerEvents=hidden.has(id)?"none":"";
+    const el=document.getElementById("nw-"+id);if(!el)return;
+    el.style.opacity=hidden.has(id)?"0":"1";el.style.pointerEvents=hidden.has(id)?"none":"";
   }});
-  Object.keys(NODES).forEach(id=>{{
-    const btn=document.getElementById("cb-"+id);
-    if(btn) btn.textContent=collapsed.has(id)?"+":"-";
-  }});
+  Object.keys(NODES).forEach(id=>{{const btn=document.getElementById("cb-"+id);if(btn)btn.textContent=collapsed.has(id)?"+":"-";}});
 }}
 function expandAll(){{collapsed.clear();updateVis();drawEdges();}}
-function collapseAll(){{
-  Object.keys(NODES).forEach(id=>{{if((NODES[id].children||[]).length)collapsed.add(id);}});
-  updateVis();drawEdges();
+function collapseAll(){{Object.keys(NODES).forEach(id=>{{if((NODES[id].children||[]).length)collapsed.add(id);}});updateVis();drawEdges();}}
+
+// ── search ────────────────────────────────────────────────────────────
+function doSearch(q){{
+  // Clear old matches
+  document.querySelectorAll(".search-match").forEach(el=>el.classList.remove("search-match"));
+  searchMatches=[]; searchIdx=0;
+  if(!q.trim()){{document.getElementById("search-info").textContent="";return;}}
+  const lq=q.toLowerCase();
+  Object.entries(NODES).forEach(([id,node])=>{{
+    if(node.name.toLowerCase().includes(lq)||node.type.toLowerCase().includes(lq)||node.value.toLowerCase().includes(lq)){{
+      searchMatches.push(id);
+      const el=document.getElementById("nw-"+id)?.querySelector(".fn,.fn-group");
+      if(el) el.classList.add("search-match");
+    }}
+  }});
+  document.getElementById("search-info").textContent=searchMatches.length?`${{searchMatches.length}} found`:"0 found";
+  if(searchMatches.length)panToNode(searchMatches[0]);
+}}
+function searchNext(){{
+  if(!searchMatches.length)return;
+  searchIdx=(searchIdx+1)%searchMatches.length;
+  panToNode(searchMatches[searchIdx]);
+  updateSearchInfo();
+}}
+function searchPrev(){{
+  if(!searchMatches.length)return;
+  searchIdx=(searchIdx-1+searchMatches.length)%searchMatches.length;
+  panToNode(searchMatches[searchIdx]);
+  updateSearchInfo();
+}}
+function updateSearchInfo(){{
+  document.getElementById("search-info").textContent=
+    searchMatches.length?`${{searchIdx+1}}/${{searchMatches.length}}`:"0 found";
+}}
+function panToNode(id){{
+  const p=pos[id]; if(!p) return;
+  const vr=vp.getBoundingClientRect();
+  const nw=nodeW(id),nh=nodeH(id);
+  tx=vr.width/2-(p.x+nw/2)*scale;
+  ty=vr.height/2-(p.y+nh/2)*scale;
+  applyT();
 }}
 
 // ── selection + path highlight ────────────────────────────────────────
@@ -509,11 +599,11 @@ function selectNode(id){{
   if(selId===id){{selId=null;closeDP();return;}}
   selId=id;
   const node=NODES[id]; if(!node) return;
-  const anc=getAnc(id), desc=getDesc(id);
+  const anc=getAnc(id),desc=getDesc(id);
   Object.keys(NODES).forEach(nid=>{{
-    const el=document.getElementById("nw-"+nid)?.querySelector(".fn");
+    const el=document.getElementById("nw-"+nid)?.querySelector(".fn,.fn-group");
     if(!el) return;
-    if(nid===id) el.style.boxShadow="0 0 0 3px #e94560,0 0 24px #e9456099";
+    if(nid===id)      el.style.boxShadow="0 0 0 3px #e94560,0 0 24px #e9456099";
     else if(anc.has(nid))  el.style.boxShadow="0 0 0 2px #4fc3f7,0 0 14px #4fc3f755";
     else if(desc.has(nid)) el.style.boxShadow="0 0 0 2px #ff8c42,0 0 14px #ff8c4255";
     else el.classList.add("dimmed");
@@ -522,7 +612,7 @@ function selectNode(id){{
   showDP(id,node);
 }}
 function clearNodeStyles(){{
-  document.querySelectorAll(".fn").forEach(el=>{{el.style.boxShadow="";el.classList.remove("dimmed");}});
+  document.querySelectorAll(".fn,.fn-group").forEach(el=>{{el.style.boxShadow="";el.classList.remove("dimmed");}});
 }}
 function clearHL(){{selId=null;clearNodeStyles();drawEdges();closeDP();}}
 
@@ -534,7 +624,7 @@ function showDP(id,node){{
     `<span style="color:${{node.color}}">${{node.name}}</span>`+
     (node.shared?' <span style="background:#f5c518;color:#111;font-size:8px;padding:1px 5px;border-radius:5px;font-weight:700;">SHARED</span>':'');
   document.getElementById("dp-type").style.color=node.color;
-  document.getElementById("dp-type").textContent=node.type;
+  document.getElementById("dp-type").textContent=node.isGroup?"GROUP (Combined)":node.type;
   document.getElementById("dp-gate").style.color=GCOLORS[node.gate]||"#aaa";
   document.getElementById("dp-gate").textContent=node.gate;
   document.getElementById("dp-value").style.color=node.color;
@@ -548,20 +638,24 @@ function closeDP(){{document.getElementById("dp").style.display="none";}}
 
 // ── SVG edges ─────────────────────────────────────────────────────────
 function drawEdges(hl){{
-  const hidden=new Set();
-  collapsed.forEach(cid=>getDesc(cid).forEach(d=>hidden.add(d)));
+  const hidden=new Set(); collapsed.forEach(cid=>getDesc(cid).forEach(d=>hidden.add(d)));
   let s="";
   EDGES.forEach(([pid,cid])=>{{
     if(hidden.has(cid)||hidden.has(pid)) return;
     const pp=pos[pid],cp=pos[cid]; if(!pp||!cp) return;
-    const x1=pp.x+NW/2,y1=pp.y+NH,x2=cp.x+NW/2,y2=cp.y,my=(y1+y2)/2;
+    const x1=pp.x+nodeW(pid)/2, y1=pp.y+nodeH(pid);
+    const x2=cp.x+nodeW(cid)/2, y2=cp.y, my=(y1+y2)/2;
     const isHl=hl&&(hl.has(pid)||hl.has(cid));
+    // AND-gate edges are dashed to distinguish them visually
+    const parentNode=NODES[pid];
+    const dash=parentNode&&parentNode.gate==="AND"?"stroke-dasharray=\'6,3\'":"";
     s+=`<path d="M${{x1}},${{y1}} C${{x1}},${{my}} ${{x2}},${{my}} ${{x2}},${{y2}}"
-      fill="none" stroke="${{isHl?"#4fc3f7":"#252525"}}" stroke-width="${{isHl?2:1.5}}"
-      opacity="${{isHl?1:0.8}}"/>`;
+      fill="none" stroke="${{isHl?"#4fc3f7":"#2a2a2a"}}" stroke-width="${{isHl?2.5:1.5}}"
+      ${{dash}} opacity="${{isHl?1:0.9}}"/>`;
   }});
-  const maxX=Math.max(...Object.values(pos).map(p=>p.x+NW+80),800);
-  const maxY=Math.max(...Object.values(pos).map(p=>p.y+NH+80),600);
+  const allX=Object.keys(pos).map(id=>pos[id].x+nodeW(id)+80);
+  const allY=Object.keys(pos).map(id=>pos[id].y+nodeH(id)+80);
+  const maxX=Math.max(...allX,800),maxY=Math.max(...allY,600);
   svg.setAttribute("width",maxX); svg.setAttribute("height",maxY);
   svg.style.width=maxX+"px"; svg.style.height=maxY+"px";
   svg.innerHTML=s;
@@ -574,31 +668,50 @@ function renderNodes(){{
     const gc=GCOLORS[node.gate]||"#aaa";
     const hasCh=(node.children||[]).length>0;
     const sb=node.shared?`<span style="background:#f5c518;color:#111;font-size:6px;padding:1px 3px;border-radius:3px;font-weight:700;margin-left:3px;">SHR</span>`:"";
+    const nw=nodeW(id),nh=nodeH(id);
     const wrap=document.createElement("div");
     wrap.id="nw-"+id; wrap.className="nw";
-    wrap.style.cssText=`left:${{p.x}}px;top:${{p.y}}px;width:${{NW}}px;`;
+    wrap.style.cssText=`left:${{p.x}}px;top:${{p.y}}px;width:${{nw}}px;`;
     wrap.onmousedown=e=>{{
       if(e.button!==0) return;
       e.stopPropagation(); didDrag=false;
-      dragId=id; dragOff={{x:e.clientX/scale-tx/scale-p.x,y:e.clientY/scale-ty/scale-p.y}};
+      // Re-read current pos (may have been dragged)
+      const cp=pos[id];
+      dragId=id; dragOff={{x:e.clientX/scale-tx/scale-cp.x, y:e.clientY/scale-ty/scale-cp.y}};
       document.body.style.userSelect="none";
     }};
-    wrap.innerHTML=`
-      <div class="fn" style="background:${{node.color}};color:${{node.tcolor}};border-color:${{node.color}};width:100%;">
-        <div style="font-size:7px;opacity:0.75;letter-spacing:1px;margin-bottom:2px;display:flex;align-items:center;justify-content:center;">
-          ${{node.type}}${{sb}}
+
+    if(node.isGroup){{
+      // Oval GROUP node (Combined Faults)
+      wrap.innerHTML=`
+        <div class="fn-group" style="background:${{node.color}};color:${{node.tcolor}};border-color:${{node.color}};width:${{nw}}px;height:${{nh}}px;display:flex;flex-direction:column;align-items:center;justify-content:center;">
+          <div style="font-size:7px;letter-spacing:1px;opacity:0.75;margin-bottom:2px;">COMBINED</div>
+          <div style="font-size:9px;font-weight:700;text-align:center;word-break:break-word;line-height:1.2;">${{node.name}}</div>
+          <div style="font-size:10px;font-weight:700;font-family:monospace;margin-top:3px;background:rgba(0,0,0,0.25);border-radius:3px;padding:1px 5px;">${{node.value}}</div>
         </div>
-        <div style="font-size:10px;font-weight:700;text-align:center;word-break:break-word;margin-bottom:4px;line-height:1.3;">
-          ${{node.name}}
+        ${{hasCh?`<div style="display:flex;align-items:center;gap:4px;margin-top:2px;">
+          <div class="gt" style="color:${{gc}};border-color:${{gc}};">${{node.gate}}</div>
+          <button class="cb" id="cb-${{id}}" onclick="toggleCollapse(event,'${{id}}')">-</button>
+        </div>`:"__LEAF__"}}`;
+    }} else {{
+      // Rectangular node
+      wrap.innerHTML=`
+        <div class="fn" style="background:${{node.color}};color:${{node.tcolor}};border-color:${{node.color}};width:100%;">
+          <div style="font-size:7px;opacity:0.75;letter-spacing:1px;margin-bottom:2px;display:flex;align-items:center;justify-content:center;">
+            ${{node.type}}${{sb}}
+          </div>
+          <div style="font-size:10px;font-weight:700;text-align:center;word-break:break-word;margin-bottom:4px;line-height:1.3;">
+            ${{node.name}}
+          </div>
+          <div style="background:rgba(0,0,0,0.26);border-radius:3px;padding:2px 5px;font-size:11px;font-weight:700;text-align:center;font-family:monospace;">
+            ${{node.value}}
+          </div>
         </div>
-        <div style="background:rgba(0,0,0,0.26);border-radius:3px;padding:2px 5px;font-size:11px;font-weight:700;text-align:center;font-family:monospace;">
-          ${{node.value}}
-        </div>
-      </div>
-      ${{hasCh?`<div style="display:flex;align-items:center;gap:4px;margin-top:2px;">
-        <div class="gt" style="color:${{gc}};border-color:${{gc}};">${{node.gate}}</div>
-        <button class="cb" id="cb-${{id}}" onclick="toggleCollapse(event,'${{id}}')">-</button>
-      </div>`:"__LEAF__"}}`;
+        ${{hasCh?`<div style="display:flex;align-items:center;gap:4px;margin-top:2px;">
+          <div class="gt" style="color:${{gc}};border-color:${{gc}};">${{node.gate}}</div>
+          <button class="cb" id="cb-${{id}}" onclick="toggleCollapse(event,'${{id}}')">-</button>
+        </div>`:"__LEAF__"}}`;
+    }}
     canvas.appendChild(wrap);
   }});
 }}
@@ -606,17 +719,15 @@ function renderNodes(){{
 buildLayout();
 renderNodes();
 drawEdges();
-// centre on load
 (function(){{
   const vr=vp.getBoundingClientRect();
-  const allX=Object.values(pos).map(p=>p.x+NW);
+  const allX=Object.keys(pos).map(id=>pos[id].x+nodeW(id));
   const minX=Math.min(...Object.values(pos).map(p=>p.x));
   const treeW=Math.max(...allX)-minX;
   tx=Math.max(20,(vr.width-treeW)/2)-minX; ty=20; applyT();
 }})();
 </script></body></html>"""
 
-# ── Hierarchy rows ────────────────────────────────────────────────────────
 def build_hierarchy_rows(nodes, filter_hazard_id=None):
     by_id = {n["id"]: n for n in nodes}
     rows, visited = [], set()
@@ -698,7 +809,7 @@ section[data-testid="stSidebar"]{background:#111!important;border-right:1px soli
 nodes    = st.session_state.nodes
 hazards  = [n for n in nodes if n["type"] == "HAZARD"]
 by_id    = {n["id"]: n for n in nodes}
-by_level = {lvl: [n for n in nodes if n["type"] == lvl] for lvl in LEVEL_ORDER}
+by_level = {lvl: [n for n in nodes if n["type"] == lvl] for lvl in DISPLAY_ORDER}
 
 # ── Header ────────────────────────────────────────────────────────────────
 sc = st.session_state.save_status
@@ -811,14 +922,42 @@ with st.sidebar:
         if hazards:
             st.markdown("---")
             st.markdown("<div style='font-size:9px;color:#ff8c42;letter-spacing:2px;margin-bottom:4px;'>ADD CHILD NODE</div>", unsafe_allow_html=True)
+
+            # Modelling guide tip
+            with st.expander("💡 How to model mixed AND/OR gates"):
+                st.markdown("""
+**Problem:** A parent needs some children via OR, but others must combine via AND (Combined Faults).
+
+**Solution — use a GROUP node:**
+
+*Example: SF-14 (OR gate)*
+- Add `SF-14` with gate=**OR**
+- Add `Combined Faults 1` as type=**GROUP**, gate=**AND**, parent=SF-14
+  - Add `FF-01` parent=Combined Faults 1
+  - Add `FF-02` parent=Combined Faults 1
+- Add `Combined Faults 2` as type=**GROUP**, gate=**AND**, parent=SF-14
+  - Add `IF-016` parent=Combined Faults 2
+  - Add `IF-208` parent=Combined Faults 2
+
+*Example: FF-05 (mixed)*
+- Add `FF-05` with gate=**OR**
+- Add `IF-286`, `IF-287`, `IF-288` direct children (parent=FF-05)
+- Add `Combined Faults` GROUP node (AND), parent=FF-05
+  - Add `IF-293`, `IF-289` parent=Combined Faults
+
+GROUP nodes appear as **purple ovals** in the tree. Their gate controls how their children combine.
+                """)
+
             node_name = st.text_input("Node Name", placeholder="e.g. Power Failure", key="add_name")
             parent_opts = {f"[{n['type']}] {n['name']}": n["id"]
                            for n in nodes if n["type"] in VALID_PARENT_TYPES}
             sel_labels  = st.multiselect("Parent Node(s)", list(parent_opts.keys()),
-                                         help="Multiple = shared node. SF→SF supported.", key="add_par")
+                                         help="Multiple = shared node. SF→SF and GROUP parents supported.", key="add_par")
             sel_pids    = [parent_opts[l] for l in sel_labels]
-            node_type   = st.selectbox("Type", VALID_CHILD_TYPES, key="add_type")
-            gate        = st.radio("Gate", ["OR","AND"], horizontal=True, key="add_gate")
+            node_type   = st.selectbox("Type", VALID_CHILD_TYPES, key="add_type",
+                                       help="GROUP = Combined Faults oval (intermediate AND/OR gate node)")
+            gate        = st.radio("Gate", ["OR","AND"], horizontal=True, key="add_gate",
+                                   help="OR: any child causes failure. AND: ALL children must fail (Combined Faults).")
             if st.button("✅ ADD NODE", use_container_width=True, type="primary"):
                 if not node_name.strip(): st.error("Enter node name")
                 elif not sel_pids:       st.error("Select at least one parent")
@@ -928,10 +1067,10 @@ st.markdown("---")
 nodes    = st.session_state.nodes
 hazards  = [n for n in nodes if n["type"] == "HAZARD"]
 by_id    = {n["id"]: n for n in nodes}
-by_level = {lvl:[n for n in nodes if n["type"]==lvl] for lvl in LEVEL_ORDER}
+by_level = {lvl:[n for n in nodes if n["type"]==lvl] for lvl in DISPLAY_ORDER}
 
 # ── Tabs ──────────────────────────────────────────────────────────────────
-tab_tree, tab_hier, tab_vals = st.tabs(["🌳 TREE", "📋 HIERARCHY", "📊 VALUES"])
+tab_tree, tab_hier, tab_vals, tab_search = st.tabs(["🌳 TREE", "📋 HIERARCHY", "📊 VALUES", "🔍 SEARCH"])
 
 # ── TAB 1: Tree ───────────────────────────────────────────────────────────
 with tab_tree:
@@ -999,9 +1138,9 @@ with tab_vals:
         else:
             show = nodes
 
-        show_by_level = {lvl: [n for n in show if n["type"] == lvl] for lvl in LEVEL_ORDER}
+        show_by_level = {lvl: [n for n in show if n["type"] == lvl] for lvl in DISPLAY_ORDER}
 
-        for level in LEVEL_ORDER:
+        for level in DISPLAY_ORDER:
             lvl_nodes = show_by_level[level]
             if not lvl_nodes: continue
             color = LEVEL_COLORS[level]
@@ -1026,7 +1165,7 @@ with tab_vals:
 
         st.markdown("---")
         cols = st.columns(5)
-        counts = [(lvl, len(show_by_level[lvl])) for lvl in LEVEL_ORDER] + [("TOTAL", len(show))]
+        counts = [(lvl, len(show_by_level[lvl])) for lvl in DISPLAY_ORDER] + [("TOTAL", len(show))]
         for i,(lvl,cnt) in enumerate(counts):
             with cols[i%5]:
                 c = LEVEL_COLORS.get(lvl,"#e94560")
@@ -1034,3 +1173,86 @@ with tab_vals:
                   <div style="font-size:8px;color:#555;letter-spacing:2px;">{lvl}</div>
                   <div style="font-size:18px;font-weight:700;color:{c};">{cnt}</div>
                 </div>""", unsafe_allow_html=True)
+
+# ── TAB 4: Search ──────────────────────────────────────────────────────────
+with tab_search:
+    if not nodes:
+        st.markdown("<div style='color:#333;text-align:center;margin-top:40px;'>No nodes yet</div>", unsafe_allow_html=True)
+    else:
+        st.markdown("<div style='font-size:9px;color:#555;letter-spacing:2px;margin-bottom:10px;'>SEARCH ACROSS ALL NODES — by name, type, value, or gate</div>", unsafe_allow_html=True)
+        sq = st.text_input("Search", placeholder="e.g. IF-016, isolation, 1.25e-04, AND", key="search_q", label_visibility="collapsed")
+
+        if sq.strip():
+            lq = sq.strip().lower()
+            matches = [n for n in nodes if (
+                lq in n["name"].lower() or
+                lq in n["type"].lower() or
+                lq in n["gate"].lower() or
+                lq in fmt(n.get("calculatedValue")).lower() or
+                lq in (n.get("id","")).lower()
+            )]
+            st.markdown(f"<div style='font-size:10px;color:#ff8c42;margin-bottom:8px;'>{len(matches)} result(s) for <b>\"{sq}\"</b></div>", unsafe_allow_html=True)
+
+            if not matches:
+                st.markdown("<div style='color:#555;font-size:11px;'>No nodes matched.</div>", unsafe_allow_html=True)
+            else:
+                for node in matches:
+                    color     = LEVEL_COLORS.get(node["type"], "#7e57c2")
+                    gc        = "#4fc3f7" if node["gate"] == "OR" else "#ffb74d"
+                    val       = fmt(node.get("calculatedValue"))
+                    pnames    = " · ".join(by_id[p]["name"] for p in (node.get("parentIds") or []) if p in by_id) or "—"
+                    cnames    = " · ".join(n["name"] for n in nodes if node["id"] in (n.get("parentIds") or [])) or "—"
+                    is_shared = len(node.get("parentIds") or []) > 1
+                    is_group  = node["type"] == "GROUP"
+
+                    # Highlight matched text in name
+                    display_name = node["name"]
+                    try:
+                        idx = display_name.lower().index(lq)
+                        display_name = (display_name[:idx] +
+                            f'<span style="background:#f5c518;color:#111;border-radius:2px;padding:0 2px;">{display_name[idx:idx+len(lq)]}</span>' +
+                            display_name[idx+len(lq):])
+                    except ValueError:
+                        pass
+
+                    shape_style = "border-radius:50px;" if is_group else "border-radius:6px;"
+                    st.markdown(f"""
+                    <div style="background:#141414;border:2px solid {color}55;{shape_style}
+                                padding:9px 14px;margin-bottom:5px;
+                                display:grid;grid-template-columns:2.5fr 0.8fr 0.8fr 1.5fr 2.5fr;gap:10px;align-items:center;">
+                      <div>
+                        <div style="font-weight:700;font-size:11px;color:#ddd;">{display_name}</div>
+                        <div style="font-size:8px;color:#555;margin-top:1px;">id: {node['id']}</div>
+                        {'<div style="font-size:8px;color:#f5c518;">◈ SHARED</div>' if is_shared else ''}
+                        {'<div style="font-size:8px;color:#7e57c2;">◉ GROUP (Combined Faults)</div>' if is_group else ''}
+                      </div>
+                      <div style="font-size:9px;color:{color};font-weight:700;">{node['type']}</div>
+                      <div style="font-size:9px;color:{gc};font-weight:700;">{node['gate']}</div>
+                      <div style="font-size:10px;color:{color};font-weight:700;font-family:monospace;">{val}</div>
+                      <div style="font-size:9px;color:#555;">↑ {pnames}<br>↓ {cnames}</div>
+                    </div>""", unsafe_allow_html=True)
+        else:
+            # Summary table when no search query
+            st.markdown("<div style='font-size:9px;color:#555;margin-bottom:8px;'>Enter a search term above, or browse all nodes below:</div>", unsafe_allow_html=True)
+            for level in DISPLAY_ORDER:
+                lvl_nodes = by_level[level]
+                if not lvl_nodes: continue
+                color = LEVEL_COLORS.get(level, "#7e57c2")
+                st.markdown(f"<div style='font-size:9px;letter-spacing:3px;color:{color};border-bottom:1px solid {color}33;padding-bottom:3px;margin:10px 0 5px;'>{level} — {len(lvl_nodes)} nodes</div>", unsafe_allow_html=True)
+                for node in lvl_nodes:
+                    val    = fmt(node.get("calculatedValue"))
+                    pnames = " · ".join(by_id[p]["name"] for p in (node.get("parentIds") or []) if p in by_id) or "—"
+                    gc     = "#4fc3f7" if node["gate"] == "OR" else "#ffb74d"
+                    is_shared = len(node.get("parentIds") or []) > 1
+                    st.markdown(f"""
+                    <div style="background:#141414;border-left:3px solid {color};border-radius:0 5px 5px 0;
+                                padding:5px 10px;margin-bottom:3px;
+                                display:grid;grid-template-columns:2.5fr 0.7fr 0.7fr 1.5fr 2fr;gap:8px;align-items:center;">
+                      <div style="font-size:10px;color:#ddd;font-weight:{'700' if node['type']=='HAZARD' else '400'};">
+                        {node['name']}{'<span style="background:#f5c518;color:#111;font-size:7px;padding:0 3px;border-radius:3px;margin-left:5px;">SHR</span>' if is_shared else ''}
+                      </div>
+                      <div style="font-size:9px;color:{color};">{node['type']}</div>
+                      <div style="font-size:9px;color:{gc};">{node['gate']}</div>
+                      <div style="font-size:10px;color:{color};font-family:monospace;font-weight:700;">{val}</div>
+                      <div style="font-size:9px;color:#555;">{pnames}</div>
+                    </div>""", unsafe_allow_html=True)
