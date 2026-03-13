@@ -73,76 +73,116 @@ def reverse_distribute(parent_val, gate, n):
 
 def recalculate(nodes):
     """
-    Robust multi-pass BFS top-down reverse distribution.
+    Robust top-down reverse distribution using Kahn's topological sort.
 
-    Supports:
-    - Multiple HAZARDs
-    - GROUP nodes (intermediate AND/OR gates, the 'Combined Faults' ovals)
-    - Mixed OR+AND in the same tree at any level
-    - Shared nodes (receive WORST = MAX value from all parent paths)
-    - Cycles (visit count guard)
-    - 500+ nodes
+    Why topo-sort instead of plain BFS?
+    - A shared node can have 10+ parents across multiple hazards.
+    - With BFS + visit-count guards, complex shared nets can get wrong values
+      if a node is processed before ALL its parents are resolved.
+    - Kahn's algorithm guarantees every node is processed exactly once,
+      AFTER all its parents have been resolved. This is O(N+E) and handles
+      any DAG of 500+ nodes with N-way sharing correctly.
 
-    How GROUP nodes work:
-      SF-14 (OR gate) → CombinedFaults1 (AND gate) → FF-01, FF-02
-                      → CombinedFaults2 (AND gate) → IF-016, IF-208
+    Standard FTA rules applied:
+    - OR gate parent: child_val = parent_val / n_children
+      (sum rule: λ_parent ≈ Σλ_children for small λ)
+    - AND gate parent: child_val = parent_val ^ (1/n_children)
+      (product rule: λ_parent = Πλ_children for independent events)
+    - Shared node (multiple parents): receives MAX value across all paths.
+      MAX = most conservative (worst-case) allocation — standard FTA practice.
+      This is correct for top-down budgeting: the node must meet the strictest
+      requirement imposed on it from any path.
 
-      1. SF-14 distributes via OR → each GROUP child gets sf14_val/2
-      2. CombinedFaults1 distributes via AND → FF-01,FF-02 each get (sf14_val/2)^0.5
-      3. CombinedFaults2 distributes via AND → IF-016,IF-208 each get (sf14_val/2)^0.5
-
-      FF-05 (OR gate) → IF-286 (direct)
-                      → IF-287 (direct)
-                      → IF-288 (direct)
-                      → CombinedFaults (AND gate) → IF-293, IF-289
-
-      FF-05 has 4 children via OR. CombinedFaults gets ff05_val/4,
-      then distributes via AND → IF-293,IF-289 each get (ff05_val/4)^0.5
+    GROUP nodes (Combined Faults ovals) work transparently:
+      They are normal nodes with their own gate. A GROUP(AND) under an OR
+      parent receives parent_val/n from the parent's OR distribution, then
+      distributes (parent_val/n)^(1/k) to each of its k children.
     """
-    updated     = [dict(n) for n in nodes]
-    by_id       = {n["id"]: n for n in updated}
+    if not nodes:
+        return nodes
+
+    updated = [dict(n) for n in nodes]
+    by_id   = {n["id"]: n for n in updated}
 
     # Reset all non-HAZARD calculated values
     for n in updated:
         if n["type"] != "HAZARD":
             n["calculatedValue"] = None
+        else:
+            # Ensure HAZARD has its targetValue as calculatedValue
+            n["calculatedValue"] = n.get("targetValue") or 1e-7
 
-    # BFS from all HAZARDs simultaneously
-    queue       = [n for n in updated if n["type"] == "HAZARD"]
-    visit_count = {}
-    max_visits  = len(updated) * 2 + 10  # generous limit handles complex shared nets
+    # Build adjacency: parent_id -> [child nodes]
+    children_of = {n["id"]: [] for n in updated}
+    # In-degree: number of parents for each non-HAZARD node
+    # For shared nodes this counts each unique parent once
+    in_degree = {}
+    for n in updated:
+        nid = n["id"]
+        pids = [p for p in (n.get("parentIds") or []) if p in by_id]
+        in_degree[nid] = len(pids)
+        for pid in pids:
+            if pid in children_of:
+                children_of[pid].append(nid)
 
+    # Kahn's algorithm: start from HAZARDs (in_degree handled — they have no parents)
+    # Use a queue of nodes whose ALL parents are resolved
+    from collections import deque
+    resolved = set()
+    queue = deque()
+
+    # Seed with HAZARDs
+    for n in updated:
+        if n["type"] == "HAZARD":
+            resolved.add(n["id"])
+            queue.append(n["id"])
+
+    # Track how many parents of each node have been resolved
+    parents_resolved = {n["id"]: 0 for n in updated}
+
+    # Process in topological order
+    processed = 0
     while queue:
-        parent = queue.pop(0)
-        pid    = parent["id"]
-        visit_count[pid] = visit_count.get(pid, 0) + 1
-        if visit_count[pid] > max_visits:
-            continue  # cycle guard
+        pid = queue.popleft()
+        parent = by_id[pid]
+        parent_val = parent.get("calculatedValue")
 
-        children = [n for n in updated if pid in (n.get("parentIds") or [])]
-        if not children:
+        if parent_val is None:
+            # This shouldn't happen in a well-formed tree, but skip safely
             continue
 
-        if parent["type"] == "HAZARD":
-            parent_val = parent.get("targetValue") or 1e-7
-        else:
-            parent_val = parent.get("calculatedValue")
-            if parent_val is None:
-                # Not yet resolved — defer until parent is calculated
-                queue.append(parent)
-                continue
+        child_ids = children_of.get(pid, [])
+        if not child_ids:
+            continue
 
-        child_val = reverse_distribute(parent_val, parent["gate"], len(children))
+        # Distribute to each direct child
+        # n = number of children (for equal distribution)
+        n_ch = len(child_ids)
+        child_val = reverse_distribute(parent_val, parent["gate"], n_ch)
 
-        for child in children:
+        for cid in child_ids:
+            child = by_id[cid]
             existing = child.get("calculatedValue")
-            # Shared nodes: WORST (MAX) — highest failure rate is most conservative
+
+            # Apply MAX rule for shared nodes — most conservative allocation wins
             if existing is None:
                 child["calculatedValue"] = child_val
             else:
                 child["calculatedValue"] = max(existing, child_val)
-            queue.append(child)
 
+            # Mark this parent as resolved for this child
+            parents_resolved[cid] += 1
+
+            # Enqueue child only when ALL its parents have been resolved
+            # This guarantees the MAX has been fully computed before we propagate down
+            total_parents = in_degree.get(cid, 0)
+            if parents_resolved[cid] >= total_parents and cid not in resolved:
+                resolved.add(cid)
+                queue.append(cid)
+
+        processed += 1
+
+    # Safety: any unresolved nodes (disconnected, cycles) — leave calculatedValue=None
     return updated
 
 # ── Formatters ────────────────────────────────────────────────────────────
@@ -302,14 +342,11 @@ def export_excel(nodes):
     return buf.getvalue()
 
 # ── Tree HTML builder ─────────────────────────────────────────────────────
-def build_html_tree(nodes, filter_hazard_id=None):
+def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
     """
-    Interactive tree with:
-    - Zoom (scroll), Pan (right-drag), Move nodes (left-drag)
-    - Collapse/expand subtrees
-    - Click to highlight full ancestor+descendant path
-    - GROUP nodes rendered as ovals (Combined Faults)
-    - Search: highlights matching nodes across the tree
+    Interactive tree with persistent state across Streamlit reruns.
+    tree_state = {scale, tx, ty, collapsed:[], positions:{id:{x,y}}, focus_id}
+    Shared-node edges rendered as dashed lines through the background.
     """
     if not nodes: return ""
     by_id   = {n["id"]: n for n in nodes}
@@ -330,33 +367,61 @@ def build_html_tree(nodes, filter_hazard_id=None):
     hazards = [n for n in show_nodes if n["type"] == "HAZARD"]
     if not hazards: return ""
 
-    nodes_js = __import__("json").dumps({
+    ts = tree_state or {}
+    init_scale     = ts.get("scale", 1.0)
+    init_tx        = ts.get("tx", 0)
+    init_ty        = ts.get("ty", 0)
+    init_collapsed = ts.get("collapsed", [])
+    init_positions = ts.get("positions", {})
+    focus_id       = ts.get("focus_id", None)
+
+    # Identify shared nodes (appear in multiple parents within shown nodes)
+    shown_ids = {n["id"] for n in show_nodes}
+    shared_ids = {
+        n["id"] for n in show_nodes
+        if len([p for p in (n.get("parentIds") or []) if p in shown_ids]) > 1
+    }
+
+    import json as _json
+    nodes_js = _json.dumps({
         n["id"]: {
             "name":      n["name"],
             "type":      n["type"],
             "gate":      n["gate"],
             "value":     fmt(n.get("calculatedValue")),
+            "nodeId":    n.get("nodeId", n["id"]),
             "parentIds": [p for p in (n.get("parentIds") or []) if p in by_id],
             "children":  [c["id"] for c in show_nodes if n["id"] in (c.get("parentIds") or [])],
             "childNames":[c["name"] for c in show_nodes if n["id"] in (c.get("parentIds") or [])],
             "parents":   [by_id[p]["name"] for p in (n.get("parentIds") or []) if p in by_id],
-            "shared":    len(n.get("parentIds") or []) > 1,
+            "shared":    n["id"] in shared_ids,
             "color":     LEVEL_COLORS.get(n["type"], "#7e57c2"),
             "tcolor":    LEVEL_TEXT.get(n["type"], "#fff"),
             "isGroup":   n["type"] == "GROUP",
         }
         for n in show_nodes
     })
-    edges_js = __import__("json").dumps([
-        [pid, n["id"]]
-        for n in show_nodes
-        for pid in (n.get("parentIds") or [])
-        if pid in by_id and pid in {x["id"] for x in show_nodes}
-    ])
-    level_groups_js = __import__("json").dumps({
+
+    # Split edges: primary (first parent) vs shared (secondary parents)
+    primary_edges = []
+    shared_edges  = []
+    for n in show_nodes:
+        pids = [p for p in (n.get("parentIds") or []) if p in by_id and p in shown_ids]
+        for i, pid in enumerate(pids):
+            if i == 0:
+                primary_edges.append([pid, n["id"]])
+            else:
+                shared_edges.append([pid, n["id"]])
+
+    edges_js        = _json.dumps(primary_edges)
+    shared_edges_js = _json.dumps(shared_edges)
+    level_groups_js = _json.dumps({
         lvl: [n["id"] for n in show_nodes if n["type"] == lvl]
         for lvl in LEVEL_ORDER
     })
+    init_collapsed_js = _json.dumps(init_collapsed)
+    init_positions_js = _json.dumps(init_positions)
+    focus_js = f'"{focus_id}"' if focus_id else "null"
 
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -367,24 +432,20 @@ body{{background:#0a0a0a;font-family:'JetBrains Mono','Fira Code',monospace;colo
 .tb-btn{{background:#1a1a1a;border:1px solid #2a2a2a;color:#aaa;border-radius:4px;padding:3px 9px;cursor:pointer;font-family:inherit;font-size:10px;transition:all 0.1s;white-space:nowrap;}}
 .tb-btn:hover{{background:#252525;color:#fff;border-color:#555;}}
 #zoom-lbl{{color:#555;min-width:36px;text-align:center;}}
-#search-box{{background:#1a1a1a;border:1px solid #2a2a2a;color:#ccc;border-radius:4px;padding:3px 8px;font-family:inherit;font-size:10px;width:160px;outline:none;}}
+#search-box{{background:#1a1a1a;border:1px solid #2a2a2a;color:#ccc;border-radius:4px;padding:3px 8px;font-family:inherit;font-size:10px;width:150px;outline:none;}}
 #search-box:focus{{border-color:#e94560;}}
 #search-box::placeholder{{color:#444;}}
-#search-info{{color:#666;font-size:9px;min-width:60px;}}
-#hint{{color:#2a2a2a;font-size:9px;margin-left:4px;}}
+#search-info{{color:#666;font-size:9px;min-width:55px;}}
 #viewport{{flex:1;overflow:hidden;position:relative;cursor:default;}}
 #canvas{{position:absolute;top:0;left:0;transform-origin:0 0;will-change:transform;}}
 svg#edges{{position:absolute;top:0;left:0;pointer-events:none;overflow:visible;}}
-/* rectangular nodes */
 .nw{{position:absolute;display:flex;flex-direction:column;align-items:center;cursor:grab;}}
 .fn{{border-radius:8px;padding:7px 11px;min-width:128px;max-width:162px;user-select:none;border:2px solid transparent;transition:filter 0.12s,box-shadow 0.12s;}}
 .fn:hover{{filter:brightness(1.18);}}
 .fn.dimmed{{opacity:0.18;}}
-/* oval GROUP nodes */
-.fn-group{{border-radius:50%;padding:10px 16px;min-width:100px;max-width:130px;text-align:center;user-select:none;border:2px solid transparent;transition:filter 0.12s,box-shadow 0.12s;}}
+.fn-group{{border-radius:50%;padding:10px 14px;min-width:100px;max-width:128px;text-align:center;user-select:none;border:2px solid transparent;transition:filter 0.12s,box-shadow 0.12s;}}
 .fn-group:hover{{filter:brightness(1.18);}}
 .fn-group.dimmed{{opacity:0.18;}}
-/* search highlight */
 .fn.search-match,.fn-group.search-match{{outline:2px solid #f5c518;outline-offset:2px;}}
 .gt{{font-size:8px;font-weight:700;padding:1px 6px;border-radius:3px;margin-top:3px;border:1px solid;letter-spacing:1px;background:#0d0d0d;}}
 .cb{{width:18px;height:18px;border-radius:50%;border:1px solid #333;background:#1a1a1a;color:#888;font-size:9px;cursor:pointer;display:flex;align-items:center;justify-content:center;margin-top:2px;transition:all 0.1s;flex-shrink:0;font-family:monospace;font-weight:700;}}
@@ -406,27 +467,26 @@ svg#edges{{position:absolute;top:0;left:0;pointer-events:none;overflow:visible;}
   <button class="tb-btn" onclick="zoomBy(-0.15)">－</button>
   <span id="zoom-lbl">100%</span>
   <span style="color:#2a2a2a">|</span>
-  <button class="tb-btn" onclick="resetView()">⌂ Reset</button>
-  <button class="tb-btn" onclick="expandAll()">⊞ Expand</button>
-  <button class="tb-btn" onclick="collapseAll()">⊟ Collapse</button>
-  <button class="tb-btn" onclick="clearHL()">✕ Clear</button>
+  <button class="tb-btn" onclick="resetView()">&#8962; Reset</button>
+  <button class="tb-btn" onclick="expandAll()">&#8862; Expand</button>
+  <button class="tb-btn" onclick="collapseAll()">&#8863; Collapse</button>
+  <button class="tb-btn" onclick="clearHL()">&#10005; Clear</button>
   <span style="color:#2a2a2a">|</span>
   <input id="search-box" type="text" placeholder="Search nodes..." oninput="doSearch(this.value)" />
-  <button class="tb-btn" onclick="searchNext()">&#x25BC; Next</button>
-  <button class="tb-btn" onclick="searchPrev()">&#x25B2; Prev</button>
+  <button class="tb-btn" onclick="searchNext()">&#x25BC;</button>
+  <button class="tb-btn" onclick="searchPrev()">&#x25B2;</button>
   <span id="search-info"></span>
-  <span id="hint">Scroll=zoom · Right-drag=pan · Left-drag=move · Click=inspect</span>
 </div>
 <div id="viewport"><div id="canvas"><svg id="edges"></svg></div></div>
 <div id="dp">
-  <button id="dp-close" onclick="closeDP()">✕</button>
+  <button id="dp-close" onclick="closeDP()">&#10005;</button>
   <div style="font-size:8px;color:#888;letter-spacing:3px;margin-bottom:2px;">SELECTED NODE</div>
   <div id="dp-title" style="font-size:13px;font-weight:700;margin-bottom:3px;"></div>
   <div class="dg">
     <div class="dc"><div class="dcl">TYPE</div><div class="dcv" id="dp-type"></div></div>
     <div class="dc"><div class="dcl">GATE</div><div class="dcv" id="dp-gate"></div></div>
     <div class="dc"><div class="dcl">VALUE</div><div class="dcv" id="dp-value"></div></div>
-    <div class="dc"><div class="dcl">SHARED</div><div class="dcv" id="dp-shared"></div></div>
+    <div class="dc"><div class="dcl">NODE ID</div><div class="dcv" id="dp-nid" style="font-size:9px;"></div></div>
   </div>
   <div class="dr">
     <div class="ds"><div class="dsl">PARENTS</div><div class="dsv" id="dp-par"></div></div>
@@ -436,17 +496,21 @@ svg#edges{{position:absolute;top:0;left:0;pointer-events:none;overflow:visible;}
 <script>
 const NODES={nodes_js};
 const EDGES={edges_js};
+const SHARED_EDGES={shared_edges_js};
 const LEVELS={level_groups_js};
-// Node dimensions (GROUP nodes are smaller/oval)
 const NW=145,NH=82,GW=118,GH=64;
-const HGAP=28,VGAP=120;
 const GCOLORS={{OR:"#4fc3f7",AND:"#ffb74d"}};
-let scale=1,tx=0,ty=0,pos={{}};
-let collapsed=new Set(),selId=null;
-let panning=false,panSt={{x:0,y:0}};
+
+// ── Persistent state restored from Python ────────────────────────────
+let scale={init_scale},tx={init_tx},ty={init_ty};
+let collapsed=new Set({init_collapsed_js});
+let savedPos={init_positions_js};  // user-dragged positions
+let pos={{}};   // working positions (layout + overrides)
+let selId=null,panning=false,panSt={{x:0,y:0}};
 let dragId=null,dragOff={{x:0,y:0}},didDrag=false;
-// Search state
 let searchMatches=[],searchIdx=0;
+const FOCUS_ID={focus_js};
+
 const canvas=document.getElementById("canvas");
 const vp=document.getElementById("viewport");
 const svg=document.getElementById("edges");
@@ -454,17 +518,28 @@ const svg=document.getElementById("edges");
 function nodeW(id){{return NODES[id]?.isGroup?GW:NW;}}
 function nodeH(id){{return NODES[id]?.isGroup?GH:NH;}}
 
-// ── layout ────────────────────────────────────────────────────────────
+// ── Save state back to Streamlit parent ──────────────────────────────
+function saveState(){{
+  const state={{
+    scale:scale, tx:tx, ty:ty,
+    collapsed:[...collapsed],
+    positions:Object.fromEntries(Object.entries(pos).filter(([id])=>id in savedPos||Object.keys(savedPos).length>0? true:false)),
+  }};
+  // Only persist manually-moved node positions
+  state.positions = savedPos;
+  try{{ window.parent.postMessage({{type:"fta_tree_state",state}}, "*"); }}catch(e){{}}
+}}
+
+// ── Layout ────────────────────────────────────────────────────────────
 function buildLayout(){{
-  // Assign Y by FTA level; X spread evenly
   const LYS={{HAZARD:30,SF:200,FF:370,GROUP:450,IF:540}};
   ["HAZARD","SF","FF","GROUP","IF"].forEach(lvl=>{{
     const ids=LEVELS[lvl]||[];
     ids.forEach((id,i)=>{{
-      pos[id]={{x:60+i*(NW+HGAP), y:LYS[lvl]||400}};
+      pos[id]={{x:60+i*(NW+28), y:LYS[lvl]||400}};
     }});
   }});
-  // Centre each hazard over its direct children
+  // Centre hazards over direct children
   (LEVELS.HAZARD||[]).forEach(hid=>{{
     const kids=EDGES.filter(e=>e[0]===hid).map(e=>e[1]);
     if(kids.length){{
@@ -472,9 +547,11 @@ function buildLayout(){{
       pos[hid].x=(xs.reduce((a,b)=>a+b,0)/xs.length)-NW/2;
     }}
   }});
+  // Apply any saved dragged positions
+  Object.entries(savedPos).forEach(([id,p])=>{{ if(id in pos) pos[id]=p; }});
 }}
 
-// ── transform ─────────────────────────────────────────────────────────
+// ── Transform ─────────────────────────────────────────────────────────
 function applyT(){{
   canvas.style.transform=`translate(${{tx}}px,${{ty}}px) scale(${{scale}})`;
   document.getElementById("zoom-lbl").textContent=Math.round(scale*100)+"%";
@@ -484,7 +561,7 @@ function zoomBy(d,cx,cy){{
   const vr=vp.getBoundingClientRect();
   cx=cx??vr.width/2; cy=cy??vr.height/2;
   const ns=Math.min(3.5,Math.max(0.1,scale+d)),r=ns/scale;
-  tx=cx-r*(cx-tx); ty=cy-r*(cy-ty); scale=ns; applyT();
+  tx=cx-r*(cx-tx); ty=cy-r*(cy-ty); scale=ns; applyT(); saveState();
 }}
 function resetView(){{
   scale=1;
@@ -492,8 +569,18 @@ function resetView(){{
   const allX=Object.keys(pos).map(id=>pos[id].x+nodeW(id));
   const minX=Math.min(...Object.values(pos).map(p=>p.x));
   const treeW=Math.max(...allX)-minX;
-  tx=Math.max(20,(vr.width-treeW)/2)-minX; ty=20; applyT();
+  tx=Math.max(20,(vr.width-treeW)/2)-minX; ty=20; applyT(); saveState();
 }}
+function panToNode(id,animate){{
+  const p=pos[id]; if(!p) return;
+  const vr=vp.getBoundingClientRect();
+  const nw=nodeW(id),nh=nodeH(id);
+  tx=vr.width/2-(p.x+nw/2)*scale;
+  ty=vr.height/3-(p.y+nh/2)*scale;
+  applyT();
+}}
+
+// Events
 vp.addEventListener("wheel",e=>{{e.preventDefault();zoomBy(e.deltaY<0?0.1:-0.1,e.clientX,e.clientY);}},{{passive:false}});
 vp.addEventListener("mousedown",e=>{{
   if(e.button===2){{panning=true;panSt={{x:e.clientX-tx,y:e.clientY-ty}};vp.style.cursor="grabbing";e.preventDefault();}}
@@ -502,21 +589,23 @@ window.addEventListener("mousemove",e=>{{
   if(panning){{tx=e.clientX-panSt.x;ty=e.clientY-panSt.y;applyT();}}
   if(dragId){{
     didDrag=true;
+    const cp=pos[dragId];
     const nx=e.clientX/scale-tx/scale-dragOff.x;
     const ny=e.clientY/scale-ty/scale-dragOff.y;
     pos[dragId]={{x:nx,y:ny}};
+    savedPos[dragId]={{x:nx,y:ny}};
     const el=document.getElementById("nw-"+dragId);
     if(el){{el.style.left=nx+"px";el.style.top=ny+"px";}}
     drawEdges();
   }}
 }});
 window.addEventListener("mouseup",e=>{{
-  if(e.button===2){{panning=false;vp.style.cursor="default";}}
-  if(e.button===0&&dragId){{const id=dragId;dragId=null;document.body.style.userSelect="";if(!didDrag)selectNode(id);}}
+  if(e.button===2){{panning=false;vp.style.cursor="default";saveState();}}
+  if(e.button===0&&dragId){{const id=dragId;dragId=null;document.body.style.userSelect="";saveState();if(!didDrag)selectNode(id);}}
 }});
 vp.addEventListener("contextmenu",e=>e.preventDefault());
 
-// ── touch pinch ───────────────────────────────────────────────────────
+// Touch pinch
 let ltd=null;
 vp.addEventListener("touchstart",e=>{{if(e.touches.length===2)ltd=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY);}},{{passive:true}});
 vp.addEventListener("touchmove",e=>{{
@@ -527,205 +616,225 @@ vp.addEventListener("touchmove",e=>{{
   }}
 }},{{passive:false}});
 
-// ── collapse ──────────────────────────────────────────────────────────
+// ── Collapse ──────────────────────────────────────────────────────────
 function getDesc(id){{
   const r=new Set(),q=[id];
-  while(q.length){{const c=q.shift();EDGES.filter(e=>e[0]===c).forEach(e=>{{if(!r.has(e[1])){{r.add(e[1]);q.push(e[1]);}}}});}};
+  while(q.length){{const c=q.shift();EDGES.filter(e=>e[0]===c).forEach(e=>{{if(!r.has(e[1])){{r.add(e[1]);q.push(e[1]);}}}});}}
   return r;
 }}
 function getAnc(id){{
   const r=new Set(),q=[id];
-  while(q.length){{const c=q.shift();(NODES[c]?.parentIds||[]).forEach(p=>{{if(!r.has(p)){{r.add(p);q.push(p);}}}});}};
+  while(q.length){{const c=q.shift();(NODES[c]?.parentIds||[]).forEach(p=>{{if(!r.has(p)){{r.add(p);q.push(p);}}}});}}
   return r;
 }}
-function toggleCollapse(e,id){{e.stopPropagation();collapsed.has(id)?collapsed.delete(id):collapsed.add(id);updateVis();drawEdges();}}
-function updateVis(){{
-  const hidden=new Set();collapsed.forEach(cid=>getDesc(cid).forEach(d=>hidden.add(d)));
-  Object.keys(NODES).forEach(id=>{{
-    const el=document.getElementById("nw-"+id);if(!el)return;
-    el.style.opacity=hidden.has(id)?"0":"1";el.style.pointerEvents=hidden.has(id)?"none":"";
-  }});
-  Object.keys(NODES).forEach(id=>{{const btn=document.getElementById("cb-"+id);if(btn)btn.textContent=collapsed.has(id)?"+":"-";}});
+function toggleCollapse(e,id){{
+  e.stopPropagation();
+  collapsed.has(id)?collapsed.delete(id):collapsed.add(id);
+  updateVis(); drawEdges(); saveState();
 }}
-function expandAll(){{collapsed.clear();updateVis();drawEdges();}}
-function collapseAll(){{Object.keys(NODES).forEach(id=>{{if((NODES[id].children||[]).length)collapsed.add(id);}});updateVis();drawEdges();}}
+function updateVis(){{
+  const hidden=getHidden();
+  Object.keys(NODES).forEach(id=>{{
+    const el=document.getElementById("nw-"+id); if(!el)return;
+    el.style.opacity=hidden.has(id)?"0":"1";
+    el.style.pointerEvents=hidden.has(id)?"none":"";
+  }});
+  Object.keys(NODES).forEach(id=>{{
+    const btn=document.getElementById("cb-"+id);
+    if(btn) btn.textContent=collapsed.has(id)?"+":"-";
+  }});
+}}
+function expandAll(){{collapsed.clear();updateVis();drawEdges();saveState();}}
+function collapseAll(){{
+  Object.keys(NODES).forEach(id=>{{if((NODES[id].children||[]).length)collapsed.add(id);}});
+  updateVis();drawEdges();saveState();
+}}
 
-// ── search ────────────────────────────────────────────────────────────
+// ── Search ────────────────────────────────────────────────────────────
 function doSearch(q){{
-  // Clear old matches
   document.querySelectorAll(".search-match").forEach(el=>el.classList.remove("search-match"));
-  searchMatches=[]; searchIdx=0;
+  searchMatches=[];searchIdx=0;
   if(!q.trim()){{document.getElementById("search-info").textContent="";return;}}
   const lq=q.toLowerCase();
   Object.entries(NODES).forEach(([id,node])=>{{
-    if(node.name.toLowerCase().includes(lq)||node.type.toLowerCase().includes(lq)||node.value.toLowerCase().includes(lq)){{
+    if(node.name.toLowerCase().includes(lq)||node.type.toLowerCase().includes(lq)||
+       node.value.toLowerCase().includes(lq)||(node.nodeId||"").toLowerCase().includes(lq)){{
       searchMatches.push(id);
       const el=document.getElementById("nw-"+id)?.querySelector(".fn,.fn-group");
       if(el) el.classList.add("search-match");
     }}
   }});
-  document.getElementById("search-info").textContent=searchMatches.length?`${{searchMatches.length}} found`:"0 found";
-  if(searchMatches.length)panToNode(searchMatches[0]);
+  document.getElementById("search-info").textContent=searchMatches.length?`${{searchMatches.length}} found`:"0";
+  if(searchMatches.length) panToNode(searchMatches[0]);
 }}
-function searchNext(){{
-  if(!searchMatches.length)return;
-  searchIdx=(searchIdx+1)%searchMatches.length;
-  panToNode(searchMatches[searchIdx]);
-  updateSearchInfo();
-}}
-function searchPrev(){{
-  if(!searchMatches.length)return;
-  searchIdx=(searchIdx-1+searchMatches.length)%searchMatches.length;
-  panToNode(searchMatches[searchIdx]);
-  updateSearchInfo();
-}}
-function updateSearchInfo(){{
-  document.getElementById("search-info").textContent=
-    searchMatches.length?`${{searchIdx+1}}/${{searchMatches.length}}`:"0 found";
-}}
-function panToNode(id){{
-  const p=pos[id]; if(!p) return;
-  const vr=vp.getBoundingClientRect();
-  const nw=nodeW(id),nh=nodeH(id);
-  tx=vr.width/2-(p.x+nw/2)*scale;
-  ty=vr.height/2-(p.y+nh/2)*scale;
-  applyT();
-}}
+function searchNext(){{if(!searchMatches.length)return;searchIdx=(searchIdx+1)%searchMatches.length;panToNode(searchMatches[searchIdx]);document.getElementById("search-info").textContent=`${{searchIdx+1}}/${{searchMatches.length}}`;}}
+function searchPrev(){{if(!searchMatches.length)return;searchIdx=(searchIdx-1+searchMatches.length)%searchMatches.length;panToNode(searchMatches[searchIdx]);document.getElementById("search-info").textContent=`${{searchIdx+1}}/${{searchMatches.length}}`;}}
 
-// ── selection + path highlight ────────────────────────────────────────
+// ── Selection + path highlight ────────────────────────────────────────
 function selectNode(id){{
   if(didDrag){{didDrag=false;return;}}
   clearNodeStyles();
   if(selId===id){{selId=null;closeDP();return;}}
   selId=id;
-  const node=NODES[id]; if(!node) return;
+  const node=NODES[id]; if(!node)return;
   const anc=getAnc(id),desc=getDesc(id);
   Object.keys(NODES).forEach(nid=>{{
     const el=document.getElementById("nw-"+nid)?.querySelector(".fn,.fn-group");
-    if(!el) return;
-    if(nid===id)      el.style.boxShadow="0 0 0 3px #e94560,0 0 24px #e9456099";
+    if(!el)return;
+    if(nid===id)           el.style.boxShadow="0 0 0 3px #e94560,0 0 24px #e9456099";
     else if(anc.has(nid))  el.style.boxShadow="0 0 0 2px #4fc3f7,0 0 14px #4fc3f755";
     else if(desc.has(nid)) el.style.boxShadow="0 0 0 2px #ff8c42,0 0 14px #ff8c4255";
     else el.classList.add("dimmed");
   }});
   drawEdges(new Set([...anc,...desc,id]));
-  showDP(id,node);
-}}
-function clearNodeStyles(){{
-  document.querySelectorAll(".fn,.fn-group").forEach(el=>{{el.style.boxShadow="";el.classList.remove("dimmed");}});
-}}
-function clearHL(){{selId=null;clearNodeStyles();drawEdges();closeDP();}}
-
-// ── detail panel ──────────────────────────────────────────────────────
-function showDP(id,node){{
   const p=document.getElementById("dp");
   p.style.display="block"; p.style.borderTopColor=node.color;
   document.getElementById("dp-title").innerHTML=
     `<span style="color:${{node.color}}">${{node.name}}</span>`+
     (node.shared?' <span style="background:#f5c518;color:#111;font-size:8px;padding:1px 5px;border-radius:5px;font-weight:700;">SHARED</span>':'');
   document.getElementById("dp-type").style.color=node.color;
-  document.getElementById("dp-type").textContent=node.isGroup?"GROUP (Combined)":node.type;
+  document.getElementById("dp-type").textContent=node.isGroup?"GROUP":node.type;
   document.getElementById("dp-gate").style.color=GCOLORS[node.gate]||"#aaa";
   document.getElementById("dp-gate").textContent=node.gate;
   document.getElementById("dp-value").style.color=node.color;
   document.getElementById("dp-value").textContent=node.value;
-  document.getElementById("dp-shared").textContent=node.shared?"YES":"NO";
-  document.getElementById("dp-shared").style.color=node.shared?"#f5c518":"#555";
+  document.getElementById("dp-nid").textContent=node.nodeId||id;
   document.getElementById("dp-par").textContent=node.parents.join(" · ")||"(top event)";
   document.getElementById("dp-chi").textContent=node.childNames.join(" · ")||"(leaf node)";
 }}
+function clearNodeStyles(){{document.querySelectorAll(".fn,.fn-group").forEach(el=>{{el.style.boxShadow="";el.classList.remove("dimmed");}});}}
+function clearHL(){{selId=null;clearNodeStyles();drawEdges();closeDP();}}
 function closeDP(){{document.getElementById("dp").style.display="none";}}
 
 // ── SVG edges ─────────────────────────────────────────────────────────
 function drawEdges(hl){{
-  const hidden=new Set(); collapsed.forEach(cid=>getDesc(cid).forEach(d=>hidden.add(d)));
+  const hidden=getHidden();
   let s="";
+  // Primary edges
   EDGES.forEach(([pid,cid])=>{{
-    if(hidden.has(cid)||hidden.has(pid)) return;
-    const pp=pos[pid],cp=pos[cid]; if(!pp||!cp) return;
-    const x1=pp.x+nodeW(pid)/2, y1=pp.y+nodeH(pid);
-    const x2=cp.x+nodeW(cid)/2, y2=cp.y, my=(y1+y2)/2;
+    if(hidden.has(cid)||hidden.has(pid))return;
+    const pp=pos[pid],cp=pos[cid]; if(!pp||!cp)return;
+    const x1=pp.x+nodeW(pid)/2,y1=pp.y+nodeH(pid),x2=cp.x+nodeW(cid)/2,y2=cp.y,my=(y1+y2)/2;
     const isHl=hl&&(hl.has(pid)||hl.has(cid));
-    // AND-gate edges are dashed to distinguish them visually
-    const parentNode=NODES[pid];
-    const dash=parentNode&&parentNode.gate==="AND"?"stroke-dasharray=\'6,3\'":"";
+    const isAnd=NODES[pid]?.gate==="AND";
     s+=`<path d="M${{x1}},${{y1}} C${{x1}},${{my}} ${{x2}},${{my}} ${{x2}},${{y2}}"
       fill="none" stroke="${{isHl?"#4fc3f7":"#2a2a2a"}}" stroke-width="${{isHl?2.5:1.5}}"
-      ${{dash}} opacity="${{isHl?1:0.9}}"/>`;
+      ${{isAnd?'stroke-dasharray="6,3"':''}} opacity="${{isHl?1:0.9}}"/>`;
+  }});
+  // Shared edges — drawn faint/dashed in background to show the connection
+  SHARED_EDGES.forEach(([pid,cid])=>{{
+    if(hidden.has(cid)||hidden.has(pid))return;
+    const pp=pos[pid],cp=pos[cid]; if(!pp||!cp)return;
+    const x1=pp.x+nodeW(pid)/2,y1=pp.y+nodeH(pid),x2=cp.x+nodeW(cid)/2,y2=cp.y,my=(y1+y2)/2;
+    const isHl=hl&&(hl.has(pid)||hl.has(cid));
+    s+=`<path d="M${{x1}},${{y1}} C${{x1}},${{my}} ${{x2}},${{my}} ${{x2}},${{y2}}"
+      fill="none" stroke="${{isHl?"#f5c518":"#f5c51833"}}" stroke-width="${{isHl?2:1}}"
+      stroke-dasharray="3,5" opacity="${{isHl?0.9:0.4}}"/>`;
   }});
   const allX=Object.keys(pos).map(id=>pos[id].x+nodeW(id)+80);
   const allY=Object.keys(pos).map(id=>pos[id].y+nodeH(id)+80);
   const maxX=Math.max(...allX,800),maxY=Math.max(...allY,600);
-  svg.setAttribute("width",maxX); svg.setAttribute("height",maxY);
-  svg.style.width=maxX+"px"; svg.style.height=maxY+"px";
+  svg.setAttribute("width",maxX);svg.setAttribute("height",maxY);
+  svg.style.width=maxX+"px";svg.style.height=maxY+"px";
   svg.innerHTML=s;
 }}
 
-// ── render nodes ──────────────────────────────────────────────────────
+// ── Render nodes ──────────────────────────────────────────────────────
 function renderNodes(){{
   Object.entries(NODES).forEach(([id,node])=>{{
     const p=pos[id]||{{x:200,y:200}};
     const gc=GCOLORS[node.gate]||"#aaa";
     const hasCh=(node.children||[]).length>0;
     const sb=node.shared?`<span style="background:#f5c518;color:#111;font-size:6px;padding:1px 3px;border-radius:3px;font-weight:700;margin-left:3px;">SHR</span>`:"";
+    const nid_badge=node.nodeId&&node.nodeId!==id?`<span style="font-size:6px;color:rgba(255,255,255,0.4);margin-left:2px;">${{node.nodeId}}</span>`:"";
     const nw=nodeW(id),nh=nodeH(id);
     const wrap=document.createElement("div");
     wrap.id="nw-"+id; wrap.className="nw";
     wrap.style.cssText=`left:${{p.x}}px;top:${{p.y}}px;width:${{nw}}px;`;
     wrap.onmousedown=e=>{{
-      if(e.button!==0) return;
+      if(e.button!==0)return;
       e.stopPropagation(); didDrag=false;
-      // Re-read current pos (may have been dragged)
       const cp=pos[id];
-      dragId=id; dragOff={{x:e.clientX/scale-tx/scale-cp.x, y:e.clientY/scale-ty/scale-cp.y}};
+      dragId=id; dragOff={{x:e.clientX/scale-tx/scale-cp.x,y:e.clientY/scale-ty/scale-cp.y}};
       document.body.style.userSelect="none";
     }};
-
+    const colBtn=hasCh?`<div style="display:flex;align-items:center;gap:4px;margin-top:2px;">
+      <div class="gt" style="color:${{gc}};border-color:${{gc}};">${{node.gate}}</div>
+      <button class="cb" id="cb-${{id}}" onclick="toggleCollapse(event,'${{id}}')">${{collapsed.has(id)?"+":"-"}}</button>
+    </div>`:"";
     if(node.isGroup){{
-      // Oval GROUP node (Combined Faults)
       wrap.innerHTML=`
         <div class="fn-group" style="background:${{node.color}};color:${{node.tcolor}};border-color:${{node.color}};width:${{nw}}px;height:${{nh}}px;display:flex;flex-direction:column;align-items:center;justify-content:center;">
-          <div style="font-size:7px;letter-spacing:1px;opacity:0.75;margin-bottom:2px;">COMBINED</div>
+          <div style="font-size:7px;letter-spacing:1px;opacity:0.7;margin-bottom:1px;">COMBINED</div>
           <div style="font-size:9px;font-weight:700;text-align:center;word-break:break-word;line-height:1.2;">${{node.name}}</div>
-          <div style="font-size:10px;font-weight:700;font-family:monospace;margin-top:3px;background:rgba(0,0,0,0.25);border-radius:3px;padding:1px 5px;">${{node.value}}</div>
-        </div>
-        ${{hasCh?`<div style="display:flex;align-items:center;gap:4px;margin-top:2px;">
-          <div class="gt" style="color:${{gc}};border-color:${{gc}};">${{node.gate}}</div>
-          <button class="cb" id="cb-${{id}}" onclick="toggleCollapse(event,'${{id}}')">-</button>
-        </div>`:"__LEAF__"}}`;
-    }} else {{
-      // Rectangular node
+          <div style="font-size:9px;font-weight:700;font-family:monospace;margin-top:2px;background:rgba(0,0,0,0.25);border-radius:3px;padding:1px 4px;">${{node.value}}</div>
+        </div>${{colBtn}}`;
+    }}else{{
       wrap.innerHTML=`
         <div class="fn" style="background:${{node.color}};color:${{node.tcolor}};border-color:${{node.color}};width:100%;">
           <div style="font-size:7px;opacity:0.75;letter-spacing:1px;margin-bottom:2px;display:flex;align-items:center;justify-content:center;">
-            ${{node.type}}${{sb}}
+            ${{node.type}}${{sb}}${{nid_badge}}
           </div>
-          <div style="font-size:10px;font-weight:700;text-align:center;word-break:break-word;margin-bottom:4px;line-height:1.3;">
-            ${{node.name}}
-          </div>
-          <div style="background:rgba(0,0,0,0.26);border-radius:3px;padding:2px 5px;font-size:11px;font-weight:700;text-align:center;font-family:monospace;">
-            ${{node.value}}
-          </div>
-        </div>
-        ${{hasCh?`<div style="display:flex;align-items:center;gap:4px;margin-top:2px;">
-          <div class="gt" style="color:${{gc}};border-color:${{gc}};">${{node.gate}}</div>
-          <button class="cb" id="cb-${{id}}" onclick="toggleCollapse(event,'${{id}}')">-</button>
-        </div>`:"__LEAF__"}}`;
+          <div style="font-size:10px;font-weight:700;text-align:center;word-break:break-word;margin-bottom:4px;line-height:1.3;">${{node.name}}</div>
+          <div style="background:rgba(0,0,0,0.26);border-radius:3px;padding:2px 5px;font-size:11px;font-weight:700;text-align:center;font-family:monospace;">${{node.value}}</div>
+        </div>${{colBtn}}`;
     }}
     canvas.appendChild(wrap);
   }});
 }}
 
+function getHidden(){{
+  const hidden=new Set(); collapsed.forEach(cid=>getDesc(cid).forEach(d=>hidden.add(d)));
+  return hidden;
+}}
+
 buildLayout();
 renderNodes();
-drawEdges();
+// On load: collapse everything except the focus hazard's direct subtree
 (function(){{
-  const vr=vp.getBoundingClientRect();
-  const allX=Object.keys(pos).map(id=>pos[id].x+nodeW(id));
-  const minX=Math.min(...Object.values(pos).map(p=>p.x));
-  const treeW=Math.max(...allX)-minX;
-  tx=Math.max(20,(vr.width-treeW)/2)-minX; ty=20; applyT();
+  // Find all hazard IDs
+  const hazardIds = LEVELS.HAZARD || [];
+  if(FOCUS_ID) {{
+    // Collapse all hazards that are NOT the focus
+    hazardIds.forEach(hid => {{
+      if(hid !== FOCUS_ID) collapsed.add(hid);
+    }});
+    // Also collapse focus hazard's children-of-children to keep it tidy
+    // (user can expand as needed)
+    const directKids = EDGES.filter(e=>e[0]===FOCUS_ID).map(e=>e[1]);
+    directKids.forEach(kid => {{
+      // collapse grandchildren level
+      const grandkids = EDGES.filter(e=>e[0]===kid).map(e=>e[1]);
+      if(grandkids.length > 0) collapsed.add(kid);
+    }});
+  }} else if(hazardIds.length > 1) {{
+    // Full tree: collapse all except first hazard's first level
+    hazardIds.slice(1).forEach(hid => collapsed.add(hid));
+  }}
+  // Apply any saved collapsed overrides from Python
+  {init_collapsed_js}.forEach(id => collapsed.add(id));
+  updateVis();
 }})();
+// Apply saved transform if any
+if({init_scale}!==1||{init_tx}!==0||{init_ty}!==0){{
+  applyT();
+}}else{{
+  // Auto-centre
+  const vr=vp.getBoundingClientRect();
+  const visIds=Object.keys(pos).filter(id=>!{{...getHidden()}}.has(id));
+  const allX=visIds.map(id=>pos[id].x+nodeW(id));
+  const allY=visIds.map(id=>pos[id].y);
+  if(allX.length){{
+    const minX=Math.min(...visIds.map(id=>pos[id].x));
+    const maxX=Math.max(...allX);
+    const treeW=maxX-minX;
+    tx=Math.max(20,(vr.width-treeW)/2)-minX; ty=20;
+  }}
+  applyT();
+}}
+// Pan to focus node after layout
+if(FOCUS_ID&&pos[FOCUS_ID]){{ setTimeout(()=>panToNode(FOCUS_ID),80); }}
+drawEdges();
 </script></body></html>"""
 
 def build_hierarchy_rows(nodes, filter_hazard_id=None):
@@ -748,7 +857,15 @@ def build_hierarchy_rows(nodes, filter_hazard_id=None):
 # ── Session state ─────────────────────────────────────────────────────────
 DEFS = {"nodes":[],"save_status":"idle","save_msg":"","gist_loaded":False,
         "active_file":"my_tree.json","file_list":[],"selected_id":None,
-        "tree_filter":"ALL"}
+        "tree_filter":"ALL",
+        # Persistent tree viewport state — survives reruns
+        "tree_state": {
+            "scale": 1.0, "tx": 0, "ty": 0,
+            "collapsed": [],      # list of collapsed node IDs
+            "positions": {},      # id -> {x, y} overrides from dragging
+            "focus_id": None,     # node/hazard to centre on after rerun
+        }
+        }
 for k,v in DEFS.items():
     if k not in st.session_state: st.session_state[k] = v
 
@@ -910,9 +1027,13 @@ with st.sidebar:
             if h_name.strip():
                 try:
                     val = float(h_val)
-                    node = {"id":str(uuid.uuid4())[:7],"name":h_name.strip(),
+                    nid = str(uuid.uuid4())[:7]
+                    node = {"id":nid,"name":h_name.strip(),
                             "type":"HAZARD","gate":"OR",
                             "targetValue":val,"calculatedValue":val,"parentIds":[]}
+                    # Focus tree on the new hazard and switch filter to it
+                    st.session_state.tree_state["focus_id"] = nid
+                    st.session_state.tree_filter = nid
                     set_nodes(nodes + [node]); st.rerun()
                 except ValueError:
                     st.error("Invalid rate — use e.g. 1e-7")
@@ -923,64 +1044,164 @@ with st.sidebar:
             st.markdown("---")
             st.markdown("<div style='font-size:9px;color:#ff8c42;letter-spacing:2px;margin-bottom:4px;'>ADD CHILD NODE</div>", unsafe_allow_html=True)
 
-            # Modelling guide tip
+            # Modelling guide
             with st.expander("💡 How to model mixed AND/OR gates"):
                 st.markdown("""
-**Problem:** A parent needs some children via OR, but others must combine via AND (Combined Faults).
+**Use a GROUP node for Combined Faults:**
 
-**Solution — use a GROUP node:**
+*SF-14 (OR) with two AND groups:*
+- SF-14 → gate=OR
+- "Combined Faults A" → type=GROUP, gate=AND, parent=SF-14 → FF-01, FF-02
+- "Combined Faults B" → type=GROUP, gate=AND, parent=SF-14 → IF-016, IF-208
 
-*Example: SF-14 (OR gate)*
-- Add `SF-14` with gate=**OR**
-- Add `Combined Faults 1` as type=**GROUP**, gate=**AND**, parent=SF-14
-  - Add `FF-01` parent=Combined Faults 1
-  - Add `FF-02` parent=Combined Faults 1
-- Add `Combined Faults 2` as type=**GROUP**, gate=**AND**, parent=SF-14
-  - Add `IF-016` parent=Combined Faults 2
-  - Add `IF-208` parent=Combined Faults 2
+*FF-05 (mixed):*
+- FF-05 → gate=OR
+- IF-286, IF-287, IF-288 → direct children of FF-05
+- "Combined Faults" → type=GROUP, gate=AND, parent=FF-05 → IF-293, IF-289
 
-*Example: FF-05 (mixed)*
-- Add `FF-05` with gate=**OR**
-- Add `IF-286`, `IF-287`, `IF-288` direct children (parent=FF-05)
-- Add `Combined Faults` GROUP node (AND), parent=FF-05
-  - Add `IF-293`, `IF-289` parent=Combined Faults
-
-GROUP nodes appear as **purple ovals** in the tree. Their gate controls how their children combine.
+GROUP nodes = purple ovals. AND edges = dashed lines. Shared edges = faint yellow dashes.
                 """)
 
-            node_name = st.text_input("Node Name", placeholder="e.g. Power Failure", key="add_name")
+            node_name  = st.text_input("Node Name", placeholder="e.g. Power Failure", key="add_name")
+            custom_id  = st.text_input("Node ID (optional)", placeholder="e.g. FF-01, IF-286",
+                                       key="add_cid",
+                                       help="Your own reference ID. If this ID already exists in the tree, you'll be prompted to link it as a shared node instead of creating a new one.")
             parent_opts = {f"[{n['type']}] {n['name']}": n["id"]
                            for n in nodes if n["type"] in VALID_PARENT_TYPES}
             sel_labels  = st.multiselect("Parent Node(s)", list(parent_opts.keys()),
-                                         help="Multiple = shared node. SF→SF and GROUP parents supported.", key="add_par")
+                                         help="Multiple = shared node.", key="add_par")
             sel_pids    = [parent_opts[l] for l in sel_labels]
             node_type   = st.selectbox("Type", VALID_CHILD_TYPES, key="add_type",
-                                       help="GROUP = Combined Faults oval (intermediate AND/OR gate node)")
+                                       help="GROUP = Combined Faults oval")
             gate        = st.radio("Gate", ["OR","AND"], horizontal=True, key="add_gate",
-                                   help="OR: any child causes failure. AND: ALL children must fail (Combined Faults).")
-            if st.button("✅ ADD NODE", use_container_width=True, type="primary"):
-                if not node_name.strip(): st.error("Enter node name")
-                elif not sel_pids:       st.error("Select at least one parent")
-                else:
-                    new_node = {"id":str(uuid.uuid4())[:7],"name":node_name.strip(),
-                                "type":node_type,"gate":gate,
-                                "targetValue":None,"calculatedValue":None,"parentIds":sel_pids}
-                    set_nodes(nodes + [new_node]); st.rerun()
+                                   help="OR: any child fails → parent fails. AND: ALL children must fail.")
+
+            # ── Duplicate ID detection ────────────────────────────────
+            cid_clean = custom_id.strip()
+            existing_with_id = [n for n in nodes if n.get("nodeId","") == cid_clean and cid_clean != ""]
+            duplicate_found  = len(existing_with_id) > 0
+
+            if duplicate_found:
+                ex = existing_with_id[0]
+                ex_color = LEVEL_COLORS.get(ex["type"], "#888")
+                ex_parents = " · ".join(by_id[p]["name"] for p in (ex.get("parentIds") or []) if p in by_id) or "none"
+                st.markdown(f"""
+                <div style="background:#1a1200;border:2px solid #f5c518;border-radius:8px;padding:10px 12px;margin:8px 0;">
+                  <div style="font-size:9px;color:#f5c518;font-weight:700;letter-spacing:1px;margin-bottom:4px;">
+                    ⚠ NODE ID ALREADY EXISTS IN TREE
+                  </div>
+                  <div style="font-size:10px;color:#ddd;">
+                    <b style="color:{ex_color};">{ex['name']}</b>
+                    &nbsp;[{ex['type']} · {ex['gate']}]
+                  </div>
+                  <div style="font-size:9px;color:#888;margin-top:3px;">
+                    Current parents: {ex_parents}<br>
+                    Value: <span style="color:{ex_color};font-family:monospace;">{fmt(ex.get('calculatedValue'))}</span>
+                  </div>
+                  <div style="font-size:9px;color:#aaa;margin-top:5px;">
+                    Choose: add new parents to this existing node (shared node),
+                    or create a separate new node with the same ID label.
+                  </div>
+                </div>""", unsafe_allow_html=True)
+
+                col_share, col_new = st.columns(2)
+                with col_share:
+                    if st.button("🔗 LINK AS SHARED", use_container_width=True, type="primary",
+                                 help="Add the selected parents to the existing node. Recalculates entire tree."):
+                        if not sel_pids:
+                            st.error("Select at least one parent to link to")
+                        else:
+                            # Merge new parents into existing node
+                            updated = []
+                            for n in nodes:
+                                if n["id"] == ex["id"]:
+                                    n = dict(n)
+                                    existing_pids = list(n.get("parentIds") or [])
+                                    new_pids = [p for p in sel_pids if p not in existing_pids]
+                                    n["parentIds"] = existing_pids + new_pids
+                                updated.append(n)
+                            # Full recalculate to cascade through all shared locations
+                            updated = recalculate(updated)
+                            # Set focus to the shared node
+                            st.session_state.tree_state["focus_id"] = ex["id"]
+                            set_nodes(updated)
+                            st.success(f"Linked '{ex['name']}' as shared — added {len(new_pids)} new parent(s). Recalculated.")
+                            st.rerun()
+                with col_new:
+                    if st.button("➕ CREATE NEW NODE", use_container_width=True,
+                                 help="Create a completely new node that happens to share the same ID label"):
+                        if not node_name.strip():
+                            st.error("Enter node name")
+                        elif not sel_pids:
+                            st.error("Select at least one parent")
+                        else:
+                            nid = str(uuid.uuid4())[:7]
+                            new_node = {"id": nid, "nodeId": cid_clean,
+                                        "name": node_name.strip(), "type": node_type, "gate": gate,
+                                        "targetValue": None, "calculatedValue": None, "parentIds": sel_pids}
+                            updated = recalculate(nodes + [new_node])
+                            st.session_state.tree_state["focus_id"] = nid
+                            set_nodes(updated)
+                            st.rerun()
+            else:
+                if st.button("✅ ADD NODE", use_container_width=True, type="primary"):
+                    if not node_name.strip():
+                        st.error("Enter node name")
+                    elif not sel_pids:
+                        st.error("Select at least one parent")
+                    else:
+                        nid = cid_clean if cid_clean else str(uuid.uuid4())[:7]
+                        # Avoid collision with internal UUIDs
+                        if any(n["id"] == nid for n in nodes):
+                            nid = str(uuid.uuid4())[:7]
+                        new_node = {"id": nid, "nodeId": cid_clean or nid,
+                                    "name": node_name.strip(), "type": node_type, "gate": gate,
+                                    "targetValue": None, "calculatedValue": None, "parentIds": sel_pids}
+                        updated = recalculate(nodes + [new_node])
+                        # Focus tree on the newly added node's first parent (keep working context)
+                        st.session_state.tree_state["focus_id"] = sel_pids[0] if sel_pids else nid
+                        set_nodes(updated)
+                        st.rerun()
 
             st.markdown("---")
-            del_opts = {f"[{n['type']}] {n['name']}": n["id"]
+            del_opts = {f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name']}": n["id"]
                         for n in nodes if n["type"] != "HAZARD"}
             if del_opts:
-                dl = st.selectbox("Delete Node", ["— select —"] + list(del_opts.keys()))
-                if dl != "— select —" and st.button("🗑 DELETE NODE", use_container_width=True):
-                    did = del_opts[dl]
-                    to_del = {did}; chg = True
-                    while chg:
-                        chg = False
-                        for n in nodes:
-                            if n["id"] not in to_del and any(p in to_del for p in (n.get("parentIds") or [])):
-                                to_del.add(n["id"]); chg = True
-                    set_nodes([n for n in nodes if n["id"] not in to_del]); st.rerun()
+                dl = st.selectbox("Delete Node", ["— select —"] + list(del_opts.keys()), key="del_sel")
+                if dl != "— select —":
+                    del_id = del_opts[dl]
+                    del_node = by_id.get(del_id)
+                    is_shared_child = any(
+                        del_id in (n.get("parentIds") or []) and len(n.get("parentIds") or []) > 1
+                        for n in nodes
+                    )
+                    if is_shared_child:
+                        st.markdown(
+                            "<div style='font-size:9px;color:#f5c518;background:#1a1200;border:1px solid #f5c51844;"
+                            "border-radius:5px;padding:5px 8px;margin:4px 0;'>"
+                            "⚠ Some children of this node are shared (have other parents). "
+                            "They will be kept with their remaining parents — only orphaned children are removed."
+                            "</div>", unsafe_allow_html=True)
+                    if st.button("🗑 DELETE NODE", use_container_width=True):
+                        # Smart delete: strip parentId, only remove truly orphaned nodes
+                        temp_nodes = [dict(n) for n in nodes if n["id"] != del_id]
+                        for n in temp_nodes:
+                            if del_id in (n.get("parentIds") or []):
+                                n["parentIds"] = [p for p in n["parentIds"] if p != del_id]
+                        changed = True
+                        while changed:
+                            changed = False
+                            orphan_ids = {n["id"] for n in temp_nodes
+                                          if n["type"] != "HAZARD" and not n.get("parentIds")}
+                            if orphan_ids:
+                                temp_nodes = [n for n in temp_nodes if n["id"] not in orphan_ids]
+                                for n in temp_nodes:
+                                    before = len(n.get("parentIds") or [])
+                                    n["parentIds"] = [p for p in (n.get("parentIds") or []) if p not in orphan_ids]
+                                    if len(n.get("parentIds") or []) != before:
+                                        changed = True
+                        temp_nodes = recalculate(temp_nodes)
+                        set_nodes(temp_nodes); st.rerun()
 
             st.markdown("---")
             if st.button("🗑 CLEAR ALL NODES", use_container_width=True):
@@ -990,46 +1211,95 @@ GROUP nodes appear as **purple ovals** in the tree. Their gate controls how thei
         if not nodes:
             st.markdown("<div style='color:#555;font-size:11px;'>No nodes yet.</div>", unsafe_allow_html=True)
         else:
-            edit_opts  = {f"[{n['type']}] {n['name']}": n["id"] for n in nodes}
+            edit_opts  = {f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name']}": n["id"] for n in nodes}
             edit_label = st.selectbox("Select node to edit", ["— select —"] + list(edit_opts.keys()), key="edit_sel")
             if edit_label != "— select —":
                 eid  = edit_opts[edit_label]
                 en   = next((n for n in nodes if n["id"] == eid), None)
                 if en:
                     color = LEVEL_COLORS.get(en["type"], "#888")
+                    is_shared = len(en.get("parentIds") or []) > 1
                     st.markdown(f"""<div style="background:#141414;border:2px solid {color};border-radius:8px;padding:8px 12px;margin-bottom:8px;">
                       <div style="font-size:8px;color:#888;letter-spacing:2px;">EDITING</div>
                       <div style="font-weight:700;color:{color};">{en['name']}</div>
-                      <div style="font-size:9px;color:#666;">{en['type']} · {en['gate']}</div>
+                      <div style="font-size:9px;color:#666;">{en['type']} · {en['gate']}
+                        {'&nbsp;<span style="background:#f5c518;color:#111;font-size:7px;padding:1px 4px;border-radius:3px;font-weight:700;">SHARED</span>' if is_shared else ''}
+                      </div>
                     </div>""", unsafe_allow_html=True)
-                    new_name  = st.text_input("Name", value=en["name"], key="en_name")
-                    new_gate  = st.radio("Gate", ["OR","AND"], index=0 if en["gate"]=="OR" else 1, horizontal=True, key="en_gate")
+                    new_name    = st.text_input("Name", value=en["name"], key="en_name")
+                    new_node_id = st.text_input("Node ID", value=en.get("nodeId", en["id"]),
+                                                key="en_nid",
+                                                help="Your reference ID e.g. FF-01. Changing this won't break existing connections.")
+                    new_gate    = st.radio("Gate", ["OR","AND"], index=0 if en["gate"]=="OR" else 1,
+                                           horizontal=True, key="en_gate")
                     if en["type"] != "HAZARD":
-                        ti = VALID_CHILD_TYPES.index(en["type"]) if en["type"] in VALID_CHILD_TYPES else 0
+                        ti       = VALID_CHILD_TYPES.index(en["type"]) if en["type"] in VALID_CHILD_TYPES else 0
                         new_type = st.selectbox("Type", VALID_CHILD_TYPES, index=ti, key="en_type")
-                        avail_p  = {f"[{n['type']}] {n['name']}": n["id"]
+                        avail_p  = {f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name']}": n["id"]
                                     for n in nodes if n["type"] in VALID_PARENT_TYPES and n["id"] != eid}
                         cur_pl   = [lbl for lbl,pid in avail_p.items() if pid in (en.get("parentIds") or [])]
-                        new_pl   = st.multiselect("Parents", list(avail_p.keys()), default=cur_pl, key="en_par")
+                        new_pl   = st.multiselect("Parents", list(avail_p.keys()), default=cur_pl, key="en_par",
+                                                   help="Add/remove parents here to link this as a shared node or unlink it.")
                         new_pids = [avail_p[l] for l in new_pl]
                     else:
                         new_type = "HAZARD"; new_pids = []
                         new_tgt  = st.text_input("Target Rate", value=str(en.get("targetValue","")), key="en_tgt")
-                    if st.button("💾 APPLY CHANGES", use_container_width=True, type="primary"):
-                        upd = []
-                        for n in nodes:
-                            if n["id"] == eid:
-                                n = dict(n)
-                                n["name"] = new_name.strip() or n["name"]
-                                n["gate"] = new_gate
-                                if n["type"] != "HAZARD":
-                                    n["type"] = new_type; n["parentIds"] = new_pids
-                                else:
-                                    try:
-                                        tv = float(new_tgt); n["targetValue"] = tv; n["calculatedValue"] = tv
-                                    except: pass
-                            upd.append(n)
-                        set_nodes(upd); st.success(f"Updated '{new_name}'"); st.rerun()
+
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if st.button("💾 APPLY", use_container_width=True, type="primary"):
+                            upd = []
+                            for n in nodes:
+                                if n["id"] == eid:
+                                    n = dict(n)
+                                    n["name"]   = new_name.strip() or n["name"]
+                                    n["gate"]   = new_gate
+                                    n["nodeId"] = new_node_id.strip() or n.get("nodeId", n["id"])
+                                    if n["type"] != "HAZARD":
+                                        n["type"]      = new_type
+                                        n["parentIds"] = new_pids
+                                    else:
+                                        try:
+                                            tv = float(new_tgt)
+                                            n["targetValue"] = tv; n["calculatedValue"] = tv
+                                        except: pass
+                                upd.append(n)
+                            upd = recalculate(upd)
+                            st.session_state.tree_state["focus_id"] = eid
+                            set_nodes(upd)
+                            st.success(f"Updated '{new_name}'")
+                            st.rerun()
+                    with c2:
+                        if en["type"] != "HAZARD":
+                            if st.button("🗑 DELETE", use_container_width=True,
+                                         help="Removes this node. Shared-node children (multiple parents) keep their other parents. Orphaned children are also removed."):
+                                to_del = {eid}
+                                changed = True
+                                # Build updated parentIds for shared children: remove eid from their parents
+                                # Only fully delete children that become completely orphaned
+                                temp_nodes = [dict(n) for n in nodes if n["id"] != eid]
+                                # Strip eid from all parentIds
+                                for n in temp_nodes:
+                                    if eid in (n.get("parentIds") or []):
+                                        n["parentIds"] = [p for p in n["parentIds"] if p != eid]
+                                # Remove truly orphaned non-HAZARD nodes (no parents left and not a HAZARD)
+                                changed = True
+                                while changed:
+                                    changed = False
+                                    orphan_ids = {n["id"] for n in temp_nodes
+                                                  if n["type"] != "HAZARD" and not n.get("parentIds")}
+                                    if orphan_ids:
+                                        temp_nodes = [n for n in temp_nodes if n["id"] not in orphan_ids]
+                                        # Strip orphan refs from others
+                                        for n in temp_nodes:
+                                            before = len(n.get("parentIds") or [])
+                                            n["parentIds"] = [p for p in (n.get("parentIds") or []) if p not in orphan_ids]
+                                            if len(n.get("parentIds") or []) != before:
+                                                changed = True
+                                temp_nodes = recalculate(temp_nodes)
+                                st.session_state.tree_state["focus_id"] = None
+                                set_nodes(temp_nodes)
+                                st.rerun()
 
 # ── Action bar ────────────────────────────────────────────────────────────
 a1,a2,a3,a4,a5 = st.columns([1,1,1,1,2])
@@ -1077,16 +1347,36 @@ with tab_tree:
     if not nodes:
         st.markdown("<div style='text-align:center;color:#333;margin-top:60px;letter-spacing:2px;'>ADD A HAZARD TO START</div>", unsafe_allow_html=True)
     else:
-        # Tree filter selector
-        filter_opts = {"Full Tree (all hazards)": "ALL"} | {f"Hazard: {h['name']} ({fmt(h['targetValue'])})": h["id"] for h in hazards}
-        filter_label = st.selectbox("View", list(filter_opts.keys()), key="tree_filter_sel",
-                                    label_visibility="collapsed")
+        # Sticky hazard filter — default to first hazard, not full tree
+        filter_opts = {"Full Tree (all hazards)": "ALL"} | {
+            f"🎯 {h['name']}  ({fmt(h.get('targetValue'))})": h["id"] for h in hazards
+        }
+        opt_keys = list(filter_opts.keys())
+        opt_vals = list(filter_opts.values())
+
+        # Default to first hazard (index 1) on first load
+        saved_filter = st.session_state.get("tree_filter", "ALL")
+        default_idx  = opt_vals.index(saved_filter) if saved_filter in opt_vals else (1 if len(opt_vals) > 1 else 0)
+
+        filter_label = st.selectbox("View", opt_keys, index=default_idx,
+                                    key="tree_filter_sel", label_visibility="collapsed")
         filter_id = filter_opts[filter_label]
         fid = None if filter_id == "ALL" else filter_id
 
-        st.markdown("<div style='font-size:9px;color:#444;margin-bottom:4px;'>Scroll=zoom · Right-drag=pan · Left-drag=move · Click=inspect · ▼=collapse</div>", unsafe_allow_html=True)
-        tree_html = build_html_tree(nodes, filter_hazard_id=fid)
+        # When user changes hazard in dropdown → focus on that hazard
+        if filter_id != saved_filter:
+            st.session_state.tree_filter = filter_id
+            st.session_state.tree_state["focus_id"] = fid  # None = full tree, else hazard id
+
+        ts = st.session_state.tree_state
+        st.markdown(
+            "<div style='font-size:9px;color:#333;margin-bottom:3px;'>"
+            "Scroll=zoom · Right-drag=pan · Left-drag=move · Click=inspect · ▼/+= collapse/expand"
+            "</div>", unsafe_allow_html=True)
+        tree_html = build_html_tree(nodes, filter_hazard_id=fid, tree_state=ts)
         components.html(tree_html, height=700, scrolling=False)
+        # Clear focus_id after render so next rerun doesn't keep jumping
+        st.session_state.tree_state["focus_id"] = None
 
 # ── TAB 2: Hierarchy ─────────────────────────────────────────────────────
 with tab_hier:
