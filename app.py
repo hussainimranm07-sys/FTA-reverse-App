@@ -109,7 +109,9 @@ def recalculate(nodes):
         child_val = reverse_distribute(parent_val, parent["gate"], len(children))
         for child in children:
             existing = child.get("calculatedValue")
-            child["calculatedValue"] = child_val if existing is None else min(existing, child_val)
+            # Shared nodes: use MAX (worst/highest failure rate wins)
+            # Higher failure rate = worse constraint = more conservative
+            child["calculatedValue"] = child_val if existing is None else max(existing, child_val)
             queue.append(child)
     return updated
 
@@ -295,95 +297,24 @@ def export_excel(nodes):
 
 # ── HTML Tree builder ─────────────────────────────────────────────────────
 def build_html_tree(nodes, selected_id=None):
-    """Build an interactive HTML/CSS/JS tree with zoom + right-click pan."""
+    """Interactive tree: zoom, pan, collapse/expand, drag nodes, path highlight."""
     if not nodes:
         return ""
-
     by_id   = {n["id"]: n for n in nodes}
     hazards = [n for n in nodes if n["type"] == "HAZARD"]
     if not hazards:
         return ""
 
-    def node_html(node):
-        nid       = node["id"]
-        color     = LEVEL_COLORS.get(node["type"], "#888")
-        tcolor    = LEVEL_TEXT.get(node["type"], "#fff")
-        val       = fmt(node.get("calculatedValue"))
-        is_shared = len(node.get("parentIds") or []) > 1
-        children  = [n for n in nodes if nid in (n.get("parentIds") or [])]
-        pnames    = [by_id[p]["name"] for p in (node.get("parentIds") or []) if p in by_id]
-        cnames    = [n["name"] for n in children]
-        gate_col  = "#4fc3f7" if node["gate"] == "OR" else "#ffb74d"
-        is_sel    = nid == selected_id
-
-        shared_badge = (
-            '<span style="background:#f5c518;color:#111;font-size:7px;padding:1px 4px;'
-            'border-radius:6px;font-weight:700;margin-left:4px;">SHARED</span>'
-            if is_shared else ""
-        )
-        sel_outline = "box-shadow:0 0 0 3px #e94560,0 0 20px #e9456066;" if is_sel else ""
-
-        gate_html = ""
-        if children:
-            gate_html = f"""
-            <div style="display:flex;flex-direction:column;align-items:center;">
-              <div style="width:2px;height:12px;background:#333;"></div>
-              <div style="background:#1a1a1a;border:1px solid {gate_col};border-radius:4px;
-                          padding:1px 7px;font-size:9px;color:{gate_col};font-weight:700;
-                          font-family:monospace;letter-spacing:1px;">{node['gate']}</div>
-              <div style="width:2px;height:12px;background:#333;"></div>
-            </div>"""
-
-        node_box = f"""
-        <div style="display:flex;flex-direction:column;align-items:center;">
-          <div class="fta-node" data-id="{nid}"
-               onclick="selectNode(event,'{nid}')"
-               style="background:{color};color:{tcolor};border-radius:8px;
-                      padding:8px 14px;min-width:130px;max-width:170px;
-                      cursor:pointer;user-select:none;
-                      border:2px solid {color};transition:filter 0.15s,box-shadow 0.15s;
-                      {sel_outline}">
-            <div style="font-size:8px;opacity:0.75;letter-spacing:1px;margin-bottom:3px;
-                        display:flex;align-items:center;justify-content:center;gap:4px;">
-              {node['type']}{shared_badge}
-            </div>
-            <div style="font-size:11px;font-weight:700;line-height:1.3;
-                        word-break:break-word;text-align:center;margin-bottom:5px;">
-              {node['name']}
-            </div>
-            <div style="background:rgba(0,0,0,0.28);border-radius:4px;
-                        padding:3px 6px;font-size:12px;font-weight:700;
-                        text-align:center;font-family:monospace;letter-spacing:0.5px;">
-              {val}
-            </div>
-          </div>
-          {gate_html}
-        </div>"""
-
-        if not children:
-            return f'<div class="tree-node-wrap" style="display:inline-flex;flex-direction:column;align-items:center;margin:0 8px;">{node_box}</div>'
-
-        children_html = "".join(node_html(c) for c in children)
-        return f"""
-        <div class="tree-node-wrap" style="display:inline-flex;flex-direction:column;align-items:center;margin:0 8px;">
-          {node_box}
-          <div style="display:flex;flex-direction:row;align-items:flex-start;">
-            <div class="connector-row" style="display:flex;flex-direction:row;align-items:flex-start;position:relative;">
-              {children_html}
-            </div>
-          </div>
-        </div>"""
-
-    tree_html = "".join(node_html(h) for h in hazards)
-
-    nodes_js = json.dumps({
+    nodes_js = __import__('json').dumps({
         n["id"]: {
             "name":     n["name"],
             "type":     n["type"],
             "gate":     n["gate"],
             "value":    fmt(n.get("calculatedValue")),
             "parents":  [by_id[p]["name"] for p in (n.get("parentIds") or []) if p in by_id],
-            "children": [c["name"] for c in nodes if n["id"] in (c.get("parentIds") or [])],
+            "parentIds":[p for p in (n.get("parentIds") or []) if p in by_id],
+            "children": [c["id"] for c in nodes if n["id"] in (c.get("parentIds") or [])],
+            "childNames":[c["name"] for c in nodes if n["id"] in (c.get("parentIds") or [])],
             "shared":   len(n.get("parentIds") or []) > 1,
             "color":    LEVEL_COLORS.get(n["type"], "#888"),
             "tcolor":   LEVEL_TEXT.get(n["type"], "#fff"),
@@ -391,310 +322,507 @@ def build_html_tree(nodes, selected_id=None):
         for n in nodes
     })
 
-    init_sel = f'selectNode(null,"{selected_id}");' if selected_id else ""
+    # Build adjacency for JS: list of [parentId, childId] edges
+    edges_js = __import__('json').dumps([
+        [pid, n["id"]]
+        for n in nodes
+        for pid in (n.get("parentIds") or [])
+        if pid in by_id
+    ])
+
+    # Build level groups for layout
+    level_groups_js = __import__('json').dumps({
+        lvl: [n["id"] for n in nodes if n["type"] == lvl]
+        for lvl in ["HAZARD","SF","FF","IF"]
+    })
+
+    init_sel = f'selectNode("{selected_id}");' if selected_id else ""
 
     html = f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <style>
-  *{{box-sizing:border-box;margin:0;padding:0;}}
-  body{{
-    background:#0a0a0a;
-    font-family:'JetBrains Mono','Fira Code',monospace;
-    color:#e0e0e0;
-    overflow:hidden;
-    height:100vh;
-    display:flex;flex-direction:column;
-  }}
-
-  /* ── toolbar ── */
-  #toolbar{{
-    display:flex;align-items:center;gap:8px;
-    padding:6px 12px;
-    background:#111;border-bottom:1px solid #1e1e1e;
-    flex-shrink:0;font-size:10px;color:#555;letter-spacing:1px;
-    user-select:none;
-  }}
-  .tb-btn{{
-    background:#1a1a1a;border:1px solid #333;color:#aaa;
-    border-radius:4px;padding:3px 10px;cursor:pointer;
-    font-family:inherit;font-size:10px;letter-spacing:1px;
-    transition:background 0.1s;
-  }}
-  .tb-btn:hover{{background:#252525;color:#fff;}}
-  #zoom-label{{color:#666;font-size:10px;min-width:42px;text-align:center;}}
-
-  /* ── viewport ── */
-  #viewport{{
-    flex:1;overflow:hidden;position:relative;
-    cursor:grab;
-  }}
-  #viewport.dragging{{cursor:grabbing;}}
-  #canvas{{
-    position:absolute;
-    transform-origin:0 0;
-    padding:40px 60px 80px 60px;
-    will-change:transform;
-  }}
-
-  /* ── nodes ── */
-  .fta-node:hover{{
-    filter:brightness(1.18);
-    box-shadow:0 6px 20px rgba(0,0,0,0.6) !important;
-  }}
-  .connector-row>div{{position:relative;}}
-  .connector-row>div:not(:only-child)::before{{
-    content:'';position:absolute;top:0;left:50%;width:100%;
-    border-top:2px solid #2a2a2a;
-  }}
-  .connector-row>div:first-child:not(:only-child)::before{{left:50%;width:50%;}}
-  .connector-row>div:last-child:not(:only-child)::before{{left:0;width:50%;}}
-
-  /* ── detail panel ── */
-  #detail-panel{{
-    position:fixed;bottom:0;left:0;right:0;
-    background:#141414ee;border-top:2px solid #333;
-    padding:10px 16px;display:none;
-    backdrop-filter:blur(8px);
-    z-index:100;
-  }}
-  .detail-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:8px 0 6px;}}
-  .dc{{background:#0a0a0a;border-radius:6px;padding:6px;text-align:center;}}
-  .dcl{{font-size:7px;color:#555;letter-spacing:2px;margin-bottom:2px;}}
-  .dcv{{font-size:12px;font-weight:700;}}
-  .detail-row{{display:grid;grid-template-columns:1fr 1fr;gap:8px;}}
-  .ds{{background:#0a0a0a;border-radius:6px;padding:6px;}}
-  .dsl{{font-size:7px;color:#555;letter-spacing:2px;margin-bottom:3px;}}
-  .dsv{{font-size:10px;color:#ccc;}}
-  #close-detail{{
-    position:absolute;top:8px;right:12px;
-    background:none;border:none;color:#555;font-size:16px;
-    cursor:pointer;font-family:inherit;
-  }}
-  #close-detail:hover{{color:#fff;}}
+*{{box-sizing:border-box;margin:0;padding:0;}}
+body{{
+  background:#0a0a0a;
+  font-family:'JetBrains Mono','Fira Code',monospace;
+  color:#e0e0e0;
+  overflow:hidden;
+  height:100vh;
+  display:flex;flex-direction:column;
+}}
+#toolbar{{
+  display:flex;align-items:center;gap:6px;flex-wrap:wrap;
+  padding:5px 10px;background:#111;
+  border-bottom:1px solid #1e1e1e;
+  flex-shrink:0;font-size:10px;color:#555;
+  user-select:none;
+}}
+.tb-btn{{
+  background:#1a1a1a;border:1px solid #2a2a2a;color:#aaa;
+  border-radius:4px;padding:3px 9px;cursor:pointer;
+  font-family:inherit;font-size:10px;letter-spacing:0.5px;
+  transition:background 0.1s,color 0.1s;white-space:nowrap;
+}}
+.tb-btn:hover{{background:#252525;color:#fff;border-color:#444;}}
+.tb-sep{{color:#2a2a2a;}}
+#zoom-label{{color:#555;font-size:10px;min-width:38px;text-align:center;}}
+#hint{{color:#383838;font-size:9px;letter-spacing:0.5px;margin-left:4px;}}
+#viewport{{
+  flex:1;overflow:hidden;position:relative;
+  cursor:default;
+}}
+#canvas{{
+  position:absolute;top:0;left:0;
+  transform-origin:0 0;
+  will-change:transform;
+}}
+svg#edges{{
+  position:absolute;top:0;left:0;
+  pointer-events:none;
+  overflow:visible;
+}}
+.node-wrap{{
+  position:absolute;
+  display:flex;flex-direction:column;align-items:center;
+  cursor:grab;
+  transition:opacity 0.2s;
+}}
+.node-wrap.collapsed-hidden{{opacity:0;pointer-events:none;}}
+.fta-node{{
+  border-radius:8px;padding:8px 12px;
+  min-width:120px;max-width:155px;
+  user-select:none;
+  border:2px solid transparent;
+  transition:filter 0.12s,box-shadow 0.12s,transform 0.12s;
+  position:relative;
+}}
+.fta-node:hover{{filter:brightness(1.18);}}
+.fta-node.dimmed{{opacity:0.25;}}
+.fta-node.highlighted{{}}
+.collapse-btn{{
+  width:20px;height:20px;border-radius:50%;
+  border:1px solid #333;background:#1a1a1a;
+  color:#888;font-size:10px;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;
+  margin-top:4px;transition:background 0.1s,color 0.1s;
+  flex-shrink:0;
+}}
+.collapse-btn:hover{{background:#252525;color:#fff;border-color:#555;}}
+.gate-tag{{
+  font-size:8px;font-weight:700;font-family:monospace;
+  padding:1px 6px;border-radius:3px;margin-top:3px;
+  border:1px solid;letter-spacing:1px;
+}}
+#detail-panel{{
+  position:fixed;bottom:0;left:0;right:0;
+  background:#141414f0;border-top:2px solid #333;
+  padding:8px 14px 10px;display:none;
+  backdrop-filter:blur(10px);z-index:200;
+}}
+.dg{{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin:6px 0 5px;}}
+.dc{{background:#0a0a0a;border-radius:5px;padding:5px;text-align:center;}}
+.dcl{{font-size:7px;color:#555;letter-spacing:2px;margin-bottom:2px;}}
+.dcv{{font-size:11px;font-weight:700;}}
+.dr{{display:grid;grid-template-columns:1fr 1fr;gap:6px;}}
+.ds{{background:#0a0a0a;border-radius:5px;padding:5px;}}
+.dsl{{font-size:7px;color:#555;letter-spacing:2px;margin-bottom:2px;}}
+.dsv{{font-size:10px;color:#ccc;line-height:1.4;}}
+#close-dp{{
+  position:absolute;top:6px;right:10px;
+  background:none;border:none;color:#555;font-size:15px;
+  cursor:pointer;font-family:inherit;
+}}
+#close-dp:hover{{color:#fff;}}
 </style>
 </head>
 <body>
 
-<!-- toolbar -->
 <div id="toolbar">
-  <button class="tb-btn" onclick="zoom(0.15)">＋ Zoom In</button>
-  <button class="tb-btn" onclick="zoom(-0.15)">－ Zoom Out</button>
-  <button class="tb-btn" onclick="resetView()">⌂ Reset</button>
+  <button class="tb-btn" onclick="zoomBy(0.15)">＋</button>
+  <button class="tb-btn" onclick="zoomBy(-0.15)">－</button>
   <span id="zoom-label">100%</span>
-  <span style="margin-left:8px;">Scroll to zoom &nbsp;·&nbsp; Right-click drag to pan &nbsp;·&nbsp; Click node to inspect</span>
+  <span class="tb-sep">|</span>
+  <button class="tb-btn" onclick="resetView()">⌂ Reset</button>
+  <button class="tb-btn" onclick="expandAll()">⊞ Expand All</button>
+  <button class="tb-btn" onclick="collapseAll()">⊟ Collapse All</button>
+  <button class="tb-btn" onclick="clearHighlight()">✕ Clear Highlight</button>
+  <span class="tb-sep">|</span>
+  <span id="hint">Scroll=zoom &nbsp; Right-drag=pan &nbsp; Left-drag=move node &nbsp; Click=inspect &nbsp; ▼ button=collapse</span>
 </div>
 
-<!-- zoomable viewport -->
 <div id="viewport">
   <div id="canvas">
-    {tree_html}
+    <svg id="edges"></svg>
   </div>
 </div>
 
-<!-- detail panel (fixed bottom) -->
 <div id="detail-panel">
-  <button id="close-detail" onclick="closeDetail()">✕</button>
-  <div style="font-size:8px;color:#888;letter-spacing:3px;margin-bottom:4px;">SELECTED NODE</div>
-  <div id="detail-title" style="font-size:14px;font-weight:700;margin-bottom:4px;"></div>
-  <div class="detail-grid">
-    <div class="dc"><div class="dcl">TYPE</div><div class="dcv" id="d-type"></div></div>
-    <div class="dc"><div class="dcl">GATE</div><div class="dcv" id="d-gate"></div></div>
-    <div class="dc"><div class="dcl">VALUE</div><div class="dcv" id="d-value"></div></div>
-    <div class="dc"><div class="dcl">SHARED</div><div class="dcv" id="d-shared"></div></div>
+  <button id="close-dp" onclick="closeDetail()">✕</button>
+  <div style="font-size:8px;color:#888;letter-spacing:3px;margin-bottom:3px;">SELECTED NODE</div>
+  <div id="dp-title" style="font-size:14px;font-weight:700;margin-bottom:3px;"></div>
+  <div class="dg">
+    <div class="dc"><div class="dcl">TYPE</div><div class="dcv" id="dp-type"></div></div>
+    <div class="dc"><div class="dcl">GATE</div><div class="dcv" id="dp-gate"></div></div>
+    <div class="dc"><div class="dcl">VALUE</div><div class="dcv" id="dp-value"></div></div>
+    <div class="dc"><div class="dcl">SHARED</div><div class="dcv" id="dp-shared"></div></div>
   </div>
-  <div class="detail-row">
-    <div class="ds"><div class="dsl">PARENTS</div><div class="dsv" id="d-parents"></div></div>
-    <div class="ds"><div class="dsl">CHILDREN</div><div class="dsv" id="d-children"></div></div>
+  <div class="dr">
+    <div class="ds"><div class="dsl">PARENTS</div><div class="dsv" id="dp-parents"></div></div>
+    <div class="ds"><div class="dsl">CHILDREN</div><div class="dsv" id="dp-children"></div></div>
   </div>
 </div>
 
 <script>
-const NODES = {nodes_js};
+// ── data ──────────────────────────────────────────────────────────────
+const NODES   = {nodes_js};
+const EDGES   = {edges_js};
+const LEVELS  = {level_groups_js};
+const COLORS  = {{HAZARD:"#ff4d4d",SF:"#ff8c42",FF:"#f5c518",IF:"#4caf7d"}};
+const TCOLORS = {{HAZARD:"#fff",SF:"#fff",FF:"#111",IF:"#fff"}};
+const GATE_COLORS = {{OR:"#4fc3f7",AND:"#ffb74d"}};
+const LEVEL_Y = {{HAZARD:40, SF:200, FF:360, IF:520}};
+const NODE_W  = 145, NODE_H = 80, H_GAP = 30, V_GAP = 120;
 
-// ── transform state ──
-let scale  = 1.0;
-let tx     = 0;
-let ty     = 0;
-const MIN_SCALE = 0.15;
-const MAX_SCALE = 3.0;
-const canvas    = document.getElementById('canvas');
-const viewport  = document.getElementById('viewport');
+// ── state ──────────────────────────────────────────────────────────────
+let scale     = 1, tx = 0, ty = 0;
+const MIN_S   = 0.12, MAX_S = 3.5;
+let positions = {{}};      // id -> {{x,y}}
+let collapsed = new Set(); // collapsed node ids
+let selectedId= null;
 
-function applyTransform() {{
-  canvas.style.transform = `translate(${{tx}}px,${{ty}}px) scale(${{scale}})`;
-  document.getElementById('zoom-label').textContent = Math.round(scale*100)+'%';
+// ── build initial layout ───────────────────────────────────────────────
+function buildLayout() {{
+  const order = ["HAZARD","SF","FF","IF"];
+  const ys    = {{HAZARD:40, SF:220, FF:400, IF:580}};
+  order.forEach(lvl => {{
+    const ids = LEVELS[lvl] || [];
+    const total = ids.length;
+    ids.forEach((id,i) => {{
+      positions[id] = {{
+        x: total === 1 ? 400 : 60 + i*(NODE_W+H_GAP),
+        y: ys[lvl]
+      }};
+    }});
+  }});
+  // centre HAZARD over its children
+  const hid = (LEVELS.HAZARD||[])[0];
+  if (hid) {{
+    const kids = EDGES.filter(e=>e[0]===hid).map(e=>e[1]);
+    if (kids.length) {{
+      const xs = kids.map(k=>positions[k]?.x||400);
+      positions[hid].x = xs.reduce((a,b)=>a+b,0)/xs.length;
+    }}
+  }}
 }}
 
-function zoom(delta, cx, cy) {{
+// ── viewport transform ─────────────────────────────────────────────────
+const canvas   = document.getElementById('canvas');
+const viewport = document.getElementById('viewport');
+
+function applyT() {{
+  canvas.style.transform = `translate(${{tx}}px,${{ty}}px) scale(${{scale}})`;
+  document.getElementById('zoom-label').textContent = Math.round(scale*100)+'%';
+  drawEdges();
+}}
+
+function zoomBy(d, cx, cy) {{
   const vr  = viewport.getBoundingClientRect();
-  const ocx = (cx !== undefined) ? cx - vr.left : vr.width  / 2;
-  const ocy = (cy !== undefined) ? cy - vr.top  : vr.height / 2;
-  const newScale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, scale + delta));
-  const ratio    = newScale / scale;
-  tx = ocx - ratio * (ocx - tx);
-  ty = ocy - ratio * (ocy - ty);
-  scale = newScale;
-  applyTransform();
+  cx = cx ?? vr.width/2; cy = cy ?? vr.height/2;
+  const ns  = Math.min(MAX_S, Math.max(MIN_S, scale+d));
+  const r   = ns/scale;
+  tx = cx - r*(cx-tx); ty = cy - r*(cy-ty);
+  scale = ns; applyT();
 }}
 
 function resetView() {{
-  scale = 1.0; tx = 0; ty = 0;
-  applyTransform();
+  scale=1; tx=60; ty=20; applyT();
 }}
 
-// ── scroll to zoom ──
 viewport.addEventListener('wheel', e => {{
   e.preventDefault();
-  const delta = e.deltaY < 0 ? 0.1 : -0.1;
-  zoom(delta, e.clientX, e.clientY);
-}}, {{ passive: false }});
+  zoomBy(e.deltaY<0?0.1:-0.1, e.clientX, e.clientY);
+}}, {{passive:false}});
 
-// ── right-click drag to pan ──
-let isPanning = false;
-let panStart  = {{ x:0, y:0 }};
-
+// ── right-click pan ────────────────────────────────────────────────────
+let panning=false, panStart={{x:0,y:0}};
 viewport.addEventListener('mousedown', e => {{
-  if (e.button === 2) {{
-    isPanning = true;
-    panStart  = {{ x: e.clientX - tx, y: e.clientY - ty }};
-    viewport.classList.add('dragging');
-    e.preventDefault();
+  if (e.button===2) {{
+    panning=true; panStart={{x:e.clientX-tx, y:e.clientY-ty}};
+    viewport.style.cursor='grabbing'; e.preventDefault();
   }}
 }});
-
 window.addEventListener('mousemove', e => {{
-  if (!isPanning) return;
-  tx = e.clientX - panStart.x;
-  ty = e.clientY - panStart.y;
-  applyTransform();
+  if (!panning) return;
+  tx=e.clientX-panStart.x; ty=e.clientY-panStart.y; applyT();
 }});
-
 window.addEventListener('mouseup', e => {{
-  if (e.button === 2) {{
-    isPanning = false;
-    viewport.classList.remove('dragging');
+  if (e.button===2) {{ panning=false; viewport.style.cursor='default'; }}
+}});
+viewport.addEventListener('contextmenu', e=>e.preventDefault());
+
+// ── node drag ─────────────────────────────────────────────────────────
+let draggingId=null, dragOff={{x:0,y:0}}, didDrag=false;
+
+function onNodeMouseDown(e, id) {{
+  if (e.button!==0) return;
+  e.stopPropagation();
+  draggingId=id; didDrag=false;
+  const pos = positions[id];
+  dragOff = {{
+    x: e.clientX/scale - tx/scale - pos.x,
+    y: e.clientY/scale - ty/scale - pos.y
+  }};
+  document.body.style.userSelect='none';
+}}
+window.addEventListener('mousemove', e => {{
+  if (!draggingId) return;
+  didDrag=true;
+  const nx = e.clientX/scale - tx/scale - dragOff.x;
+  const ny = e.clientY/scale - ty/scale - dragOff.y;
+  positions[draggingId] = {{x:nx, y:ny}};
+  const el = document.getElementById('node-'+draggingId);
+  if (el) {{ el.style.left=nx+'px'; el.style.top=ny+'px'; }}
+  drawEdges();
+}});
+window.addEventListener('mouseup', e => {{
+  if (e.button===0 && draggingId) {{
+    const id = draggingId;
+    draggingId=null;
+    document.body.style.userSelect='';
+    if (!didDrag) selectNode(id);
   }}
 }});
 
-// Disable right-click context menu on viewport
-viewport.addEventListener('contextmenu', e => e.preventDefault());
-
-// ── touch pinch-to-zoom + drag ──
-let lastTouchDist = null;
-let lastTouchMid  = null;
-
-viewport.addEventListener('touchstart', e => {{
-  if (e.touches.length === 2) {{
-    const dx = e.touches[0].clientX - e.touches[1].clientX;
-    const dy = e.touches[0].clientY - e.touches[1].clientY;
-    lastTouchDist = Math.hypot(dx, dy);
-    lastTouchMid  = {{
-      x: (e.touches[0].clientX + e.touches[1].clientX) / 2,
-      y: (e.touches[0].clientY + e.touches[1].clientY) / 2,
-    }};
+// ── collapse / expand ──────────────────────────────────────────────────
+function getDescendants(id) {{
+  const result=new Set();
+  const queue=[id];
+  while(queue.length) {{
+    const cur=queue.shift();
+    const kids=EDGES.filter(e=>e[0]===cur).map(e=>e[1]);
+    kids.forEach(k=>{{ if(!result.has(k)){{ result.add(k); queue.push(k); }} }});
   }}
-}}, {{ passive: true }});
+  return result;
+}}
 
-viewport.addEventListener('touchmove', e => {{
-  if (e.touches.length === 2) {{
-    const dx   = e.touches[0].clientX - e.touches[1].clientX;
-    const dy   = e.touches[0].clientY - e.touches[1].clientY;
-    const dist = Math.hypot(dx, dy);
-    const mid  = {{
-      x: (e.touches[0].clientX + e.touches[1].clientX) / 2,
-      y: (e.touches[0].clientY + e.touches[1].clientY) / 2,
-    }};
-    if (lastTouchDist) {{
-      const delta = (dist - lastTouchDist) * 0.01;
-      zoom(delta, mid.x, mid.y);
+function toggleCollapse(e, id) {{
+  e.stopPropagation();
+  if (collapsed.has(id)) {{
+    collapsed.delete(id);
+  }} else {{
+    collapsed.add(id);
+  }}
+  updateVisibility();
+  drawEdges();
+}}
+
+function updateVisibility() {{
+  const hidden=new Set();
+  collapsed.forEach(cid => {{
+    getDescendants(cid).forEach(d=>hidden.add(d));
+  }});
+  Object.keys(NODES).forEach(id => {{
+    const el=document.getElementById('node-'+id);
+    if (!el) return;
+    if (hidden.has(id)) {{ el.style.opacity='0'; el.style.pointerEvents='none'; }}
+    else {{ el.style.opacity='1'; el.style.pointerEvents=''; }}
+  }});
+  // update collapse button label
+  collapsed.forEach(cid=>{{
+    const btn=document.getElementById('cbtn-'+cid);
+    if (btn) btn.textContent='＋';
+  }});
+  Object.keys(NODES).forEach(id=>{{
+    if (!collapsed.has(id)) {{
+      const btn=document.getElementById('cbtn-'+id);
+      if (btn) btn.textContent='－';
     }}
-    lastTouchDist = dist;
-    lastTouchMid  = mid;
-    e.preventDefault();
+  }});
+}}
+
+function expandAll()  {{ collapsed.clear(); updateVisibility(); drawEdges(); }}
+function collapseAll(){{
+  Object.keys(NODES).forEach(id=>{{
+    if((NODES[id].children||[]).length>0) collapsed.add(id);
+  }});
+  updateVisibility(); drawEdges();
+}}
+
+// ── get all ancestors of a node ────────────────────────────────────────
+function getAncestors(id) {{
+  const result=new Set();
+  const queue=[id];
+  while(queue.length) {{
+    const cur=queue.shift();
+    const parents=(NODES[cur]?.parentIds||[]);
+    parents.forEach(p=>{{ if(!result.has(p)){{ result.add(p); queue.push(p); }} }});
   }}
-}}, {{ passive: false }});
+  return result;
+}}
 
-// ── node selection ──
-let selectedId = null;
+// ── selection + path highlighting ─────────────────────────────────────
+function selectNode(id) {{
+  if (didDrag) return;
 
-function selectNode(event, id) {{
-  // Don't trigger if we were panning
-  if (isPanning) return;
-
-  document.querySelectorAll('.fta-node').forEach(el => {{
-    el.style.boxShadow = '';
+  // clear old highlights
+  document.querySelectorAll('.fta-node').forEach(el=>{{
+    el.style.boxShadow=''; el.classList.remove('dimmed','highlighted');
   }});
 
-  if (selectedId === id) {{
-    selectedId = null;
-    closeDetail();
-    return;
-  }}
+  if (selectedId===id) {{ selectedId=null; closeDetail(); clearHighlight(); return; }}
+  selectedId=id;
 
-  selectedId = id;
-  const node = NODES[id];
+  const node=NODES[id];
   if (!node) return;
 
-  // Highlight selected node
-  const el = document.querySelector(`[data-id="${{id}}"]`);
-  if (el) el.style.boxShadow = '0 0 0 3px #e94560,0 0 22px #e9456077';
+  // compute full ancestor path to root
+  const ancestors  = getAncestors(id);
+  const descendants= getDescendants(id);
+  const connected  = new Set([...ancestors,...descendants,id]);
 
-  // Highlight connected nodes
-  Object.entries(NODES).forEach(([nid, n]) => {{
-    if (nid === id) return;
-    const isParent = node.parents.includes(n.name);
-    const isChild  = node.children.includes(n.name);
-    if (isParent || isChild) {{
-      const cel = document.querySelector(`[data-id="${{nid}}"]`);
-      if (cel) cel.style.boxShadow = '0 0 0 2px #ff8c42,0 0 14px #ff8c4255';
+  // dim all, highlight path
+  Object.keys(NODES).forEach(nid=>{{
+    const el=document.getElementById('node-'+nid)?.querySelector('.fta-node');
+    if (!el) return;
+    if (nid===id) {{
+      el.style.boxShadow='0 0 0 3px #e94560,0 0 24px #e9456088';
+    }} else if (ancestors.has(nid)) {{
+      el.style.boxShadow='0 0 0 2px #4fc3f7,0 0 14px #4fc3f744';  // blue = ancestors
+    }} else if (descendants.has(nid)) {{
+      el.style.boxShadow='0 0 0 2px #ff8c42,0 0 14px #ff8c4244';  // orange = descendants
+    }} else {{
+      el.classList.add('dimmed');
     }}
   }});
 
-  // Show detail panel
-  const panel = document.getElementById('detail-panel');
-  panel.style.display  = 'block';
-  panel.style.borderTopColor = node.color;
+  // highlight edges in path
+  drawEdges(connected);
 
-  document.getElementById('detail-title').innerHTML =
+  // detail panel
+  const panel=document.getElementById('detail-panel');
+  panel.style.display='block';
+  panel.style.borderTopColor=node.color;
+
+  document.getElementById('dp-title').innerHTML =
     `<span style="color:${{node.color}}">${{node.name}}</span>` +
-    (node.shared
-      ? ' <span style="background:#f5c518;color:#111;font-size:8px;padding:1px 6px;border-radius:6px;font-weight:700;">SHARED</span>'
-      : '');
+    (node.shared?' <span style="background:#f5c518;color:#111;font-size:8px;padding:1px 5px;border-radius:5px;font-weight:700;">SHARED</span>':'');
 
-  document.getElementById('d-type').style.color   = node.color;
-  document.getElementById('d-type').textContent   = node.type;
-  document.getElementById('d-gate').style.color   = node.gate === 'OR' ? '#4fc3f7' : '#ffb74d';
-  document.getElementById('d-gate').textContent   = node.gate;
-  document.getElementById('d-value').style.color  = node.color;
-  document.getElementById('d-value').textContent  = node.value;
-  document.getElementById('d-shared').textContent = node.shared ? 'YES' : 'NO';
-  document.getElementById('d-shared').style.color = node.shared ? '#f5c518' : '#555';
-  document.getElementById('d-parents').textContent  = node.parents.join(' · ') || '(top event)';
-  document.getElementById('d-children').textContent = node.children.join(' · ') || '(leaf node)';
+  document.getElementById('dp-type').style.color  = node.color;
+  document.getElementById('dp-type').textContent  = node.type;
+  document.getElementById('dp-gate').style.color  = GATE_COLORS[node.gate]||'#aaa';
+  document.getElementById('dp-gate').textContent  = node.gate;
+  document.getElementById('dp-value').style.color = node.color;
+  document.getElementById('dp-value').textContent = node.value;
+  document.getElementById('dp-shared').textContent= node.shared?'YES':'NO';
+  document.getElementById('dp-shared').style.color= node.shared?'#f5c518':'#555';
+  document.getElementById('dp-parents').textContent  = node.parents.join(' · ')||'(top event)';
+  document.getElementById('dp-children').textContent = node.childNames.join(' · ')||'(leaf node)';
+}}
+
+function clearHighlight() {{
+  selectedId=null;
+  document.querySelectorAll('.fta-node').forEach(el=>{{
+    el.style.boxShadow=''; el.classList.remove('dimmed');
+  }});
+  drawEdges();
+  closeDetail();
 }}
 
 function closeDetail() {{
-  document.getElementById('detail-panel').style.display = 'none';
-  document.querySelectorAll('.fta-node').forEach(el => el.style.boxShadow = '');
-  selectedId = null;
+  document.getElementById('detail-panel').style.display='none';
 }}
 
-// centre tree on load
-window.addEventListener('load', () => {{
-  const vr = viewport.getBoundingClientRect();
-  const cr = canvas.getBoundingClientRect();
-  tx = (vr.width  - cr.width)  / 2;
-  ty = 20;
-  applyTransform();
-  {init_sel}
-}});
+// ── SVG edge drawing ───────────────────────────────────────────────────
+const svgEl = document.getElementById('edges');
+
+function drawEdges(highlighted) {{
+  const hidden=new Set();
+  collapsed.forEach(cid=>getDescendants(cid).forEach(d=>hidden.add(d)));
+
+  let svgContent='';
+  EDGES.forEach(([pid,cid])=>{{
+    if (hidden.has(cid)||hidden.has(pid)) return;
+    const pp=positions[pid], cp=positions[cid];
+    if (!pp||!cp) return;
+    const x1=pp.x+NODE_W/2, y1=pp.y+NODE_H;
+    const x2=cp.x+NODE_W/2, y2=cp.y;
+    const my=(y1+y2)/2;
+    const isHl = highlighted && (highlighted.has(pid)||highlighted.has(cid));
+    const color = isHl ? '#4fc3f7' : '#2a2a2a';
+    const width = isHl ? 2 : 1.5;
+    svgContent += `<path d="M${{x1}},${{y1}} C${{x1}},${{my}} ${{x2}},${{my}} ${{x2}},${{y2}}"
+      fill="none" stroke="${{color}}" stroke-width="${{width}}" opacity="${{isHl?1:0.7}}"/>`;
+  }});
+  svgEl.innerHTML=svgContent;
+  // size SVG to cover all nodes
+  const allX=Object.values(positions).map(p=>p.x+NODE_W);
+  const allY=Object.values(positions).map(p=>p.y+NODE_H+40);
+  const maxX=Math.max(...allX,800), maxY=Math.max(...allY,600);
+  svgEl.setAttribute('width',maxX); svgEl.setAttribute('height',maxY);
+  svgEl.style.width=maxX+'px'; svgEl.style.height=maxY+'px';
+}}
+
+// ── render nodes ────────────────────────────────────────────────────────
+function renderNodes() {{
+  Object.entries(NODES).forEach(([id,node])=>{{
+    const pos=positions[id]||{{x:200,y:200}};
+    const color=node.color, tc=node.tcolor;
+    const hasChildren=(node.children||[]).length>0;
+    const gateColor=GATE_COLORS[node.gate]||'#aaa';
+    const sharedBadge=node.shared
+      ?`<span style="background:#f5c518;color:#111;font-size:6px;padding:1px 3px;border-radius:4px;font-weight:700;margin-left:3px;">SHARED</span>`:'';
+
+    const wrap=document.createElement('div');
+    wrap.id='node-'+id;
+    wrap.className='node-wrap';
+    wrap.style.cssText=`left:${{pos.x}}px;top:${{pos.y}}px;width:${{NODE_W}}px;`;
+    wrap.onmousedown=e=>onNodeMouseDown(e,id);
+
+    wrap.innerHTML=`
+      <div class="fta-node" style="background:${{color}};color:${{tc}};border-color:${{color}};width:100%;">
+        <div style="font-size:7px;opacity:0.75;letter-spacing:1px;margin-bottom:2px;display:flex;align-items:center;justify-content:center;">
+          ${{node.type}}${{sharedBadge}}
+        </div>
+        <div style="font-size:10px;font-weight:700;text-align:center;word-break:break-word;margin-bottom:4px;line-height:1.3;">
+          ${{node.name}}
+        </div>
+        <div style="background:rgba(0,0,0,0.25);border-radius:3px;padding:2px 5px;
+                    font-size:11px;font-weight:700;text-align:center;font-family:monospace;">
+          ${{node.value}}
+        </div>
+      </div>
+      ${{hasChildren?`
+        <div style="display:flex;align-items:center;gap:5px;margin-top:3px;">
+          <div class="gate-tag" style="color:${{gateColor}};border-color:${{gateColor}};background:#111;">
+            ${{node.gate}}
+          </div>
+          <button class="collapse-btn" id="cbtn-${{id}}" onclick="toggleCollapse(event,'${{id}}')">-</button>
+        </div>`:'__EMPTY__'}}
+    `;
+    canvas.appendChild(wrap);
+  }});
+}}
+
+// ── init ────────────────────────────────────────────────────────────────
+buildLayout();
+renderNodes();
+drawEdges();
+
+// centre view
+const vr=viewport.getBoundingClientRect();
+const allX2=Object.values(positions).map(p=>p.x+NODE_W);
+const allY2=Object.values(positions).map(p=>p.y+NODE_H);
+const treeW=Math.max(...allX2)-Math.min(...Object.values(positions).map(p=>p.x));
+tx=Math.max(20,(vr.width-treeW*scale)/2); ty=20;
+applyT();
+
+{init_sel}
 </script>
 </body>
 </html>"""
     return html
-
 
 # ── Hierarchy text builder ────────────────────────────────────────────────
 def build_hierarchy_rows(nodes):
@@ -930,85 +1058,175 @@ with st.sidebar:
     # NODE EDITOR
     st.markdown("### 🔧 NODE EDITOR")
 
-    if not hazard:
-        st.markdown("**STEP 1 — TOP EVENT**")
-        h_name = st.text_input("Hazard Name", placeholder="e.g. Aircraft Crash")
-        h_val  = st.text_input("Target Failure Rate", placeholder="e.g. 1e-7")
-        if st.button("➕ ADD HAZARD", use_container_width=True):
-            try:
-                val  = float(h_val)
-                node = {
-                    "id": str(uuid.uuid4())[:7], "name": h_name.strip(),
-                    "type": "HAZARD", "gate": "OR",
-                    "targetValue": val, "calculatedValue": val, "parentIds": []
-                }
-                set_nodes([node])
+    editor_tab_add, editor_tab_edit = st.tabs(["➕ ADD", "✏️ EDIT"])
+
+    with editor_tab_add:
+        if not hazard:
+            st.markdown("**STEP 1 — TOP EVENT**")
+            h_name = st.text_input("Hazard Name", placeholder="e.g. Aircraft Crash")
+            h_val  = st.text_input("Target Failure Rate", placeholder="e.g. 1e-7")
+            if st.button("➕ ADD HAZARD", use_container_width=True):
+                try:
+                    val  = float(h_val)
+                    node = {
+                        "id": str(uuid.uuid4())[:7], "name": h_name.strip(),
+                        "type": "HAZARD", "gate": "OR",
+                        "targetValue": val, "calculatedValue": val, "parentIds": []
+                    }
+                    set_nodes([node])
+                    st.rerun()
+                except ValueError:
+                    st.error("Invalid value — use format like 1e-7")
+        else:
+            col = LEVEL_COLORS["HAZARD"]
+            st.markdown(f"""
+            <div style="background:#141414;border:1px solid {col};border-radius:8px;
+                        padding:10px;margin-bottom:10px;">
+              <div style="font-size:9px;color:#888;letter-spacing:2px;">TOP EVENT</div>
+              <div style="font-weight:700;color:{col};margin:3px 0;">{hazard['name']}</div>
+              <div style="font-size:11px;color:#aaa;">
+                Target: <span style="color:#fff">{fmt(hazard['targetValue'])}</span>
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+            node_name = st.text_input("Node Name", placeholder="e.g. Power Failure", key="add_name")
+            parent_options = {f"[{n['type']}] {n['name']}": n["id"]
+                              for n in nodes if n["type"] in VALID_PARENT_TYPES}
+            sel_labels     = st.multiselect("Parent Node(s)", list(parent_options.keys()),
+                                            help="Select multiple → shared node. SF→SF supported.",
+                                            key="add_parents")
+            sel_parent_ids = [parent_options[l] for l in sel_labels]
+            node_type      = st.selectbox("Node Type", VALID_CHILD_TYPES, key="add_type",
+                                          help="SF→SF allowed for transfer events")
+            gate           = st.radio("Gate (for this node's children)", ["OR", "AND"],
+                                      horizontal=True, key="add_gate")
+
+            if st.button("✅ ADD NODE", use_container_width=True, type="primary"):
+                if not node_name.strip():
+                    st.error("Enter a node name")
+                elif not sel_parent_ids:
+                    st.error("Select at least one parent")
+                else:
+                    new_node = {
+                        "id": str(uuid.uuid4())[:7], "name": node_name.strip(),
+                        "type": node_type, "gate": gate,
+                        "targetValue": None, "calculatedValue": None,
+                        "parentIds": sel_parent_ids
+                    }
+                    set_nodes(nodes + [new_node])
+                    st.rerun()
+
+            st.markdown("---")
+            del_options = {f"[{n['type']}] {n['name']}": n["id"]
+                           for n in nodes if n["type"] != "HAZARD"}
+            if del_options:
+                del_label = st.selectbox("Delete Node", ["— select —"] + list(del_options.keys()))
+                if del_label != "— select —" and st.button("🗑 DELETE NODE", use_container_width=True):
+                    del_id    = del_options[del_label]
+                    to_delete = {del_id}
+                    changed   = True
+                    while changed:
+                        changed = False
+                        for n in nodes:
+                            if n["id"] not in to_delete and any(
+                                p in to_delete for p in (n.get("parentIds") or [])
+                            ):
+                                to_delete.add(n["id"])
+                                changed = True
+                    set_nodes([n for n in nodes if n["id"] not in to_delete])
+                    st.rerun()
+
+            st.markdown("---")
+            if st.button("🗑 CLEAR ALL", use_container_width=True):
+                set_nodes([])
+                st.session_state.selected_id = None
                 st.rerun()
-            except ValueError:
-                st.error("Invalid value — use format like 1e-7")
-    else:
-        col = LEVEL_COLORS["HAZARD"]
-        st.markdown(f"""
-        <div style="background:#141414;border:1px solid {col};border-radius:8px;
-                    padding:10px;margin-bottom:10px;">
-          <div style="font-size:9px;color:#888;letter-spacing:2px;">TOP EVENT</div>
-          <div style="font-weight:700;color:{col};margin:3px 0;">{hazard['name']}</div>
-          <div style="font-size:11px;color:#aaa;">
-            Target: <span style="color:#fff">{fmt(hazard['targetValue'])}</span>
-          </div>
-        </div>""", unsafe_allow_html=True)
 
-        st.markdown("**➕ ADD NODE**")
-        node_name = st.text_input("Node Name", placeholder="e.g. Power Failure")
-        parent_options = {f"[{n['type']}] {n['name']}": n["id"]
-                          for n in nodes if n["type"] in VALID_PARENT_TYPES}
-        sel_labels     = st.multiselect("Parent Node(s)", list(parent_options.keys()),
-                                        help="Select multiple → shared node. SF→SF supported.")
-        sel_parent_ids = [parent_options[l] for l in sel_labels]
-        node_type      = st.selectbox("Node Type", VALID_CHILD_TYPES,
-                                      help="SF→SF allowed for transfer events")
-        gate           = st.radio("Gate (for this node's children)", ["OR", "AND"], horizontal=True)
+    with editor_tab_edit:
+        if not nodes:
+            st.markdown("<div style='color:#555;font-size:11px;'>No nodes to edit yet.</div>",
+                        unsafe_allow_html=True)
+        else:
+            edit_options = {f"[{n['type']}] {n['name']}": n["id"] for n in nodes}
+            edit_label   = st.selectbox("Select node to edit",
+                                        ["— select —"] + list(edit_options.keys()),
+                                        key="edit_select")
 
-        if st.button("✅ ADD NODE", use_container_width=True, type="primary"):
-            if not node_name.strip():
-                st.error("Enter a node name")
-            elif not sel_parent_ids:
-                st.error("Select at least one parent")
-            else:
-                new_node = {
-                    "id": str(uuid.uuid4())[:7], "name": node_name.strip(),
-                    "type": node_type, "gate": gate,
-                    "targetValue": None, "calculatedValue": None,
-                    "parentIds": sel_parent_ids
-                }
-                set_nodes(nodes + [new_node])
-                st.rerun()
+            if edit_label != "— select —":
+                edit_id   = edit_options[edit_label]
+                edit_node = next((n for n in nodes if n["id"] == edit_id), None)
 
-        st.markdown("---")
-        del_options = {f"[{n['type']}] {n['name']}": n["id"]
-                       for n in nodes if n["type"] != "HAZARD"}
-        if del_options:
-            del_label = st.selectbox("Delete Node", ["— select —"] + list(del_options.keys()))
-            if del_label != "— select —" and st.button("🗑 DELETE", use_container_width=True):
-                del_id    = del_options[del_label]
-                to_delete = {del_id}
-                changed   = True
-                while changed:
-                    changed = False
-                    for n in nodes:
-                        if n["id"] not in to_delete and any(
-                            p in to_delete for p in (n.get("parentIds") or [])
-                        ):
-                            to_delete.add(n["id"])
-                            changed = True
-                set_nodes([n for n in nodes if n["id"] not in to_delete])
-                st.rerun()
+                if edit_node:
+                    color = LEVEL_COLORS.get(edit_node["type"], "#888")
+                    st.markdown(f"""
+                    <div style="background:#141414;border:2px solid {color};
+                                border-radius:8px;padding:8px 12px;margin-bottom:10px;">
+                      <div style="font-size:8px;color:#888;letter-spacing:2px;">EDITING</div>
+                      <div style="font-weight:700;color:{color};">{edit_node['name']}</div>
+                      <div style="font-size:9px;color:#666;">{edit_node['type']} · {edit_node['gate']}</div>
+                    </div>""", unsafe_allow_html=True)
 
-        st.markdown("---")
-        if st.button("🗑 CLEAR ALL", use_container_width=True):
-            set_nodes([])
-            st.session_state.selected_id = None
-            st.rerun()
+                    # ── Edit name ──
+                    new_name = st.text_input("Name", value=edit_node["name"], key="edit_name")
+
+                    # ── Edit gate ──
+                    gate_idx = 0 if edit_node["gate"] == "OR" else 1
+                    new_gate = st.radio("Gate", ["OR", "AND"], index=gate_idx,
+                                        horizontal=True, key="edit_gate")
+
+                    # ── Edit type (non-hazard only) ──
+                    if edit_node["type"] != "HAZARD":
+                        type_idx = VALID_CHILD_TYPES.index(edit_node["type"]) if edit_node["type"] in VALID_CHILD_TYPES else 0
+                        new_type = st.selectbox("Node Type", VALID_CHILD_TYPES,
+                                                index=type_idx, key="edit_type")
+                    else:
+                        new_type = "HAZARD"
+                        # Hazard: allow editing target value
+                        new_target_str = st.text_input(
+                            "Target Failure Rate",
+                            value=str(edit_node.get("targetValue", "")),
+                            key="edit_target"
+                        )
+
+                    # ── Edit parents (non-hazard only) ──
+                    if edit_node["type"] != "HAZARD":
+                        avail_parents  = {f"[{n['type']}] {n['name']}": n["id"]
+                                          for n in nodes
+                                          if n["type"] in VALID_PARENT_TYPES and n["id"] != edit_id}
+                        current_parent_labels = [
+                            lbl for lbl, pid in avail_parents.items()
+                            if pid in (edit_node.get("parentIds") or [])
+                        ]
+                        new_parent_labels = st.multiselect(
+                            "Parent Node(s)", list(avail_parents.keys()),
+                            default=current_parent_labels, key="edit_parents"
+                        )
+                        new_parent_ids = [avail_parents[l] for l in new_parent_labels]
+                    else:
+                        new_parent_ids = []
+
+                    # ── Apply changes ──
+                    if st.button("💾 APPLY CHANGES", use_container_width=True, type="primary"):
+                        updated = []
+                        for n in nodes:
+                            if n["id"] == edit_id:
+                                n = dict(n)
+                                n["name"] = new_name.strip() or n["name"]
+                                n["gate"] = new_gate
+                                if n["type"] != "HAZARD":
+                                    n["type"]      = new_type
+                                    n["parentIds"] = new_parent_ids
+                                else:
+                                    try:
+                                        tv = float(new_target_str)
+                                        n["targetValue"]    = tv
+                                        n["calculatedValue"] = tv
+                                    except ValueError:
+                                        pass
+                            updated.append(n)
+                        set_nodes(updated)
+                        st.success(f"Updated '{new_name}'")
+                        st.rerun()
 
 # ── Action bar ────────────────────────────────────────────────────────────
 a1, a2, a3, a4 = st.columns([1, 1, 1, 3])
