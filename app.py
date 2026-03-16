@@ -377,15 +377,10 @@ def export_excel(nodes):
 # ── Tree HTML builder ─────────────────────────────────────────────────────
 def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
     """
-    Top-down layered fault tree visualization.
-    Bugs fixed vs v11:
-    - Drag works in both force ON and OFF modes (fx/fy correctly managed)
-    - ticked() uses d.source/target objects correctly after D3 link resolution
-    - positions persisted in userPos map (not INIT_POS) so drag state survives collapse
-    - D3 enter/update/exit used properly — no full DOM rebuild on collapse
-    - Link stroke colors set on both enter AND update (merge)
-    - Lane labels in fixed overlay, not zoom layer
-    - computeLayerLayout only recomputes nodes that don't have userPos overrides
+    Sugiyama column layout: each SF owns a horizontal column.
+    FFs/IFs grouped under their SF column.
+    Per-subtree force: select an SF then click Force to release only that branch.
+    Full drag freedom in both force ON and OFF modes.
     """
     if not nodes: return ""
     import json as _json
@@ -409,13 +404,13 @@ def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
     shared_ids = {n["id"] for n in show_nodes
                   if len([p for p in (n.get("parentIds") or []) if p in shown_ids]) > 1}
 
-    ts            = tree_state or {}
-    init_pos      = ts.get("positions", {})
-    focus_id      = ts.get("focus_id")
+    ts        = tree_state or {}
+    init_pos  = ts.get("positions", {})
+    focus_id  = ts.get("focus_id")
 
     LEVEL_ROW   = {"HAZARD": 0, "SF": 1, "FF": 2, "GROUP": 2, "IF": 3}
     LEVEL_COLOR = {0: "#ff4d4d", 1: "#ff8c42", 2: "#f5c518", 3: "#4caf7d"}
-    LEVEL_LABEL = {0: "HAZARD", 1: "SF", 2: "FF / GROUP", 3: "IF"}
+    LEVEL_LABEL = {0: "HAZARD", 1: "SF", 2: "FF", 3: "IF"}
 
     nodes_js = _json.dumps([{
         "id":       n["id"],
@@ -446,679 +441,443 @@ def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
         if pid in shown_ids
     ])
 
-    init_pos_js     = _json.dumps(init_pos)
-    focus_js        = f'"{focus_id}"' if focus_id else "null"
-    level_label_js  = _json.dumps(LEVEL_LABEL)
-    level_color_js  = _json.dumps({str(k): v for k, v in LEVEL_COLOR.items()})
+    init_pos_js    = _json.dumps(init_pos)
+    focus_js       = f'"{focus_id}"' if focus_id else "null"
+    level_label_js = _json.dumps(LEVEL_LABEL)
+    level_color_js = _json.dumps({str(k): v for k, v in LEVEL_COLOR.items()})
 
-    return f"""<!DOCTYPE html>
+    html = """<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style>
-*{{box-sizing:border-box;margin:0;padding:0;}}
-body{{background:#0a0a0a;font-family:'JetBrains Mono','Fira Code',monospace;
-      color:#e0e0e0;overflow:hidden;height:100vh;display:flex;flex-direction:column;}}
-#toolbar{{
-  display:flex;align-items:center;gap:8px;padding:7px 14px;
-  background:#111;border-bottom:2px solid #1e1e1e;
-  flex-shrink:0;user-select:none;height:46px;
-}}
-.sep{{width:1px;height:24px;background:#2a2a2a;flex-shrink:0;}}
-.btn{{
-  background:#1c1c1c;border:1.5px solid #2e2e2e;color:#bbb;
-  border-radius:6px;padding:0 14px;cursor:pointer;
-  font-family:inherit;font-size:11px;font-weight:700;letter-spacing:0.5px;
-  transition:background .1s,border-color .1s,color .1s;
-  white-space:nowrap;flex-shrink:0;height:30px;
-}}
-.btn:hover{{background:#282828;color:#fff;border-color:#555;}}
-.btn.on{{background:#e94560;border-color:#e94560;color:#fff;}}
-.btn.on:hover{{background:#c9334f;}}
-#zlbl{{color:#666;font-size:11px;min-width:44px;text-align:center;font-weight:700;}}
-#swrap{{display:flex;align-items:center;gap:6px;flex:1;max-width:300px;margin-left:auto;}}
-#sbox{{
-  background:#1c1c1c;border:1.5px solid #2e2e2e;color:#ccc;
-  border-radius:6px;padding:0 10px;font-family:inherit;font-size:11px;
-  outline:none;flex:1;height:30px;
-}}
-#sbox:focus{{border-color:#e94560;color:#fff;}}
-#sbox::placeholder{{color:#444;}}
-#sinfo{{color:#666;font-size:10px;min-width:58px;}}
-#wrap{{flex:1;position:relative;overflow:hidden;}}
-svg{{position:absolute;inset:0;width:100%;height:100%;}}
-/* Lane overlay — fixed in screen space, not zoom space */
-#lanes{{
-  position:absolute;top:0;left:0;right:0;bottom:0;
-  pointer-events:none;z-index:1;overflow:hidden;
-}}
-.lane-band{{
-  position:absolute;left:0;right:0;
-  border-top:1px solid rgba(255,255,255,0.04);
-  display:flex;align-items:flex-start;padding-top:6px;
-}}
-.lane-tag{{
-  margin-left:6px;font-size:8px;font-weight:700;
-  letter-spacing:2.5px;opacity:0.4;
-  writing-mode:horizontal-tb;
-}}
-.lane-stripe{{
-  position:absolute;left:0;top:0;width:3px;height:100%;opacity:0.55;
-}}
-#dp{{
-  position:absolute;bottom:0;left:0;right:0;background:rgba(10,10,10,0.92);
-  border-top:2px solid #2a2a2a;padding:8px 16px 10px;display:none;z-index:10;
-  backdrop-filter:blur(14px);
-}}
-.dg{{display:grid;grid-template-columns:repeat(5,1fr);gap:5px;margin:5px 0;}}
-.dc{{background:#111;border-radius:5px;padding:6px;text-align:center;}}
-.dcl{{font-size:7px;color:#555;letter-spacing:2px;margin-bottom:2px;font-weight:700;}}
-.dcv{{font-size:11px;font-weight:700;word-break:break-all;}}
-.dr{{display:grid;grid-template-columns:1fr 1fr;gap:5px;}}
-.ds{{background:#111;border-radius:5px;padding:6px;}}
-.dsl{{font-size:7px;color:#555;letter-spacing:2px;margin-bottom:3px;font-weight:700;}}
-.dsv{{font-size:10px;color:#bbb;line-height:1.5;}}
-#dpc{{position:absolute;top:8px;right:12px;background:none;border:none;
-      color:#555;font-size:17px;cursor:pointer;line-height:1;}}
-#dpc:hover{{color:#fff;}}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:#0a0a0a;font-family:\'JetBrains Mono\',\'Fira Code\',monospace;
+     color:#e0e0e0;overflow:hidden;height:100vh;display:flex;flex-direction:column;}
+#toolbar{display:flex;align-items:center;gap:7px;padding:7px 14px;
+  background:#111;border-bottom:2px solid #1a1a1a;flex-shrink:0;user-select:none;height:46px;}
+.sep{width:1px;height:24px;background:#2a2a2a;flex-shrink:0;}
+.btn{background:#1c1c1c;border:1.5px solid #2e2e2e;color:#bbb;border-radius:6px;
+  padding:0 13px;cursor:pointer;font-family:inherit;font-size:11px;font-weight:700;
+  letter-spacing:.4px;transition:.12s;white-space:nowrap;flex-shrink:0;
+  height:30px;display:inline-flex;align-items:center;gap:4px;}
+.btn:hover{background:#282828;color:#fff;border-color:#555;}
+.btn.on{background:#e94560;border-color:#e94560;color:#fff;}
+#zlbl{color:#666;font-size:11px;min-width:44px;text-align:center;font-weight:700;}
+#fst{font-size:10px;color:#f5c518;padding:2px 9px;border-radius:5px;
+  background:#1a1300;border:1px solid #f5c51844;white-space:nowrap;display:none;}
+#fst.show{display:inline-block;}
+#swrap{display:flex;align-items:center;gap:5px;margin-left:auto;max-width:290px;}
+#sbox{background:#1c1c1c;border:1.5px solid #2e2e2e;color:#ccc;border-radius:6px;
+  padding:0 10px;font-family:inherit;font-size:11px;outline:none;width:170px;height:30px;}
+#sbox:focus{border-color:#e94560;color:#fff;}
+#sbox::placeholder{color:#444;}
+#si{color:#666;font-size:10px;min-width:55px;}
+#wrap{flex:1;position:relative;overflow:hidden;}
+svg{position:absolute;inset:0;width:100%;height:100%;}
+#lanes{position:absolute;inset:0;pointer-events:none;z-index:2;overflow:hidden;}
+.lb{position:absolute;left:0;right:0;border-top:1px solid rgba(255,255,255,.035);
+  display:flex;align-items:flex-start;padding-top:5px;}
+.lt{margin-left:8px;font-size:8px;font-weight:700;letter-spacing:2.5px;opacity:.36;}
+.ls{position:absolute;left:0;top:0;width:3px;height:100%;opacity:.5;}
+#dp{position:absolute;bottom:0;left:0;right:0;background:rgba(8,8,8,.93);
+  border-top:2px solid #222;padding:8px 16px 10px;display:none;z-index:20;
+  backdrop-filter:blur(14px);}
+.dg{display:grid;grid-template-columns:repeat(5,1fr);gap:5px;margin:5px 0;}
+.dc{background:#111;border-radius:5px;padding:6px;text-align:center;}
+.dcl{font-size:7px;color:#555;letter-spacing:2px;margin-bottom:2px;font-weight:700;}
+.dcv{font-size:11px;font-weight:700;word-break:break-all;}
+.dr{display:grid;grid-template-columns:1fr 1fr;gap:5px;}
+.ds{background:#111;border-radius:5px;padding:6px;}
+.dsl{font-size:7px;color:#555;letter-spacing:2px;margin-bottom:2px;font-weight:700;}
+.dsv{font-size:10px;color:#bbb;line-height:1.5;}
+#dpc{position:absolute;top:8px;right:12px;background:none;border:none;color:#555;font-size:17px;cursor:pointer;}
+#dpc:hover{color:#fff;}
 </style>
 </head><body>
 <div id="toolbar">
-  <button class="btn" onclick="zBy(.22)">＋</button>
-  <button class="btn" onclick="zBy(-.22)">－</button>
+  <button class="btn" onclick="zBy(.22)">&#65291;</button>
+  <button class="btn" onclick="zBy(-.22)">&#65293;</button>
   <span id="zlbl">85%</span>
   <div class="sep"></div>
-  <button class="btn" id="blayers" onclick="doLayerLayout()">⊞ Layers</button>
-  <button class="btn" onclick="doFit()">⊡ Fit</button>
-  <button class="btn" id="bforce"  onclick="toggleForce()">⚡ Force</button>
+  <button class="btn" id="blay" onclick="doColumnLayout(true)" title="Reset to clean column layout">&#8862; Reset Layout</button>
+  <button class="btn" onclick="doFit()">&#8865; Fit</button>
   <div class="sep"></div>
-  <button class="btn" onclick="clearHL()">✕ Clear</button>
+  <button class="btn" id="bfrc" onclick="toggleForce()" title="Select an SF node first to release only that subtree to physics">&#9889; Force</button>
+  <span id="fst"></span>
+  <div class="sep"></div>
+  <button class="btn" onclick="clearHL()">&#10005; Clear</button>
   <div id="swrap">
-    <input id="sbox" placeholder="Search…" oninput="doSearch(this.value)"/>
-    <button class="btn" onclick="sPrev()">▲</button>
-    <button class="btn" onclick="sNext()">▼</button>
-    <span id="sinfo"></span>
+    <input id="sbox" placeholder="Search&#8230;" oninput="doSearch(this.value)"/>
+    <button class="btn" onclick="sPrev()">&#9650;</button>
+    <button class="btn" onclick="sNext()">&#9660;</button>
+    <span id="si"></span>
   </div>
 </div>
 <div id="wrap">
   <div id="lanes"></div>
   <svg id="sv">
     <defs>
-      <marker id="ma"  markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-        <path d="M0,0 L8,4 L0,8 Z" fill="#333"/></marker>
-      <marker id="mah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-        <path d="M0,0 L8,4 L0,8 Z" fill="#4fc3f7"/></marker>
-      <marker id="mas" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-        <path d="M0,0 L8,4 L0,8 Z" fill="#f5c518aa"/></marker>
+      <marker id="ma"  markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#333"/></marker>
+      <marker id="mah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#4fc3f7"/></marker>
     </defs>
-    <g id="zg">
-      <g id="lg"></g>
-      <g id="ng"></g>
-    </g>
+    <g id="zg"><g id="lg"></g><g id="ng"></g></g>
   </svg>
 </div>
 <div id="dp">
-  <button id="dpc" onclick="closeDP()">✕</button>
-  <div style="font-size:8px;color:#666;letter-spacing:3px;margin-bottom:3px">SELECTED NODE</div>
+  <button id="dpc" onclick="closeDP()">&#10005;</button>
+  <div style="font-size:8px;color:#555;letter-spacing:3px;margin-bottom:3px">SELECTED NODE</div>
   <div id="dpt" style="font-size:14px;font-weight:700;margin-bottom:5px"></div>
   <div class="dg">
-    <div class="dc"><div class="dcl">TYPE</div><div class="dcv" id="dp0"></div></div>
-    <div class="dc"><div class="dcl">GATE</div><div class="dcv" id="dp1"></div></div>
-    <div class="dc"><div class="dcl">VALUE</div><div class="dcv" id="dp2"></div></div>
-    <div class="dc"><div class="dcl">NODE ID</div><div class="dcv" id="dp3" style="font-size:9px"></div></div>
-    <div class="dc"><div class="dcl">SHARED</div><div class="dcv" id="dp4"></div></div>
+    <div class="dc"><div class="dcl">TYPE</div><div class="dcv" id="d0"></div></div>
+    <div class="dc"><div class="dcl">GATE</div><div class="dcv" id="d1"></div></div>
+    <div class="dc"><div class="dcl">VALUE</div><div class="dcv" id="d2"></div></div>
+    <div class="dc"><div class="dcl">NODE ID</div><div class="dcv" id="d3" style="font-size:9px"></div></div>
+    <div class="dc"><div class="dcl">SHARED</div><div class="dcv" id="d4"></div></div>
   </div>
   <div class="dr">
-    <div class="ds"><div class="dsl">PARENTS</div><div class="dsv" id="dp5"></div></div>
-    <div class="ds"><div class="dsl">CHILDREN</div><div class="dsv" id="dp6"></div></div>
+    <div class="ds"><div class="dsl">PARENTS</div><div class="dsv" id="d5"></div></div>
+    <div class="ds"><div class="dsl">CHILDREN</div><div class="dsv" id="d6"></div></div>
   </div>
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
 <script>
-// ── constants ─────────────────────────────────────────────────────────
-const RNODES  = {nodes_js};
-const RLINKS  = {links_js};
-const IPOS    = {init_pos_js};         // positions from Python (last saved)
-const FOCUSID = {focus_js};
-const LLABELS = {level_label_js};
-const LCOLORS = {level_color_js};
-const GC = {{OR:"#4fc3f7", AND:"#ffb74d"}};
-const NW=152, NH=84, HG=28, VG=170;   // node W/H, horiz gap, vert gap
-
-// ── mutable state ─────────────────────────────────────────────────────
-let forceOn  = false;
-let selId    = null;
-let collapsed= new Set();
-let sMatches = [], sIdx = 0;
-// userPos: positions the user has manually dragged — these survive re-layouts
-const userPos = {{}};
-Object.entries(IPOS).forEach(([id,p])=>{{ userPos[id]={{x:p.x,y:p.y}}; }});
-
-// node lookup
-const NM = {{}};
+const RNODES=__NODES__;
+const RLINKS=__LINKS__;
+const IPOS=__IPOS__;
+const FOCUSID=__FOCUS__;
+const LLABELS=__LLABELS__;
+const LCOLORS=__LCOLORS__;
+const GC={OR:"#4fc3f7",AND:"#ffb74d"};
+const NW=152,NH=84,HG=22,VG=168;
+let selId=null,forceOn=false,forceSub=null;
+let collapsed=new Set(),sM=[],sI=0;
+const uP={};
+Object.entries(IPOS).forEach(([id,p])=>uP[id]={x:p.x,y:p.y});
+const NM={};
 RNODES.forEach(n=>NM[n.id]=n);
-
-// ── D3 selections ─────────────────────────────────────────────────────
-const wrap = document.getElementById("wrap");
-const svg  = d3.select("#sv");
-const zg   = svg.select("#zg");
-const lg   = svg.select("#lg");
-const ng   = svg.select("#ng");
-
-// ── zoom ──────────────────────────────────────────────────────────────
-const zb = d3.zoom().scaleExtent([0.03,6])
-  .filter(e => e.button===2 || e.type==="wheel")
-  .on("zoom", e=>{{
-    zg.attr("transform", e.transform);
-    document.getElementById("zlbl").textContent = Math.round(e.transform.k*100)+"%";
-    updateLaneBands();
-  }});
+const wrap=document.getElementById("wrap");
+const svg=d3.select("#sv");
+const zg=svg.select("#zg"),lg=svg.select("#lg"),ng=svg.select("#ng");
+const zb=d3.zoom().scaleExtent([.03,6])
+  .filter(e=>e.button===2||e.type==="wheel")
+  .on("zoom",e=>{zg.attr("transform",e.transform);document.getElementById("zlbl").textContent=Math.round(e.transform.k*100)+"%";updateLanes();});
 svg.call(zb).on("contextmenu",e=>e.preventDefault());
 svg.on("click",()=>closeDP());
-
-function getCurT(){{ return d3.zoomTransform(svg.node()); }}
-
-// ── simulation (only active when force=true) ──────────────────────────
-let sNodes=[], sLinks=[];
-const sim = d3.forceSimulation()
-  .force("link",    d3.forceLink().id(d=>d.id).distance(130).strength(0.45))
-  .force("charge",  d3.forceManyBody().strength(-550).distanceMax(420))
-  .force("collide", d3.forceCollide(88))
-  .force("y",       d3.forceY(d=>layerY(d.row)).strength(0.55))
-  .force("x",       d3.forceX().strength(0.04))
-  .alphaDecay(0.025).velocityDecay(0.42)
-  .on("tick", tick);
+function getT(){return d3.zoomTransform(svg.node());}
+function layY(r){return 80+r*VG;}
+let sN=[],sL=[];
+const sim=d3.forceSimulation()
+  .force("link",d3.forceLink().id(d=>d.id).distance(130).strength(.4))
+  .force("charge",d3.forceManyBody().strength(-500).distanceMax(380))
+  .force("collide",d3.forceCollide(88))
+  .force("y",d3.forceY(d=>layY(d.row)).strength(.5))
+  .force("x",d3.forceX(d=>d.bx||400).strength(.06))
+  .alphaDecay(.025).velocityDecay(.42)
+  .on("tick",tick);
 sim.stop();
 
-function layerY(row){{ return 80 + row * VG; }}
+// ── visible nodes ─────────────────────────────────────────────────────
+function getVis(){
+  const h=new Set();
+  collapsed.forEach(cid=>{const q=[cid];while(q.length){const c=q.shift();(NM[c]?.children||[]).forEach(ch=>{if(!h.has(ch)){h.add(ch);q.push(ch);}});}});
+  return RNODES.filter(n=>!h.has(n.id));
+}
 
-// ── visibility ────────────────────────────────────────────────────────
-function getVisible(){{
-  const hidden=new Set();
-  collapsed.forEach(cid=>{{
-    const q=[cid]; while(q.length){{
-      const cur=q.shift();
-      (NM[cur]?.children||[]).forEach(ch=>{{if(!hidden.has(ch)){{hidden.add(ch);q.push(ch);}}}});
-    }}
-  }});
-  return RNODES.filter(n=>!hidden.has(n.id));
-}}
+// ── subtree ids ────────────────────────────────────────────────────────
+function subIds(id){
+  const s=new Set([id]),q=[id];
+  while(q.length){const c=q.shift();(NM[c]?.children||[]).forEach(ch=>{if(!s.has(ch)&&sN.find(n=>n.id===ch)){s.add(ch);q.push(ch);}});}
+  return s;
+}
 
-// ── layer layout (default, no force) ──────────────────────────────────
-function computeLayout(forceRecalc){{
-  const vis = getVisible();
-  const byRow={{}};
-  vis.forEach(n=>{{ (byRow[n.row]||(byRow[n.row]=[])).push(n); }});
-  const W = wrap.getBoundingClientRect().width || 1100;
+// ── find which SF owns a node ──────────────────────────────────────────
+function ownerSF(id,depth){
+  if(depth>8) return null;
+  const n=NM[id]; if(!n) return null;
+  if(n.type==="SF") return id;
+  for(const pid of (n.parents||[])){const r=ownerSF(pid,depth+1);if(r)return r;}
+  return null;
+}
 
-  Object.entries(byRow).forEach(([row, group])=>{{
-    row = +row;
-    // Sort group by first parent's position for nicer edge routing
-    group.sort((a,b)=>{{
-      const px = id => sNodes.find(s=>s.id===id)?.x ?? 500;
-      const ax = a.parents.length ? px(a.parents[0]) : 500;
-      const bx = b.parents.length ? px(b.parents[0]) : 500;
-      return ax-bx;
-    }});
-    const total = group.length;
-    const blockW = total*NW + (total-1)*HG;
-    const startX = Math.max(NW/2+10, (W-blockW)/2 + NW/2);
-    group.forEach((n,i)=>{{
-      const sn = sNodes.find(s=>s.id===n.id);
-      if(!sn) return;
-      if(!forceRecalc && userPos[n.id]){{
-        // respect user's manual position
-        sn.x = userPos[n.id].x;
-        sn.y = userPos[n.id].y;
-      }} else {{
-        sn.x = startX + i*(NW+HG);
-        sn.y = layerY(row);
-        userPos[n.id] = {{x:sn.x, y:sn.y}};
-      }}
-      // in layer mode, pin position
-      if(!forceOn){{ sn.fx=sn.x; sn.fy=sn.y; }}
-      else {{ sn.fx=null; sn.fy=null; }}
-    }});
-  }});
-}}
+// ── column layout ─────────────────────────────────────────────────────
+function computeCols(reset){
+  const vis=getVis();
+  const W=wrap.getBoundingClientRect().width||1200;
+  const sfNodes=vis.filter(n=>n.type==="SF");
 
-// ── lane overlay (HTML divs, fixed in screen space) ───────────────────
-function updateLaneBands(){{
-  const lanesEl = document.getElementById("lanes");
-  lanesEl.innerHTML="";
-  const vis = getVisible();
-  const rows = [...new Set(vis.map(n=>n.row))].sort((a,b)=>a-b);
-  const t = getCurT();
-  const H = wrap.getBoundingClientRect().height || 700;
+  // Count IF descendants per SF for proportional width
+  const leafCount={};
+  sfNodes.forEach(sf=>{
+    const sub=subIds(sf.id);
+    leafCount[sf.id]=Math.max(1,[...sub].filter(id=>{const n=NM[id];return n&&n.type==="IF"&&vis.find(v=>v.id===id);}).length);
+  });
+  const total=Object.values(leafCount).reduce((a,b)=>a+b,0)||1;
+  const usable=W-40;
 
-  rows.forEach(row=>{{
-    const y_world = layerY(row);
-    const y_screen = t.apply([0, y_world])[1];
-    const y_next   = row < 3 ? t.apply([0, layerY(row+1)])[1] : H;
-    const bandH    = Math.max(40, y_next - y_screen);
-    if(y_screen > H || y_screen + bandH < 0) return; // off screen
+  // Build column ranges
+  const cols={};
+  let cx=20;
+  sfNodes.forEach(sf=>{
+    const w=Math.max(NW+HG*3,(leafCount[sf.id]/total)*usable);
+    cols[sf.id]={x0:cx,x1:cx+w,mid:cx+w/2,w};
+    cx+=w;
+  });
 
-    const div = document.createElement("div");
-    div.className = "lane-band";
-    div.style.top  = (y_screen - VG*t.k*0.48) + "px";
-    div.style.height = Math.max(40, VG*t.k) + "px";
-    const col = LCOLORS[row]||"#888";
+  vis.forEach(n=>{
+    const sn=sN.find(s=>s.id===n.id); if(!sn) return;
+    // Is this node in the force-active subtree?
+    const inForce=forceOn&&forceSub&&subIds(forceSub).has(n.id);
+    if(inForce){sn.fx=null;sn.fy=null;return;}
 
-    // Left color stripe
-    const stripe = document.createElement("div");
-    stripe.className="lane-stripe";
-    stripe.style.background=col;
-    div.appendChild(stripe);
+    if(!reset&&uP[n.id]){sn.x=uP[n.id].x;sn.y=uP[n.id].y;sn.fx=sn.x;sn.fy=sn.y;return;}
 
-    // Label
-    const tag = document.createElement("div");
-    tag.className="lane-tag";
-    tag.style.color=col;
-    tag.style.marginLeft="10px";
-    tag.textContent=LLABELS[row]||"";
-    div.appendChild(tag);
+    if(n.type==="HAZARD"){sn.x=W/2;sn.y=layY(0);sn.bx=W/2;}
+    else {
+      const sf=ownerSF(n.id,0);
+      const col=sf&&cols[sf];
+      if(n.type==="SF"&&col){sn.x=col.mid;sn.y=layY(1);sn.bx=col.mid;}
+      else if(col){
+        // Siblings of same type within column
+        const sibs=vis.filter(s=>s.type===n.type&&ownerSF(s.id,0)===sf);
+        const idx=sibs.findIndex(s=>s.id===n.id);
+        const cnt=sibs.length||1;
+        const sp=Math.min(NW+HG,col.w/(cnt+.5));
+        sn.x=col.mid-sp*(cnt-1)/2+idx*sp;
+        sn.y=layY(n.row);
+        sn.bx=col.mid;
+      }else{sn.x=W/2;sn.y=layY(n.row);sn.bx=W/2;}
+    }
+    uP[n.id]={x:sn.x,y:sn.y};
+    sn.fx=sn.x; sn.fy=sn.y;
+  });
+}
 
-    lanesEl.appendChild(div);
-  }});
-}}
+// ── lane overlay ──────────────────────────────────────────────────────
+function updateLanes(){
+  const el=document.getElementById("lanes"); el.innerHTML="";
+  const vis=getVis();
+  const rows=[...new Set(vis.map(n=>n.row))].sort((a,b)=>a-b);
+  const t=getT(); const H=wrap.getBoundingClientRect().height||700;
+  rows.forEach(row=>{
+    const yw=layY(row),ys=t.apply([0,yw])[1];
+    const yn=row<3?t.apply([0,layY(row+1)])[1]:H+200;
+    const bh=Math.max(40,yn-ys);
+    if(ys>H+50||ys+bh<-50)return;
+    const d=document.createElement("div"); d.className="lb";
+    d.style.top=(ys-VG*t.k*.46)+"px";
+    d.style.height=Math.max(40,VG*t.k*.92)+"px";
+    const col=LCOLORS[row]||"#888";
+    const stripe=document.createElement("div"); stripe.className="ls"; stripe.style.background=col; d.appendChild(stripe);
+    const tag=document.createElement("div"); tag.className="lt"; tag.style.color=col; tag.textContent=LLABELS[row]||""; d.appendChild(tag);
+    el.appendChild(d);
+  });
+}
 
-// ── init/refresh ──────────────────────────────────────────────────────
-function refresh(){{
-  const vis = getVisible();
-  const existing={{}};
-  sNodes.forEach(n=>existing[n.id]=n);
+// ── refresh ────────────────────────────────────────────────────────────
+function refresh(){
+  const vis=getVis(); const ex={};
+  sN.forEach(n=>ex[n.id]=n);
+  sN=vis.map(n=>Object.assign({...n},{x:ex[n.id]?.x??uP[n.id]?.x??null,y:ex[n.id]?.y??uP[n.id]?.y??null,vx:0,vy:0,fx:null,fy:null,bx:500}));
+  const vs=new Set(sN.map(n=>n.id));
+  sL=RLINKS.filter(l=>vs.has(l.sid)&&vs.has(l.tid)).map(l=>{const s=sN.find(n=>n.id===l.sid),t=sN.find(n=>n.id===l.tid);return s&&t?{source:s,target:t,andGate:l.andGate,shared:l.shared}:null;}).filter(Boolean);
+  sim.nodes(sN); sim.force("link").links(sL); sim.force("x").x(d=>d.bx||400);
+  computeCols(false); drawLinks(); drawNodes(); tick(); updateLanes();
+  if(forceOn) sim.alpha(.3).restart();
+}
 
-  // Build simNodes preserving existing x/y for nodes that already exist
-  sNodes = vis.map(n=>{{
-    const ex = existing[n.id];
-    const up = userPos[n.id];
-    return Object.assign({{...n}},{{
-      x: ex?.x ?? up?.x ?? null,
-      y: ex?.y ?? up?.y ?? null,
-      vx:0, vy:0,
-      fx: forceOn ? null : (ex?.fx ?? null),
-      fy: forceOn ? null : (ex?.fy ?? null),
-    }});
-  }});
+// ── draw links ─────────────────────────────────────────────────────────
+function drawLinks(){
+  const s=lg.selectAll("path.lk").data(sL,d=>d.source.id+"->"+d.target.id);
+  const a=s.enter().append("path").attr("class","lk").attr("fill","none").merge(s);
+  a.attr("stroke",d=>d.shared?"#f5c51855":"#2d2d2d")
+   .attr("stroke-width",d=>d.shared?1.2:2)
+   .attr("stroke-dasharray",d=>d.andGate?"8,4":d.shared?"4,6":null)
+   .attr("opacity",d=>d.shared?.5:.92).attr("marker-end","url(#ma)");
+  s.exit().remove();
+}
 
-  const visSet = new Set(sNodes.map(n=>n.id));
-  // Build links with object references for D3
-  sLinks = RLINKS
-    .filter(l=>visSet.has(l.sid)&&visSet.has(l.tid))
-    .map(l=>{{
-      const src = sNodes.find(n=>n.id===l.sid);
-      const tgt = sNodes.find(n=>n.id===l.tid);
-      return src&&tgt ? {{source:src, target:tgt, andGate:l.andGate, shared:l.shared}} : null;
-    }}).filter(Boolean);
-
-  sim.nodes(sNodes);
-  sim.force("link").links(sLinks);
-
-  computeLayout(false);
-  drawLinks();
-  drawNodes();
-  tick();
-  updateLaneBands();
-
-  if(forceOn) sim.alpha(0.35).restart();
-}}
-
-// ── draw links (enter/update/exit) ────────────────────────────────────
-function drawLinks(){{
-  const sel = lg.selectAll("path.lk").data(sLinks,
-    d=>d.source.id+"->"+d.target.id);
-
-  const allPaths = sel.enter().append("path").attr("class","lk")
-    .attr("fill","none").attr("marker-end","url(#ma)")
-    .merge(sel);  // UPDATE both new and existing
-
-  allPaths
-    .attr("stroke",      d=>d.shared ? "#f5c51855" : "#303030")
-    .attr("stroke-width",d=>d.shared ? 1.2 : 2)
-    .attr("stroke-dasharray",d=>d.andGate?"8,4":d.shared?"4,6":null)
-    .attr("opacity",     d=>d.shared ? 0.55 : 0.95)
-    .attr("marker-end",  "url(#ma)");
-
-  sel.exit().remove();
-}}
-
-// ── draw nodes (enter/update/exit — no full rebuild) ──────────────────
-function drawNodes(){{
-  const sel = ng.selectAll("g.nd").data(sNodes, d=>d.id);
-
-  // ── ENTER (new nodes only) ──
-  const ent = sel.enter().append("g").attr("class","nd")
-    .style("cursor","grab")
-    .on("click",(e,d)=>{{e.stopPropagation();selectNode(d.id);}})
-    .on("dblclick",(e,d)=>{{e.stopPropagation();toggleCollapse(d.id);}})
-    .call(d3.drag()
-      .filter(e=>e.button===0)
-      .on("start",(e,d)=>{{
-        e.sourceEvent.stopPropagation();
-        if(forceOn&&!e.active) sim.alphaTarget(0.05).restart();
-        // Fix position at drag start — works in both force and layout modes
-        d.fx = d.x; d.fy = d.y;
-      }})
-      .on("drag",(e,d)=>{{
-        // Move node — always update x,y AND fx,fy so ticked() reflects it
-        d.x = d.fx = e.x;
-        d.y = d.fy = e.y;
-        // Save to userPos so position survives re-layouts
-        userPos[d.id] = {{x:e.x, y:e.y}};
-        tick(); // immediate visual update — don't wait for sim
-      }})
-      .on("end",(e,d)=>{{
-        if(forceOn&&!e.active) sim.alphaTarget(0);
-        if(forceOn){{
-          // Release pin so force can continue moving it
-          d.fx=null; d.fy=null;
-        }}
-        // In layout mode: keep fx/fy pinned at new position
-      }})
+// ── draw nodes ─────────────────────────────────────────────────────────
+function drawNodes(){
+  const s=ng.selectAll("g.nd").data(sN,d=>d.id);
+  const ent=s.enter().append("g").attr("class","nd").style("cursor","grab")
+    .on("click",(e,d)=>{e.stopPropagation();selectNode(d.id);})
+    .on("dblclick",(e,d)=>{e.stopPropagation();toggleCollapse(d.id);})
+    .call(d3.drag().filter(e=>e.button===0)
+      .on("start",(e,d)=>{e.sourceEvent.stopPropagation();if(forceOn&&!e.active)sim.alphaTarget(.05).restart();d.fx=d.x;d.fy=d.y;})
+      .on("drag",(e,d)=>{d.x=d.fx=e.x;d.y=d.fy=e.y;uP[d.id]={x:e.x,y:e.y};tick();})
+      .on("end",(e,d)=>{if(forceOn&&!e.active)sim.alphaTarget(0);const inF=forceOn&&forceSub&&subIds(forceSub).has(d.id);if(!inF){d.fx=d.x;d.fy=d.y;}else{d.fx=null;d.fy=null;}})
     );
+  ent.append("rect").attr("class","nb");
+  ent.append("text").attr("class","nt").attr("text-anchor","middle").attr("font-size",7).attr("font-weight",700).attr("font-family","JetBrains Mono,monospace").attr("letter-spacing",2).attr("opacity",.65);
+  ent.append("foreignObject").attr("class","nf").append("xhtml:div").attr("xmlns","http://www.w3.org/1999/xhtml").style("font-size","9.5px").style("font-weight","700").style("font-family","JetBrains Mono,monospace").style("text-align","center").style("word-break","break-word").style("line-height","1.25").style("overflow","hidden");
+  ent.append("rect").attr("class","vb").attr("height",19).attr("rx",4).attr("fill","rgba(0,0,0,.3)");
+  ent.append("text").attr("class","vt").attr("text-anchor","middle").attr("font-size",10).attr("font-weight",700).attr("font-family","JetBrains Mono,monospace");
+  ent.append("g").attr("class","gb"); ent.append("g").attr("class","cb");
 
-  // Node background rect (oval for GROUP)
-  ent.append("rect").attr("class","nb")
-    .attr("width", d=>d.isGroup?126:NW)
-    .attr("height",d=>d.isGroup?68:NH)
-    .attr("x",     d=>d.isGroup?-63:-NW/2)
-    .attr("y",     d=>d.isGroup?-34:-NH/2)
-    .attr("rx",    d=>d.isGroup?63:9)
-    .attr("ry",    d=>d.isGroup?34:9);
-
-  // Type label
-  ent.append("text").attr("class","nt")
-    .attr("text-anchor","middle")
-    .attr("font-size",7).attr("font-weight",700)
-    .attr("font-family","JetBrains Mono,monospace")
-    .attr("letter-spacing",2).attr("opacity",0.65);
-
-  // Name (foreign object for word-wrap)
-  ent.append("foreignObject").attr("class","nfo")
-    .append("xhtml:div").attr("xmlns","http://www.w3.org/1999/xhtml")
-    .style("font-size","9.5px").style("font-weight","700")
-    .style("font-family","JetBrains Mono,monospace")
-    .style("text-align","center").style("word-break","break-word")
-    .style("line-height","1.25").style("overflow","hidden");
-
-  // Value background
-  ent.append("rect").attr("class","vb")
-    .attr("height",19).attr("rx",4)
-    .attr("fill","rgba(0,0,0,0.3)");
-
-  // Value text
-  ent.append("text").attr("class","vt")
-    .attr("text-anchor","middle")
-    .attr("font-size",10).attr("font-weight",700)
-    .attr("font-family","JetBrains Mono,monospace");
-
-  // Gate badge (only nodes with children)
-  ent.append("g").attr("class","gb");
-  // Collapse button (only nodes with children)
-  ent.append("g").attr("class","cb");
-
-  // ── UPDATE (all nodes: entered + existing) ──
-  const all = ent.merge(sel);
-
+  const all=ent.merge(s);
   all.select("rect.nb")
-    .attr("fill",   d=>d.color)
-    .attr("stroke", d=>d.isPinned?"#e94560":d.color)
-    .attr("stroke-width",     d=>d.isPinned?2.5:1.5)
-    .attr("stroke-dasharray", d=>d.isPinned?"6,3":null);
-
-  all.select("text.nt")
-    .attr("y",   d=>d.isGroup?-16:-NH/2+13)
-    .attr("fill",d=>d.tcolor)
+    .attr("width",d=>d.isGroup?126:NW).attr("height",d=>d.isGroup?68:NH)
+    .attr("x",d=>d.isGroup?-63:-NW/2).attr("y",d=>d.isGroup?-34:-NH/2)
+    .attr("rx",d=>d.isGroup?63:9).attr("ry",d=>d.isGroup?34:9)
+    .attr("fill",d=>d.color)
+    .attr("stroke",d=>forceSub===d.id&&forceOn?"#f5c518":d.isPinned?"#e94560":d.color)
+    .attr("stroke-width",d=>forceSub===d.id&&forceOn?3:d.isPinned?2.5:1.5)
+    .attr("stroke-dasharray",d=>d.isPinned?"6,3":null);
+  all.select("text.nt").attr("y",d=>d.isGroup?-16:-NH/2+13).attr("fill",d=>d.tcolor)
     .text(d=>d.isGroup?"COMBINED":d.type+(d.shared?" ◈":"")+(d.isPinned?" 📌":""));
+  all.select("foreignObject.nf")
+    .attr("x",d=>d.isGroup?-57:-NW/2+7).attr("y",d=>d.isGroup?-22:-NH/2+17)
+    .attr("width",d=>d.isGroup?114:NW-14).attr("height",d=>d.isGroup?28:34)
+    .select("div").style("color",d=>d.tcolor).text(d=>d.name);
+  all.select("rect.vb").attr("x",d=>d.isGroup?-47:-NW/2+9).attr("y",d=>d.isGroup?11:NH/2-24).attr("width",d=>d.isGroup?94:NW-18);
+  all.select("text.vt").attr("y",d=>d.isGroup?25:NH/2-10).attr("fill",d=>d.isPinned?"#e94560":d.tcolor).text(d=>d.value+(d.isPinned?" 📌":""));
 
-  all.select("foreignObject.nfo")
-    .attr("x",     d=>d.isGroup?-57:-NW/2+7)
-    .attr("y",     d=>d.isGroup?-22:-NH/2+17)
-    .attr("width", d=>d.isGroup?114:NW-14)
-    .attr("height",d=>d.isGroup?28:34)
-    .select("div")
-    .style("color",d=>d.tcolor)
-    .text(d=>d.name);
+  all.each(function(d){
+    const hc=(d.children||[]).length>0;
+    const gb=d3.select(this).select("g.gb"); gb.selectAll("*").remove();
+    if(hc){
+      gb.append("rect").attr("x",-19).attr("y",NH/2+3).attr("width",38).attr("height",15).attr("rx",4).attr("fill","#0d0d0d").attr("stroke",GC[d.gate]||"#aaa").attr("stroke-width",1.2);
+      gb.append("text").attr("y",NH/2+14).attr("text-anchor","middle").attr("fill",GC[d.gate]||"#aaa").attr("font-size",8).attr("font-weight",700).attr("font-family","JetBrains Mono,monospace").attr("letter-spacing",1).text(d.gate);
+    }
+    const cb=d3.select(this).select("g.cb"); cb.selectAll("*").remove();
+    if(hc){
+      const cx=d.isGroup?53:NW/2-10,cy=-NH/2+10;
+      cb.append("circle").attr("cx",cx).attr("cy",cy).attr("r",9).attr("fill","#1c1c1c").attr("stroke","#3a3a3a").attr("stroke-width",1.2).style("cursor","pointer").on("click",(e,dd)=>{e.stopPropagation();toggleCollapse(dd.id);});
+      cb.append("text").attr("x",cx).attr("y",cy+5).attr("text-anchor","middle").attr("fill","#888").attr("font-size",12).attr("font-weight",700).attr("font-family","monospace").attr("pointer-events","none").text(collapsed.has(d.id)?"+":"−");
+    }
+  });
+  s.exit().remove();
+}
 
-  all.select("rect.vb")
-    .attr("x",     d=>d.isGroup?-47:-NW/2+9)
-    .attr("y",     d=>d.isGroup?11:NH/2-24)
-    .attr("width", d=>d.isGroup?94:NW-18);
-
-  all.select("text.vt")
-    .attr("y",    d=>d.isGroup?25:NH/2-10)
-    .attr("fill", d=>d.isPinned?"#e94560":d.tcolor)
-    .text(d=>d.value+(d.isPinned?" 📌":""));
-
-  // Gate badge — only for nodes with children
-  all.each(function(d){{
-    const hasCh = (d.children||[]).length>0;
-    const gb = d3.select(this).select("g.gb");
-    gb.selectAll("*").remove();
-    if(!hasCh) return;
-    gb.append("rect")
-      .attr("x",-19).attr("y",NH/2+3).attr("width",38).attr("height",15)
-      .attr("rx",4).attr("fill","#0d0d0d")
-      .attr("stroke",GC[d.gate]||"#aaa").attr("stroke-width",1.2);
-    gb.append("text")
-      .attr("y",NH/2+14).attr("text-anchor","middle")
-      .attr("fill",GC[d.gate]||"#aaa")
-      .attr("font-size",8).attr("font-weight",700)
-      .attr("font-family","JetBrains Mono,monospace")
-      .attr("letter-spacing",1).text(d.gate);
-  }});
-
-  // Collapse button — only for nodes with children
-  all.each(function(d){{
-    const hasCh = (d.children||[]).length>0;
-    const cb = d3.select(this).select("g.cb");
-    cb.selectAll("*").remove();
-    if(!hasCh) return;
-    const cx = d.isGroup?53:NW/2-10, cy=-NH/2+10;
-    cb.append("circle")
-      .attr("cx",cx).attr("cy",cy).attr("r",9)
-      .attr("fill","#1c1c1c").attr("stroke","#3a3a3a").attr("stroke-width",1.2)
-      .style("cursor","pointer")
-      .on("click",(e,dd)=>{{e.stopPropagation();toggleCollapse(dd.id);}});
-    cb.append("text")
-      .attr("x",cx).attr("y",cy+5).attr("text-anchor","middle")
-      .attr("fill","#888").attr("font-size",12).attr("font-weight",700)
-      .attr("font-family","monospace").attr("pointer-events","none")
-      .text(collapsed.has(d.id)?"+":"−");
-  }});
-
-  sel.exit().remove();
-}}
-
-// ── tick — update positions ───────────────────────────────────────────
-function tick(){{
-  lg.selectAll("path.lk").attr("d",d=>{{
-    if(!d.source||!d.target) return "";
-    const sx=d.source.x||0, sy=(d.source.y||0)+NH/2+2;
-    const tx=d.target.x||0, ty=(d.target.y||0)-NH/2-8;
+function tick(){
+  lg.selectAll("path.lk").attr("d",d=>{
+    if(!d.source||!d.target)return"";
+    const sx=d.source.x||0,sy=(d.source.y||0)+NH/2+2;
+    const tx=d.target.x||0,ty=(d.target.y||0)-NH/2-8;
     const my=(sy+ty)/2;
-    return `M${{sx}},${{sy}} C${{sx}},${{my}} ${{tx}},${{my}} ${{tx}},${{ty}}`;
-  }});
-  ng.selectAll("g.nd")
-    .attr("transform",d=>`translate(${{d.x||0}},${{d.y||0}})`);
-}}
+    return `M${sx},${sy} C${sx},${my} ${tx},${my} ${tx},${ty}`;
+  });
+  ng.selectAll("g.nd").attr("transform",d=>`translate(${d.x||0},${d.y||0})`);
+}
 
-// ── layout button ─────────────────────────────────────────────────────
-function doLayerLayout(){{
-  if(forceOn) toggleForce();
-  // Clear userPos overrides and recompute clean layout
-  sNodes.forEach(n=>{{ delete userPos[n.id]; n.fx=null; n.fy=null; }});
-  computeLayout(true);
-  sNodes.forEach(n=>{{ n.fx=n.x; n.fy=n.y; }});
-  tick();
-  updateLaneBands();
-  setTimeout(doFit, 60);
-}}
+function doColumnLayout(reset){
+  if(forceOn) stopForce();
+  if(reset) sN.forEach(n=>delete uP[n.id]);
+  computeCols(reset);
+  tick(); updateLanes();
+  setTimeout(doFit,60);
+}
 
-// ── force toggle ──────────────────────────────────────────────────────
-function toggleForce(){{
-  forceOn=!forceOn;
-  const btn=document.getElementById("bforce");
-  if(forceOn){{
-    btn.classList.add("on"); btn.textContent="⚡ Force ON";
-    sNodes.forEach(n=>{{n.fx=null;n.fy=null;}});
-    sim.alpha(0.4).restart();
-  }}else{{
-    btn.classList.remove("on"); btn.textContent="⚡ Force";
-    sim.stop();
-    sNodes.forEach(n=>{{n.fx=n.x;n.fy=n.y;}});
-  }}
-}}
+function toggleForce(){
+  if(forceOn){stopForce();return;}
+  startForce();
+}
+function startForce(){
+  const btn=document.getElementById("bfrc");
+  const st=document.getElementById("fst");
+  btn.classList.add("on"); btn.textContent="⚡ Force ON";
+  forceSub=selId&&NM[selId]?.type==="SF"?selId:null;
+  forceOn=true;
+  const ids=forceSub?subIds(forceSub):new Set(sN.map(n=>n.id));
+  sN.forEach(n=>{if(ids.has(n.id)){n.fx=null;n.fy=null;}else{n.fx=n.x;n.fy=n.y;}});
+  st.textContent=forceSub?"⚡ "+NM[forceSub].name+" subtree":"⚡ Full tree";
+  st.classList.add("show");
+  sim.alpha(.45).restart();
+  drawNodes();
+}
+function stopForce(){
+  document.getElementById("bfrc").classList.remove("on");
+  document.getElementById("bfrc").textContent="⚡ Force";
+  document.getElementById("fst").classList.remove("show");
+  forceOn=false; forceSub=null;
+  sim.stop();
+  sN.forEach(n=>{n.fx=n.x;n.fy=n.y;uP[n.id]={x:n.x,y:n.y};});
+  drawNodes();
+}
 
-// ── fit view ──────────────────────────────────────────────────────────
-function doFit(){{
-  if(!sNodes.length) return;
-  const xs=sNodes.map(n=>n.x||0), ys=sNodes.map(n=>n.y||0);
-  const pad=NW;
-  const x0=Math.min(...xs)-pad, x1=Math.max(...xs)+pad;
-  const y0=Math.min(...ys)-pad, y1=Math.max(...ys)+pad;
+function doFit(){
+  if(!sN.length)return;
+  const xs=sN.map(n=>n.x||0),ys=sN.map(n=>n.y||0);
+  const x0=Math.min(...xs)-NW,x1=Math.max(...xs)+NW;
+  const y0=Math.min(...ys)-NH,y1=Math.max(...ys)+NH;
   const cw=wrap.getBoundingClientRect();
-  const W=cw.width||1000, H=cw.height||650;
-  const k=Math.min(0.96, 0.9*Math.min(W/(x1-x0), H/(y1-y0)));
-  const tx=W/2-k*(x0+x1)/2, ty=H/2-k*(y0+y1)/2;
-  svg.transition().duration(500)
-    .call(zb.transform, d3.zoomIdentity.translate(tx,ty).scale(k));
-  setTimeout(updateLaneBands,520);
-}}
+  const W=cw.width||1000,H=cw.height||650;
+  const k=Math.min(.96,.9*Math.min(W/(x1-x0),H/(y1-y0)));
+  svg.transition().duration(500).call(zb.transform,d3.zoomIdentity.translate(W/2-k*(x0+x1)/2,H/2-k*(y0+y1)/2).scale(k));
+  setTimeout(updateLanes,520);
+}
+function zBy(d){svg.transition().duration(180).call(zb.scaleBy,1+d);setTimeout(updateLanes,200);}
 
-function zBy(d){{
-  svg.transition().duration(180).call(zb.scaleBy,1+d);
-  setTimeout(updateLaneBands,200);
-}}
+function toggleCollapse(id){collapsed.has(id)?collapsed.delete(id):collapsed.add(id);refresh();}
 
-// ── collapse ──────────────────────────────────────────────────────────
-function toggleCollapse(id){{
-  collapsed.has(id)?collapsed.delete(id):collapsed.add(id);
-  refresh();
-}}
-
-// ── highlight ─────────────────────────────────────────────────────────
-function selectNode(id){{
-  if(selId===id){{selId=null;clearHL();closeDP();return;}}
+function selectNode(id){
+  if(selId===id){selId=null;clearHL();closeDP();return;}
   selId=id;
-  const n=NM[id]; if(!n) return;
-  const par=new Set(n.parents||[]);
-  const chi=new Set(n.children||[]);
-
-  ng.selectAll("g.nd").each(function(d){{
-    const el=d3.select(this), r=el.select("rect.nb");
-    if(d.id===id){{
-      r.attr("stroke","#e94560").attr("stroke-width",3.5)
-       .attr("filter","drop-shadow(0 0 12px #e9456088)");
-      el.attr("opacity",1);
-    }}else if(par.has(d.id)){{
-      r.attr("stroke","#4fc3f7").attr("stroke-width",3)
-       .attr("filter","drop-shadow(0 0 9px #4fc3f755)");
-      el.attr("opacity",1);
-    }}else if(chi.has(d.id)){{
-      r.attr("stroke","#ff8c42").attr("stroke-width",3)
-       .attr("filter","drop-shadow(0 0 9px #ff8c4255)");
-      el.attr("opacity",1);
-    }}else{{
-      r.attr("stroke",d.isPinned?"#e94560":d.color)
-       .attr("stroke-width",d.isPinned?2:1.5)
-       .attr("filter",null);
-      el.attr("opacity",0.16);
-    }}
-  }});
-
-  lg.selectAll("path.lk").each(function(d){{
+  const n=NM[id]; if(!n)return;
+  const par=new Set(n.parents||[]),chi=new Set(n.children||[]);
+  ng.selectAll("g.nd").each(function(d){
+    const el=d3.select(this),r=el.select("rect.nb");
+    if(d.id===id){r.attr("stroke","#e94560").attr("stroke-width",3.5).attr("filter","drop-shadow(0 0 12px #e9456088)");el.attr("opacity",1);}
+    else if(par.has(d.id)){r.attr("stroke","#4fc3f7").attr("stroke-width",3).attr("filter","drop-shadow(0 0 9px #4fc3f755)");el.attr("opacity",1);}
+    else if(chi.has(d.id)){r.attr("stroke","#ff8c42").attr("stroke-width",3).attr("filter","drop-shadow(0 0 9px #ff8c4255)");el.attr("opacity",1);}
+    else{r.attr("stroke",d.isPinned?"#e94560":d.color).attr("stroke-width",d.isPinned?2:1.5).attr("filter",null);el.attr("opacity",.15);}
+  });
+  lg.selectAll("path.lk").each(function(d){
     const on=d.source.id===id||d.target.id===id;
-    d3.select(this)
-      .attr("stroke",on?(d.shared?"#f5c518":"#4fc3f7"):"#1e1e1e")
-      .attr("stroke-width",on?2.8:1)
-      .attr("opacity",on?1:0.08)
-      .attr("marker-end",on?"url(#mah)":"url(#ma)");
-  }});
-
+    d3.select(this).attr("stroke",on?(d.shared?"#f5c518":"#4fc3f7"):"#1a1a1a").attr("stroke-width",on?2.8:1).attr("opacity",on?1:.07).attr("marker-end",on?"url(#mah)":"url(#ma)");
+  });
+  if(n.type==="SF"&&!forceOn) document.getElementById("bfrc").title="Click to release \\\'"+n.name+"\\' subtree to physics";
   showDP(id,n);
-}}
+}
 
-function clearHL(){{
+function clearHL(){
   selId=null;
-  ng.selectAll("g.nd").attr("opacity",1)
-    .select("rect.nb")
-    .attr("stroke",d=>d.isPinned?"#e94560":d.color)
-    .attr("stroke-width",d=>d.isPinned?2.5:1.5)
-    .attr("filter",null);
-  lg.selectAll("path.lk")
-    .attr("stroke",d=>d.shared?"#f5c51844":"#303030")
-    .attr("stroke-width",d=>d.shared?1.2:2)
-    .attr("opacity",d=>d.shared?0.55:0.95)
-    .attr("marker-end","url(#ma)");
-}}
+  ng.selectAll("g.nd").attr("opacity",1).select("rect.nb").attr("stroke",d=>forceSub===d.id&&forceOn?"#f5c518":d.isPinned?"#e94560":d.color).attr("stroke-width",d=>forceSub===d.id&&forceOn?3:d.isPinned?2.5:1.5).attr("filter",null);
+  lg.selectAll("path.lk").attr("stroke",d=>d.shared?"#f5c51844":"#2d2d2d").attr("stroke-width",d=>d.shared?1.2:2).attr("opacity",d=>d.shared?.5:.92).attr("marker-end","url(#ma)");
+}
 
-// ── detail panel ──────────────────────────────────────────────────────
-const GCM={{OR:"#4fc3f7",AND:"#ffb74d"}};
-function showDP(id,n){{
-  const dp=document.getElementById("dp");
-  dp.style.display="block"; dp.style.borderTopColor=n.color;
-  document.getElementById("dpt").innerHTML=
-    `<span style="color:${{n.color}}">${{n.name}}</span>`+
-    (n.shared?' <span style="background:#f5c518;color:#111;font-size:8px;padding:1px 6px;border-radius:5px;font-weight:700">SHARED</span>':'')+
-    (n.isPinned?` <span style="background:#e94560;color:#fff;font-size:8px;padding:1px 6px;border-radius:5px;font-weight:700">📌 FIXED ${{n.fixedVal}}</span>`:'');
-  const set=(id,val,col)=>{{
-    const el=document.getElementById(id);
-    el.textContent=val; if(col) el.style.color=col;
-  }};
-  set("dp0",n.isGroup?"GROUP":n.type, n.color);
-  set("dp1",n.gate, GCM[n.gate]||"#aaa");
-  set("dp2",n.isPinned?n.value+" 📌":n.value, n.isPinned?"#e94560":n.color);
-  set("dp3",n.nodeId||id, "#aaa");
-  set("dp4",n.shared?"YES":"NO", n.shared?"#f5c518":"#555");
-  set("dp5",(n.pnames||[]).join(" · ")||"(top event)");
-  set("dp6",(n.cnames||[]).join(" · ")||"(leaf)");
-}}
-function closeDP(){{document.getElementById("dp").style.display="none";clearHL();}}
+const GCM={OR:"#4fc3f7",AND:"#ffb74d"};
+function showDP(id,n){
+  const dp=document.getElementById("dp"); dp.style.display="block"; dp.style.borderTopColor=n.color;
+  document.getElementById("dpt").innerHTML=`<span style="color:${n.color}">${n.name}</span>`+(n.shared?\' <span style="background:#f5c518;color:#111;font-size:8px;padding:1px 6px;border-radius:5px;font-weight:700">SHARED</span>\':\'\')+( n.isPinned?` <span style="background:#e94560;color:#fff;font-size:8px;padding:1px 6px;border-radius:5px;font-weight:700">&#128204; FIXED ${n.fixedVal}</span>`:\'\');
+  const q=(id,v,c)=>{const e=document.getElementById(id);e.textContent=v;if(c)e.style.color=c;};
+  q("d0",n.isGroup?"GROUP":n.type,n.color);q("d1",n.gate,GCM[n.gate]||"#aaa");
+  q("d2",n.isPinned?n.value+" 📌":n.value,n.isPinned?"#e94560":n.color);
+  q("d3",n.nodeId||id,"#aaa");q("d4",n.shared?"YES":"NO",n.shared?"#f5c518":"#555");
+  q("d5",(n.pnames||[]).join(" · ")||"(top event)");q("d6",(n.cnames||[]).join(" · ")||"(leaf)");
+}
+function closeDP(){document.getElementById("dp").style.display="none";clearHL();}
 
-// ── search ────────────────────────────────────────────────────────────
-function doSearch(q){{
-  ng.selectAll("rect.nb").attr("filter",null);
-  sMatches=[];sIdx=0;
-  if(!q.trim()){{document.getElementById("sinfo").textContent="";return;}}
+function doSearch(q){
+  ng.selectAll("rect.nb").attr("filter",null);sM=[];sI=0;
+  if(!q.trim()){document.getElementById("si").textContent="";return;}
   const lq=q.toLowerCase();
-  RNODES.forEach(n=>{{
-    if([n.name,n.type,n.value,n.nodeId||""].some(v=>v.toLowerCase().includes(lq)))
-      sMatches.push(n.id);
-  }});
-  const info=document.getElementById("sinfo");
-  info.textContent=sMatches.length?sMatches.length+" found":"0";
-  ng.selectAll("g.nd").filter(d=>sMatches.includes(d.id))
-    .select("rect.nb").attr("filter","drop-shadow(0 0 10px #f5c518)");
-  if(sMatches.length) panTo(sMatches[0]);
-}}
-function sNext(){{
-  if(!sMatches.length)return;
-  sIdx=(sIdx+1)%sMatches.length;
-  panTo(sMatches[sIdx]);
-  document.getElementById("sinfo").textContent=`${{sIdx+1}}/${{sMatches.length}}`;
-}}
-function sPrev(){{
-  if(!sMatches.length)return;
-  sIdx=(sIdx-1+sMatches.length)%sMatches.length;
-  panTo(sMatches[sIdx]);
-  document.getElementById("sinfo").textContent=`${{sIdx+1}}/${{sMatches.length}}`;
-}}
-function panTo(id){{
-  const n=sNodes.find(s=>s.id===id); if(!n) return;
-  const t=getCurT();
-  const cw=wrap.getBoundingClientRect();
-  const W=cw.width||1000, H=cw.height||650;
-  svg.transition().duration(400)
-    .call(zb.transform,
-      d3.zoomIdentity.translate(W/2-t.k*(n.x||0), H/3-t.k*(n.y||0)).scale(t.k));
-  setTimeout(updateLaneBands,420);
-}}
+  RNODES.forEach(n=>{if([n.name,n.type,n.value,n.nodeId||""].some(v=>v.toLowerCase().includes(lq)))sM.push(n.id);});
+  document.getElementById("si").textContent=sM.length?sM.length+" found":"0";
+  ng.selectAll("g.nd").filter(d=>sM.includes(d.id)).select("rect.nb").attr("filter","drop-shadow(0 0 10px #f5c518)");
+  if(sM.length)panTo(sM[0]);
+}
+function sNext(){if(!sM.length)return;sI=(sI+1)%sM.length;panTo(sM[sI]);document.getElementById("si").textContent=`${sI+1}/${sM.length}`;}
+function sPrev(){if(!sM.length)return;sI=(sI-1+sM.length)%sM.length;panTo(sM[sI]);document.getElementById("si").textContent=`${sI+1}/${sM.length}`;}
+function panTo(id){
+  const n=sN.find(s=>s.id===id);if(!n)return;
+  const t=getT(),cw=wrap.getBoundingClientRect();
+  svg.transition().duration(400).call(zb.transform,d3.zoomIdentity.translate((cw.width||1000)/2-t.k*(n.x||0),(cw.height||650)/3-t.k*(n.y||0)).scale(t.k));
+  setTimeout(updateLanes,420);
+}
 
-// ── boot ──────────────────────────────────────────────────────────────
-refresh();           // build sim nodes + links
-doLayerLayout();     // clean layer layout, then fit
-if(FOCUSID) setTimeout(()=>panTo(FOCUSID), 700);
-</script>
-</body></html>"""
+refresh();
+doColumnLayout(true);
+if(FOCUSID) setTimeout(()=>panTo(FOCUSID),700);
+</script></body></html>"""
+
+    # Substitute data placeholders
+    html = html.replace("__NODES__", nodes_js)
+    html = html.replace("__LINKS__", links_js)
+    html = html.replace("__IPOS__",  init_pos_js)
+    html = html.replace("__FOCUS__", focus_js)
+    html = html.replace("__LLABELS__", level_label_js)
+    html = html.replace("__LCOLORS__", level_color_js)
+    return html
 
 def build_hierarchy_rows(nodes, filter_hazard_id=None):
     by_id = {n["id"]: n for n in nodes}
