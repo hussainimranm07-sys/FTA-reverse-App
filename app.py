@@ -727,13 +727,13 @@ function selectNode(id){{
   document.getElementById("dp-title").innerHTML=
     `<span style="color:${{node.color}}">${{node.name}}</span>`+
     (node.shared?' <span style="background:#f5c518;color:#111;font-size:8px;padding:1px 5px;border-radius:5px;font-weight:700;">SHARED</span>':'')+
-    (node.isPinned?` <span style="background:#e94560;color:#fff;font-size:8px;padding:1px 5px;border-radius:5px;font-weight:700;">📌 FIXED ${node.fixedVal}</span>`:'');
+    (node.isPinned?` <span style="background:#e94560;color:#fff;font-size:8px;padding:1px 5px;border-radius:5px;font-weight:700;">📌 FIXED ${{node.fixedVal}}</span>`:'');
   document.getElementById("dp-type").style.color=node.color;
   document.getElementById("dp-type").textContent=node.isGroup?"GROUP":node.type;
   document.getElementById("dp-gate").style.color=GCOLORS[node.gate]||"#aaa";
   document.getElementById("dp-gate").textContent=node.gate;
   document.getElementById("dp-value").style.color=node.isPinned?"#e94560":node.color;
-  document.getElementById("dp-value").textContent=node.isPinned?`${node.value} 📌`:`${node.value}`;
+  document.getElementById("dp-value").textContent=node.isPinned?`${{node.value}} 📌`:`${{node.value}}`;
   document.getElementById("dp-nid").innerHTML=
     `<span style="color:#aaa;">${{node.nodeId||id}}</span>`+
     (node.isPinned?`<br><span style="color:#e94560;font-size:8px;">pinned = ${{node.fixedVal}}</span>`:'');
@@ -784,7 +784,7 @@ function renderNodes(){{
     const gc=GCOLORS[node.gate]||"#aaa";
     const hasCh=(node.children||[]).length>0;
     const sb=node.shared?`<span style="background:#f5c518;color:#111;font-size:6px;padding:1px 3px;border-radius:3px;font-weight:700;margin-left:3px;">SHR</span>`:"";
-    const pb=node.isPinned?`<span style="background:#e94560;color:#fff;font-size:6px;padding:1px 3px;border-radius:3px;font-weight:700;margin-left:3px;" title="Fixed value: ${node.fixedVal}">📌PIN</span>`:"";
+    const pb=node.isPinned?`<span style="background:#e94560;color:#fff;font-size:6px;padding:1px 3px;border-radius:3px;font-weight:700;margin-left:3px;" title="Fixed value: ${{node.fixedVal}}">📌PIN</span>`:"";
     const nid_badge=node.nodeId&&node.nodeId!==id?`<span style="font-size:6px;color:rgba(255,255,255,0.4);margin-left:2px;">${{node.nodeId}}</span>`:"";
     const nw=nodeW(id),nh=nodeH(id);
     const wrap=document.createElement("div");
