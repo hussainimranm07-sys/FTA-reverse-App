@@ -547,7 +547,7 @@ const FOCUSID=__FOCUS__;
 const LLABELS=__LLABELS__;
 const LCOLORS=__LCOLORS__;
 const GC={OR:"#4fc3f7",AND:"#ffb74d"};
-const NW=152,NH=84,HG=22,VG=168;
+const NW=160,NH=88,HG=20,VG=185;
 let selId=null,forceOn=false,forceSub=null;
 let collapsed=new Set(),sM=[],sI=0;
 const uP={};
@@ -652,7 +652,7 @@ function drawNodes(){
     .text(d=>d.isGroup?"COMBINED":d.type+(d.shared?" ◈":"")+(d.isPinned?" 📌":""));
   all.select("foreignObject.nf")
     .attr("x",d=>d.isGroup?-57:-NW/2+7).attr("y",d=>d.isGroup?-22:-NH/2+17)
-    .attr("width",d=>d.isGroup?114:NW-14).attr("height",d=>d.isGroup?28:34)
+    .attr("width",d=>d.isGroup?114:NW-14).attr("height",d=>d.isGroup?28:40)
     .select("div").style("color",d=>d.tcolor).text(d=>d.name);
   all.select("rect.vb").attr("x",d=>d.isGroup?-47:-NW/2+9).attr("y",d=>d.isGroup?11:NH/2-24).attr("width",d=>d.isGroup?94:NW-18);
   all.select("text.vt").attr("y",d=>d.isGroup?25:NH/2-10).attr("fill",d=>d.isPinned?"#e94560":d.tcolor).text(d=>d.value+(d.isPinned?" 📌":""));
@@ -685,78 +685,99 @@ function tick(){
   ng.selectAll("g.nd").attr("transform",d=>`translate(${d.x||0},${d.y||0})`);
 }
 function computeRTLayout(reset){
-  // Reingold-Tilford style: center each parent over its children.
-  // Width of each subtree slot is proportional to its leaf count.
-  // Every time a node is added the whole tree rebalances cleanly.
-  const vis=getVis();
-  const W=wrap.getBoundingClientRect().width||1400;
-  const SLOT=NW+HG;
+  // Reingold-Tilford tree layout.
+  // Key rules:
+  // 1. Every leaf gets exactly SLOT px of horizontal space
+  // 2. Every parent is centered over the span of its children
+  // 3. Total canvas width = totalLeaves * SLOT (grows beyond viewport — use Fit to see all)
+  // 4. Shared nodes: x = average of all parent positions (already placed)
+  // 5. Manual drag overrides are respected until ⊞ Reset Layout is pressed
 
-  const visSet=new Set(vis.map(n=>n.id));
-  // Build child adjacency from visible nodes
-  const childMap={};
-  vis.forEach(n=>{childMap[n.id]=[];});
+  const vis    = getVis();
+  const visSet = new Set(vis.map(n=>n.id));
+  const SLOT   = NW + HG;   // px per leaf slot
+
+  // ── 1. Build child map from visible nodes ──────────────────────────
+  const childMap = {};
+  vis.forEach(n=>{ childMap[n.id] = []; });
   vis.forEach(n=>{
     (n.parents||[]).forEach(pid=>{
-      if(visSet.has(pid)&&childMap[pid]) childMap[pid].push(n.id);
+      if(visSet.has(pid) && childMap[pid]) childMap[pid].push(n.id);
     });
   });
 
-  // Count visible leaves in each subtree
-  const lc={};
+  // ── 2. Count leaves in each subtree ────────────────────────────────
+  const lc = {};
   function cLeaves(id){
-    if(lc[id]!==undefined) return lc[id];
-    const ch=childMap[id]||[];
-    lc[id]=ch.length?ch.reduce((s,c)=>s+cLeaves(c),0):1;
+    if(lc[id] !== undefined) return lc[id];
+    const ch = childMap[id]||[];
+    lc[id] = ch.length ? ch.reduce((s,c)=>s+cLeaves(c), 0) : 1;
     return lc[id];
   }
   vis.forEach(n=>cLeaves(n.id));
 
-  // Assign x: distribute slice among children proportional to leaf counts,
-  // then center parent over its children.
-  const posMap={};
-  function assignX(id,left,width){
-    const ch=childMap[id]||[];
-    if(!ch.length){posMap[id]=left+width/2;return;}
-    const tot=lc[id]||1;
-    let cur=left;
+  // ── 3. Assign x positions ──────────────────────────────────────────
+  // posMap[id] = center x of node
+  const posMap = {};
+  const MARGIN = 80;
+
+  function assignX(id, left, width){
+    const ch = childMap[id]||[];
+    if(!ch.length){
+      // Leaf: center in its exact slot
+      posMap[id] = left + width/2;
+      return;
+    }
+    // Distribute slice evenly proportional to each child's leaf count
+    const tot = lc[id] || 1;
+    let cur = left;
     ch.forEach(cid=>{
-      const w=(lc[cid]/tot)*width;
-      assignX(cid,cur,Math.max(w,SLOT));
-      cur+=Math.max(w,SLOT);
+      // Each child's slice = (its leaves / parent total leaves) * parent width
+      // Minimum = exactly SLOT so nodes never overlap
+      const childW = Math.max(SLOT, (lc[cid]/tot) * width);
+      assignX(cid, cur, childW);
+      cur += childW;
     });
-    const xs=ch.map(c=>posMap[c]);
-    posMap[id]=(Math.min(...xs)+Math.max(...xs))/2;
+    // Parent x = midpoint between leftmost and rightmost child
+    const xs = ch.map(c=>posMap[c]);
+    posMap[id] = (Math.min(...xs) + Math.max(...xs)) / 2;
   }
 
-  // Roots = visible nodes with no visible parents
-  const roots=vis.filter(n=>(n.parents||[]).every(p=>!visSet.has(p)));
-  const totLeaves=roots.reduce((s,r)=>s+cLeaves(r.id),0)||1;
-  const MARGIN=50;
-  const usable=Math.max(W-MARGIN*2,roots.length*SLOT*3);
-  let cur=MARGIN;
+  // Find roots (nodes with no visible parent)
+  const roots = vis.filter(n=>(n.parents||[]).every(p=>!visSet.has(p)));
+
+  // Total canvas width driven by leaf count — not by screen width
+  // This means the tree can be wider than the screen; user zooms/pans to navigate
+  const totalLeaves = roots.reduce((s,r)=>s+cLeaves(r.id), 0) || 1;
+  const totalWidth  = Math.max(totalLeaves * SLOT + MARGIN*2, 1200);
+
+  let cur = MARGIN;
   roots.forEach(r=>{
-    const w=Math.max((lc[r.id]/totLeaves)*usable,SLOT*2);
-    assignX(r.id,cur,w);
-    cur+=w;
+    const w = Math.max((lc[r.id]/totalLeaves) * (totalWidth - MARGIN*2), SLOT*2);
+    assignX(r.id, cur, w);
+    cur += w;
   });
 
-  // Apply to simNodes
+  // ── 4. Apply positions to sim nodes ───────────────────────────────
   vis.forEach(n=>{
-    const sn=sN.find(s=>s.id===n.id); if(!sn) return;
-    const inForce=forceOn&&forceSub&&subIds(forceSub).has(n.id);
-    if(inForce){sn.fx=null;sn.fy=null;return;}
-    // Respect manual drag only if not resetting
-    if(!reset&&uP[n.id]?.manual){
+    const sn = sN.find(s=>s.id===n.id); if(!sn) return;
+
+    // Skip nodes in active force subtree
+    const inForce = forceOn && forceSub && subIds(forceSub).has(n.id);
+    if(inForce){ sn.fx=null; sn.fy=null; return; }
+
+    // Respect manual drag unless resetting
+    if(!reset && uP[n.id]?.manual){
       sn.x=uP[n.id].x; sn.y=uP[n.id].y;
       sn.fx=sn.x; sn.fy=sn.y;
       return;
     }
-    const nx=posMap[n.id]??sn.x??W/2;
-    const ny=layY(n.row);
+
+    const nx = posMap[n.id] ?? sn.x ?? totalWidth/2;
+    const ny = layY(n.row);
     sn.x=nx; sn.y=ny; sn.bx=nx;
     sn.fx=nx; sn.fy=ny;
-    uP[n.id]={x:nx,y:ny,manual:false};
+    uP[n.id] = {x:nx, y:ny, manual:false};
   });
 }
 
