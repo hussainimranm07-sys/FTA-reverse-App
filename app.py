@@ -1131,61 +1131,182 @@ def render_sidebar():
 GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                 """)
 
-            node_name  = st.text_input("Node Name", placeholder="e.g. Power Failure", key="add_name")
+            node_name = st.text_input("Node Name", placeholder="e.g. Pack mechanical damage due to crash", key="add_name")
 
-            custom_id  = st.text_input("Node ID (optional)", placeholder="e.g. FF-01, IF-286",
-                                       key="add_cid",
-                                       help="Type your reference ID. Searches live as you type.")
+            # ── Node ID (mandatory) ──────────────────────────────────
+            c_id, c_ft = st.columns([2, 1])
+            with c_id:
+                custom_id = st.text_input(
+                    "Node ID ★ required",
+                    placeholder="e.g. IF-196, FF-01",
+                    key="add_cid",
+                    help="Mandatory reference ID. Searched live across the full tree as you type."
+                )
+            with c_ft:
+                ft_label = st.text_input(
+                    "FT Label (optional)",
+                    placeholder="e.g. FT-46",
+                    key="add_ft",
+                    help="Fault tree label e.g. FT-46. Appended as a tag on the node."
+                )
 
-            # ── Live Node ID search ──────────────────────────────────
-            # Shows a compact info card while typing:
-            #   • Green  = ID is free — safe to create
-            #   • Yellow = ID already exists — can link as shared OR still add new
-            # ADD NODE button is ALWAYS present — no blocking popups.
             cid_clean = custom_id.strip()
-            existing_with_id = []
+            ft_clean  = ft_label.strip()
+
+            # ── Live search: check BOTH nodeId AND name ───────────────
+            # nodeId search: exact match (IF-196 ≠ IF-195)
+            # Name search: case-insensitive contains (partial match)
+            id_matches   = []   # exact nodeId match
+            name_matches = []   # name contains typed string
+
             if len(cid_clean) >= 2:
-                existing_with_id = [
+                id_matches = [
                     n for n in nodes
                     if (n.get("nodeId") or "").strip() == cid_clean
                     and (n.get("nodeId") or "").strip() != ""
                 ]
-            duplicate_found = len(existing_with_id) > 0
 
-            if cid_clean and len(cid_clean) >= 2:
-                if duplicate_found:
-                    ex        = existing_with_id[0]
+            if len(node_name.strip()) >= 4:
+                lname = node_name.strip().lower()
+                name_matches = [
+                    n for n in nodes
+                    if lname in (n.get("name") or "").lower()
+                    and n not in id_matches  # don't double-show
+                ]
+
+            # ── Render search results ─────────────────────────────────
+            def render_match_card(matches, match_type):
+                """Render a match card. match_type = 'id' or 'name'"""
+                for ex in matches:
                     ex_color  = LEVEL_COLORS.get(ex["type"], "#888")
-                    ex_pnames = " · ".join(
-                        by_id[p]["name"] for p in (ex.get("parentIds") or []) if p in by_id
-                    ) or "none"
+                    ex_pids   = ex.get("parentIds") or []
+                    ex_pnames = " · ".join(by_id[p]["name"] for p in ex_pids if p in by_id) or "—"
+                    ex_val    = fmt(ex.get("calculatedValue"))
+                    ex_nid    = ex.get("nodeId", ex["id"])
+                    # Find which hazard(s) this node belongs to
+                    def find_hazards_of(node_id, depth=0):
+                        if depth > 8: return []
+                        n = by_id.get(node_id)
+                        if not n: return []
+                        if n["type"] == "HAZARD": return [n["name"]]
+                        result = []
+                        for pid in (n.get("parentIds") or []):
+                            result.extend(find_hazards_of(pid, depth+1))
+                        return list(dict.fromkeys(result))  # dedupe
+                    ex_fts = find_hazards_of(ex["id"])
+                    ex_ft_str = " · ".join(ex_fts) if ex_fts else "—"
+
+                    is_id_match = match_type == "id"
+                    border_col  = "#f5c518" if is_id_match else "#ff8c42"
+                    bg_col      = "#1a1100" if is_id_match else "#1a0e00"
+                    label       = "⚠ EXACT NODE ID MATCH" if is_id_match else "~ SIMILAR NAME FOUND"
+
                     st.markdown(f"""
-                    <div style="background:#1a1100;border:1.5px solid #f5c518;border-radius:7px;
-                                padding:8px 11px;margin:4px 0 6px 0;">
-                      <div style="font-size:9px;color:#f5c518;font-weight:700;letter-spacing:1px;margin-bottom:3px;">
-                        ⚠ &nbsp;{cid_clean} already exists in tree
+                    <div style="background:{bg_col};border:1.5px solid {border_col};
+                                border-radius:7px;padding:9px 12px;margin:3px 0 5px 0;">
+                      <div style="font-size:8px;color:{border_col};font-weight:700;
+                                  letter-spacing:1px;margin-bottom:4px;">{label}</div>
+                      <div style="display:flex;align-items:center;gap:8px;margin-bottom:3px;">
+                        <code style="background:#2a2200;color:{border_col};padding:1px 6px;
+                               border-radius:3px;font-size:10px;font-weight:700;">{ex_nid}</code>
+                        <span style="font-size:10px;color:{ex_color};font-weight:700;">{ex['name']}</span>
+                        <span style="font-size:9px;color:#555;">[{ex['type']} · {ex['gate']}]</span>
                       </div>
-                      <div style="font-size:10px;color:#ddd;font-weight:700;">
-                        <span style="color:{ex_color};">{ex['name']}</span>
-                        <span style="color:#555;font-size:9px;margin-left:5px;">[{ex['type']} · {ex['gate']}]</span>
-                      </div>
-                      <div style="font-size:9px;color:#777;margin-top:2px;">
-                        Parents: {ex_pnames} &nbsp;·&nbsp;
-                        Value: <span style="font-family:monospace;color:{ex_color};">{fmt(ex.get('calculatedValue'))}</span>
-                      </div>
-                      <div style="font-size:9px;color:#aaa;margin-top:4px;">
-                        Press <b>✅ ADD NODE</b> to create a new separate node with this ID &nbsp;|&nbsp;
-                        or press <b>🔗 Link Shared</b> to reuse the existing node
+                      <div style="font-size:9px;color:#777;line-height:1.7;">
+                        <b style="color:#555;">Value:</b>
+                        <span style="font-family:monospace;color:{ex_color};">{ex_val}</span>
+                        &nbsp;·&nbsp;<b style="color:#555;">In FT:</b> {ex_ft_str}<br>
+                        <b style="color:#555;">Parents:</b> {ex_pnames}
                       </div>
                     </div>""", unsafe_allow_html=True)
-                else:
-                    st.markdown(f"""
-                    <div style="background:#0a1a0a;border:1.5px solid #4caf7d;border-radius:7px;
-                                padding:6px 11px;margin:4px 0 6px 0;">
-                      <div style="font-size:9px;color:#4caf7d;font-weight:700;">
-                        ✓ &nbsp;{cid_clean} is available — ready to create
-                      </div>
-                    </div>""", unsafe_allow_html=True)
+
+                    # Action buttons for this match
+                    b1, b2, b3 = st.columns(3)
+                    link_help = (
+                        f"Links '{ex['name']}' ({ex_nid}) as a shared node.\n\n"
+                        f"Current parents: {ex_pnames}\n"
+                        f"Current value: {ex_val}\n"
+                        f"In fault tree(s): {ex_ft_str}\n\n"
+                        f"After linking, this node will receive its value from ALL parent paths. "
+                        f"The engine takes MAX (worst case) across all paths — standard FTA practice."
+                    )
+                    with b1:
+                        if st.button("🔗 Link Shared",
+                                     key=f"link_{ex['id']}",
+                                     use_container_width=True,
+                                     type="primary",
+                                     help=link_help):
+                            if not (sel_pids if 'sel_pids' in dir() else []):
+                                st.error("Select at least one parent first")
+                            else:
+                                updated = []
+                                for n in nodes:
+                                    if n["id"] == ex["id"]:
+                                        n = dict(n)
+                                        ep = list(n.get("parentIds") or [])
+                                        ep += [p for p in sel_pids if p not in ep]
+                                        n["parentIds"] = ep
+                                    updated.append(n)
+                                st.session_state.tree_state["focus_id"] = ex["id"]
+                                st.session_state.nodes_since_calc += 1
+                                set_nodes(updated)
+                                st.success(f"Linked '{ex['name']}' as shared — MAX value applies across all paths.")
+                                st.rerun()
+                    with b2:
+                        if st.button("➕ New Node",
+                                     key=f"new_{ex['id']}",
+                                     use_container_width=True,
+                                     help="Create a NEW separate node with the same ID label (different internal ID)"):
+                            st.session_state["_force_add"] = True
+                            st.rerun()
+                    with b3:
+                        if st.button("📋 Duplicate",
+                                     key=f"dup_{ex['id']}",
+                                     use_container_width=True,
+                                     help="Create an exact copy: same name, same type, same gate — in a different fault tree branch"):
+                            st.session_state["_dup_from"] = ex["id"]
+                            st.rerun()
+
+            # Show name matches first (informational), then ID matches
+            if name_matches:
+                render_match_card(name_matches, "name")
+            if id_matches:
+                render_match_card(id_matches, "id")
+
+            # Handle duplicate action from session state
+            if st.session_state.get("_dup_from"):
+                dup_src = st.session_state.pop("_dup_from")
+                src = by_id.get(dup_src)
+                if src:
+                    nid = str(uuid.uuid4())[:7]
+                    dup_node = {
+                        "id": nid,
+                        "nodeId": (src.get("nodeId") or src["id"]) + "_copy",
+                        "name": src["name"],
+                        "type": src["type"],
+                        "gate": src["gate"],
+                        "fixedValue": src.get("fixedValue"),
+                        "targetValue": None,
+                        "calculatedValue": src.get("fixedValue"),
+                        "parentIds": [],  # user must connect it
+                    }
+                    set_nodes(nodes + [dup_node])
+                    st.success(f"Duplicated '{src['name']}' — select parents and press ADD NODE to connect it.")
+                    st.rerun()
+
+            # ── ID validation banner ──────────────────────────────────
+            if not cid_clean:
+                st.markdown(
+                    "<div style='font-size:9px;color:#e94560;margin:2px 0 4px 0;'>★ Node ID is required</div>",
+                    unsafe_allow_html=True)
+            elif len(cid_clean) >= 2 and not id_matches:
+                st.markdown(f"""
+                <div style="background:#0a1a0a;border:1.5px solid #4caf7d;border-radius:6px;
+                            padding:5px 10px;margin:2px 0 4px 0;">
+                  <span style="font-size:9px;color:#4caf7d;font-weight:700;">
+                    ✓ {cid_clean} is available
+                  </span>
+                </div>""", unsafe_allow_html=True)
 
             parent_opts = {f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name']}": n["id"]
                            for n in nodes if n["type"] in VALID_PARENT_TYPES}
@@ -1195,7 +1316,6 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                                        help="GROUP = Combined Faults oval (placed between FF and IF layers)")
             gate        = st.radio("Gate", ["OR","AND"], horizontal=True, key="add_gate")
 
-            # Fixed value option
             use_fixed  = st.checkbox("📌 Pin to fixed value", key="add_use_fixed",
                                      help="Overrides calculated value. Subtracts from parent budget, gives remainder to siblings.")
             fixed_val_input = None
@@ -1204,35 +1324,15 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                                                 key="add_fixed_val",
                                                 help="Node always carries this exact failure rate.")
 
-            # ── Action buttons ────────────────────────────────────────
-            # ADD NODE is always present — never blocked by duplicate detection
-            if duplicate_found and sel_pids:
-                btn_share, btn_add = st.columns([1, 1])
-                with btn_share:
-                    if st.button("🔗 Link Shared", use_container_width=True, type="primary",
-                                 help="Add your selected parent(s) to the existing node — shared node pattern"):
-                        ex = existing_with_id[0]
-                        updated = []
-                        for n in nodes:
-                            if n["id"] == ex["id"]:
-                                n = dict(n)
-                                existing_pids  = list(n.get("parentIds") or [])
-                                new_pids_to_add = [p for p in sel_pids if p not in existing_pids]
-                                n["parentIds"] = existing_pids + new_pids_to_add
-                            updated.append(n)
-                        st.session_state.tree_state["focus_id"] = ex["id"]
-                        st.session_state.nodes_since_calc += 1
-                        set_nodes(updated)
-                        st.success(f"Linked '{ex['name']}' as shared. Press CALCULATE to update values.")
-                        st.rerun()
-                with btn_add:
-                    add_btn = st.button("✅ Add New", use_container_width=True,
-                                        help="Create a brand-new node — the duplicate ID is just a label")
-            else:
-                add_btn = st.button("✅ ADD NODE", use_container_width=True, type="primary")
+            # ── ADD NODE — always present, never blocked ──────────────
+            force_add = st.session_state.pop("_force_add", False)
+            add_btn   = st.button("✅ ADD NODE", use_container_width=True, type="primary",
+                                  disabled=not cid_clean)
 
-            if add_btn:
-                if not node_name.strip():
+            if add_btn or force_add:
+                if not cid_clean:
+                    st.error("★ Node ID is required — please enter a reference ID (e.g. IF-196)")
+                elif not node_name.strip():
                     st.error("Enter a node name")
                 elif not sel_pids:
                     st.error("Select at least one parent")
@@ -1241,12 +1341,23 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                     if use_fixed and fixed_val_input:
                         try:    fv = float(fixed_val_input)
                         except: st.error("Fixed value must be a number e.g. 1.67e-9"); fv = None
-                    nid = cid_clean if cid_clean and not any(n["id"] == cid_clean for n in nodes) \
-                          else str(uuid.uuid4())[:7]
-                    new_node = {"id": nid, "nodeId": cid_clean or nid,
-                                "name": node_name.strip(), "type": node_type, "gate": gate,
-                                "fixedValue": fv, "targetValue": None, "calculatedValue": fv,
-                                "parentIds": sel_pids}
+                    # Build the display name — optionally include FT label
+                    display_name = node_name.strip()
+                    if ft_clean:
+                        display_name = f"[{ft_clean}] {display_name}"
+                    nid = str(uuid.uuid4())[:7]
+                    new_node = {
+                        "id":             nid,
+                        "nodeId":         cid_clean,
+                        "ftLabel":        ft_clean or "",
+                        "name":           display_name,
+                        "type":           node_type,
+                        "gate":           gate,
+                        "fixedValue":     fv,
+                        "targetValue":    None,
+                        "calculatedValue": fv,
+                        "parentIds":      sel_pids,
+                    }
                     st.session_state.tree_state["focus_id"] = sel_pids[0] if sel_pids else nid
                     st.session_state.nodes_since_calc += 1
                     set_nodes(nodes + [new_node])
