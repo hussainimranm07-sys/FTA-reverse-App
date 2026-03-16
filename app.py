@@ -52,51 +52,24 @@ def del_gist_file(token, gid, fname):
     except: pass
 
 # ── Calculation ───────────────────────────────────────────────────────────
-def reverse_distribute(parent_val, gate, n):
-    """
-    Reverse-distribute a parent's required failure rate to its n children.
-
-    OR gate:  children are independent alternatives.
-              Each child needs: parent_val / n
-              (sum approximation: λ_parent ≈ Σ λ_children for small rates)
-
-    AND gate: children must ALL fail simultaneously (combined fault).
-              Each child needs: parent_val ^ (1/n)
-              (product law: λ_parent ≈ Π λ_children for independent events)
-
-    GROUP nodes (Combined Faults ovals) use their own gate to distribute
-    down to their children, then pass their own calculated value up to their
-    parent via the parent's gate — exactly like any other node.
-    """
-    if n == 0: return parent_val
-    return parent_val / n if gate == "OR" else parent_val ** (1.0 / n)
-
+# ── Calculation ───────────────────────────────────────────────────────────
 def recalculate(nodes):
     """
-    Robust top-down reverse distribution using Kahn's topological sort.
+    Top-down reverse distribution using Kahn topological sort.
 
-    Why topo-sort instead of plain BFS?
-    - A shared node can have 10+ parents across multiple hazards.
-    - With BFS + visit-count guards, complex shared nets can get wrong values
-      if a node is processed before ALL its parents are resolved.
-    - Kahn's algorithm guarantees every node is processed exactly once,
-      AFTER all its parents have been resolved. This is O(N+E) and handles
-      any DAG of 500+ nodes with N-way sharing correctly.
+    fixedValue support:
+    - A node with fixedValue set is PINNED — calculatedValue always = fixedValue
+    - When an OR-gate parent distributes:
+        1. Fixed children claim their pinned value from budget first
+        2. Remainder shared equally among unfixed children
+      Example: SF-10=2e-8 (OR), FF-46 pinned=1.67e-9, SF-06 unfixed
+               → FF-46 keeps 1.67e-9, SF-06 gets (2e-8 - 1.67e-9) = 1.833e-8
+    - AND gate: fixed children excluded from product decomposition
 
-    Standard FTA rules applied:
-    - OR gate parent: child_val = parent_val / n_children
-      (sum rule: λ_parent ≈ Σλ_children for small λ)
-    - AND gate parent: child_val = parent_val ^ (1/n_children)
-      (product rule: λ_parent = Πλ_children for independent events)
-    - Shared node (multiple parents): receives MAX value across all paths.
-      MAX = most conservative (worst-case) allocation — standard FTA practice.
-      This is correct for top-down budgeting: the node must meet the strictest
-      requirement imposed on it from any path.
-
-    GROUP nodes (Combined Faults ovals) work transparently:
-      They are normal nodes with their own gate. A GROUP(AND) under an OR
-      parent receives parent_val/n from the parent's OR distribution, then
-      distributes (parent_val/n)^(1/k) to each of its k children.
+    Standard FTA rules:
+    - OR:  remainder = parent - sum(fixed); each unfixed = remainder / n_unfixed
+    - AND: remainder = parent / product(fixed); each unfixed = remainder^(1/n_unfixed)
+    - Shared nodes (multiple parents): MAX value — most conservative wins
     """
     if not nodes:
         return nodes
@@ -104,88 +77,82 @@ def recalculate(nodes):
     updated = [dict(n) for n in nodes]
     by_id   = {n["id"]: n for n in updated}
 
-    # Reset all non-HAZARD calculated values
     for n in updated:
-        if n["type"] != "HAZARD":
-            n["calculatedValue"] = None
-        else:
-            # Ensure HAZARD has its targetValue as calculatedValue
+        if n["type"] == "HAZARD":
             n["calculatedValue"] = n.get("targetValue") or 1e-7
+        elif n.get("fixedValue") is not None:
+            n["calculatedValue"] = n["fixedValue"]
+        else:
+            n["calculatedValue"] = None
 
-    # Build adjacency: parent_id -> [child nodes]
     children_of = {n["id"]: [] for n in updated}
-    # In-degree: number of parents for each non-HAZARD node
-    # For shared nodes this counts each unique parent once
-    in_degree = {}
+    in_degree   = {}
     for n in updated:
-        nid = n["id"]
+        nid  = n["id"]
         pids = [p for p in (n.get("parentIds") or []) if p in by_id]
         in_degree[nid] = len(pids)
         for pid in pids:
             if pid in children_of:
                 children_of[pid].append(nid)
 
-    # Kahn's algorithm: start from HAZARDs (in_degree handled — they have no parents)
-    # Use a queue of nodes whose ALL parents are resolved
     from collections import deque
-    resolved = set()
-    queue = deque()
+    resolved         = set()
+    queue            = deque()
+    parents_resolved = {n["id"]: 0 for n in updated}
 
-    # Seed with HAZARDs
     for n in updated:
-        if n["type"] == "HAZARD":
+        if n["type"] == "HAZARD" or n.get("fixedValue") is not None:
             resolved.add(n["id"])
             queue.append(n["id"])
 
-    # Track how many parents of each node have been resolved
-    parents_resolved = {n["id"]: 0 for n in updated}
-
-    # Process in topological order
-    processed = 0
     while queue:
-        pid = queue.popleft()
-        parent = by_id[pid]
+        pid        = queue.popleft()
+        parent     = by_id[pid]
         parent_val = parent.get("calculatedValue")
-
         if parent_val is None:
-            # This shouldn't happen in a well-formed tree, but skip safely
             continue
 
         child_ids = children_of.get(pid, [])
         if not child_ids:
             continue
 
-        # Distribute to each direct child
-        # n = number of children (for equal distribution)
-        n_ch = len(child_ids)
-        child_val = reverse_distribute(parent_val, parent["gate"], n_ch)
+        fixed_ids   = [cid for cid in child_ids if by_id[cid].get("fixedValue") is not None]
+        unfixed_ids = [cid for cid in child_ids if by_id[cid].get("fixedValue") is None]
+        n_unfixed   = len(unfixed_ids)
 
-        for cid in child_ids:
-            child = by_id[cid]
+        if parent["gate"] == "OR":
+            fixed_sum = sum(by_id[cid]["fixedValue"] for cid in fixed_ids)
+            remainder = max(parent_val - fixed_sum, 0.0)
+            child_val = (remainder / n_unfixed) if n_unfixed > 0 else 0.0
+        else:  # AND
+            if fixed_ids and unfixed_ids:
+                fixed_product = 1.0
+                for cid in fixed_ids:
+                    fv = by_id[cid]["fixedValue"]
+                    if fv and fv > 0:
+                        fixed_product *= fv
+                remainder = parent_val / fixed_product if fixed_product > 0 else parent_val
+                child_val = remainder ** (1.0 / n_unfixed) if n_unfixed > 0 else parent_val
+            else:
+                child_val = parent_val ** (1.0 / n_unfixed) if n_unfixed > 0 else parent_val
+
+        for cid in unfixed_ids:
+            child    = by_id[cid]
             existing = child.get("calculatedValue")
-
-            # Apply MAX rule for shared nodes — most conservative allocation wins
             if existing is None:
                 child["calculatedValue"] = child_val
             else:
                 child["calculatedValue"] = max(existing, child_val)
 
-            # Mark this parent as resolved for this child
+        for cid in child_ids:
             parents_resolved[cid] += 1
-
-            # Enqueue child only when ALL its parents have been resolved
-            # This guarantees the MAX has been fully computed before we propagate down
             total_parents = in_degree.get(cid, 0)
             if parents_resolved[cid] >= total_parents and cid not in resolved:
                 resolved.add(cid)
                 queue.append(cid)
 
-        processed += 1
-
-    # Safety: any unresolved nodes (disconnected, cycles) — leave calculatedValue=None
     return updated
 
-# ── Formatters ────────────────────────────────────────────────────────────
 def fmt(v):
     if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))): return "-"
     return f"{v:.3e}"
@@ -398,6 +365,8 @@ def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
             "color":     LEVEL_COLORS.get(n["type"], "#7e57c2"),
             "tcolor":    LEVEL_TEXT.get(n["type"], "#fff"),
             "isGroup":   n["type"] == "GROUP",
+            "isPinned":  n.get("fixedValue") is not None,
+            "fixedVal":  fmt(n.get("fixedValue")) if n.get("fixedValue") is not None else None,
         }
         for n in show_nodes
     })
@@ -486,7 +455,7 @@ svg#edges{{position:absolute;top:0;left:0;pointer-events:none;overflow:visible;}
     <div class="dc"><div class="dcl">TYPE</div><div class="dcv" id="dp-type"></div></div>
     <div class="dc"><div class="dcl">GATE</div><div class="dcv" id="dp-gate"></div></div>
     <div class="dc"><div class="dcl">VALUE</div><div class="dcv" id="dp-value"></div></div>
-    <div class="dc"><div class="dcl">NODE ID</div><div class="dcv" id="dp-nid" style="font-size:9px;"></div></div>
+    <div class="dc"><div class="dcl">NODE ID / PIN</div><div class="dcv" id="dp-nid" style="font-size:9px;"></div></div>
   </div>
   <div class="dr">
     <div class="ds"><div class="dsl">PARENTS</div><div class="dsv" id="dp-par"></div></div>
@@ -691,14 +660,17 @@ function selectNode(id){{
   p.style.display="block"; p.style.borderTopColor=node.color;
   document.getElementById("dp-title").innerHTML=
     `<span style="color:${{node.color}}">${{node.name}}</span>`+
-    (node.shared?' <span style="background:#f5c518;color:#111;font-size:8px;padding:1px 5px;border-radius:5px;font-weight:700;">SHARED</span>':'');
+    (node.shared?' <span style="background:#f5c518;color:#111;font-size:8px;padding:1px 5px;border-radius:5px;font-weight:700;">SHARED</span>':'')+
+    (node.isPinned?` <span style="background:#e94560;color:#fff;font-size:8px;padding:1px 5px;border-radius:5px;font-weight:700;">📌 FIXED ${node.fixedVal}</span>`:'');
   document.getElementById("dp-type").style.color=node.color;
   document.getElementById("dp-type").textContent=node.isGroup?"GROUP":node.type;
   document.getElementById("dp-gate").style.color=GCOLORS[node.gate]||"#aaa";
   document.getElementById("dp-gate").textContent=node.gate;
-  document.getElementById("dp-value").style.color=node.color;
-  document.getElementById("dp-value").textContent=node.value;
-  document.getElementById("dp-nid").textContent=node.nodeId||id;
+  document.getElementById("dp-value").style.color=node.isPinned?"#e94560":node.color;
+  document.getElementById("dp-value").textContent=node.isPinned?`${node.value} 📌`:`${node.value}`;
+  document.getElementById("dp-nid").innerHTML=
+    `<span style="color:#aaa;">${{node.nodeId||id}}</span>`+
+    (node.isPinned?`<br><span style="color:#e94560;font-size:8px;">pinned = ${{node.fixedVal}}</span>`:'');
   document.getElementById("dp-par").textContent=node.parents.join(" · ")||"(top event)";
   document.getElementById("dp-chi").textContent=node.childNames.join(" · ")||"(leaf node)";
 }}
@@ -746,6 +718,7 @@ function renderNodes(){{
     const gc=GCOLORS[node.gate]||"#aaa";
     const hasCh=(node.children||[]).length>0;
     const sb=node.shared?`<span style="background:#f5c518;color:#111;font-size:6px;padding:1px 3px;border-radius:3px;font-weight:700;margin-left:3px;">SHR</span>`:"";
+    const pb=node.isPinned?`<span style="background:#e94560;color:#fff;font-size:6px;padding:1px 3px;border-radius:3px;font-weight:700;margin-left:3px;" title="Fixed value: ${node.fixedVal}">📌PIN</span>`:"";
     const nid_badge=node.nodeId&&node.nodeId!==id?`<span style="font-size:6px;color:rgba(255,255,255,0.4);margin-left:2px;">${{node.nodeId}}</span>`:"";
     const nw=nodeW(id),nh=nodeH(id);
     const wrap=document.createElement("div");
@@ -770,13 +743,16 @@ function renderNodes(){{
           <div style="font-size:9px;font-weight:700;font-family:monospace;margin-top:2px;background:rgba(0,0,0,0.25);border-radius:3px;padding:1px 4px;">${{node.value}}</div>
         </div>${{colBtn}}`;
     }}else{{
+      // Pin styling: dashed border + slight overlay if pinned
+      const pinBorder = node.isPinned ? `border:2px dashed #e94560!important;` : `border-color:${{node.color}};`;
       wrap.innerHTML=`
-        <div class="fn" style="background:${{node.color}};color:${{node.tcolor}};border-color:${{node.color}};width:100%;">
-          <div style="font-size:7px;opacity:0.75;letter-spacing:1px;margin-bottom:2px;display:flex;align-items:center;justify-content:center;">
+        <div class="fn" style="background:${{node.color}};color:${{node.tcolor}};${{pinBorder}}width:100%;position:relative;">
+          ${{node.isPinned ? `<div style="position:absolute;top:0;right:0;background:#e94560;color:#fff;font-size:6px;font-weight:700;padding:1px 4px;border-radius:0 6px 0 4px;letter-spacing:0.5px;">📌 FIXED</div>` : ''}}
+          <div style="font-size:7px;opacity:0.75;letter-spacing:1px;margin-bottom:2px;display:flex;align-items:center;justify-content:center;padding-top:${{node.isPinned?'8px':'0'}};">
             ${{node.type}}${{sb}}${{nid_badge}}
           </div>
           <div style="font-size:10px;font-weight:700;text-align:center;word-break:break-word;margin-bottom:4px;line-height:1.3;">${{node.name}}</div>
-          <div style="background:rgba(0,0,0,0.26);border-radius:3px;padding:2px 5px;font-size:11px;font-weight:700;text-align:center;font-family:monospace;">${{node.value}}</div>
+          <div style="background:rgba(0,0,0,0.26);border-radius:3px;padding:2px 5px;font-size:11px;font-weight:700;text-align:center;font-family:monospace;">${{node.value}}${{node.isPinned?'<span style="font-size:7px;opacity:0.7;margin-left:3px;">📌</span>':''}}</div>
         </div>${{colBtn}}`;
     }}
     canvas.appendChild(wrap);
@@ -1092,6 +1068,15 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                                        help="GROUP = Combined Faults oval")
             gate        = st.radio("Gate", ["OR","AND"], horizontal=True, key="add_gate")
 
+            # Fixed value option
+            use_fixed  = st.checkbox("📌 Pin to fixed value", key="add_use_fixed",
+                                     help="Overrides calculated value. The engine will subtract this node's contribution from the parent budget and give the remainder to siblings. Use for negligible or known-value nodes.")
+            fixed_val_input = None
+            if use_fixed:
+                fixed_val_input = st.text_input("Fixed Value", placeholder="e.g. 1.67e-9 or 0",
+                                                key="add_fixed_val",
+                                                help="This node will always carry this exact failure rate regardless of tree distribution.")
+
             # Duplicate ID detection
             cid_clean = custom_id.strip()
             existing_with_id = [n for n in nodes if n.get("nodeId","") == cid_clean and cid_clean != ""]
@@ -1150,14 +1135,18 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                     if not node_name.strip(): st.error("Enter node name")
                     elif not sel_pids:        st.error("Select at least one parent")
                     else:
+                        fv = None
+                        if use_fixed and fixed_val_input:
+                            try:    fv = float(fixed_val_input)
+                            except: st.error("Fixed value must be a number e.g. 1.67e-9"); fv = None
                         nid = cid_clean if cid_clean and not any(n["id"]==cid_clean for n in nodes) else str(uuid.uuid4())[:7]
                         new_node = {"id": nid, "nodeId": cid_clean or nid,
                                     "name": node_name.strip(), "type": node_type, "gate": gate,
-                                    "targetValue": None, "calculatedValue": None, "parentIds": sel_pids}
-                        # Keep tree focused on the parent being worked on
+                                    "fixedValue": fv,
+                                    "targetValue": None, "calculatedValue": fv, "parentIds": sel_pids}
                         st.session_state.tree_state["focus_id"] = sel_pids[0] if sel_pids else nid
                         st.session_state.nodes_since_calc += 1
-                        set_nodes(nodes + [new_node])  # NO recalculate — user presses CALCULATE
+                        set_nodes(nodes + [new_node])
                         st.rerun()
 
             st.markdown("---")
@@ -1243,16 +1232,34 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                         new_type = "HAZARD"; new_pids = []
                         new_tgt  = st.text_input("Target Rate", value=str(en.get("targetValue","")), key="en_tgt")
 
+                    # ── Fixed value pin ──────────────────────────────────
+                    cur_fv     = en.get("fixedValue")
+                    en_use_fix = st.checkbox("📌 Pin to fixed value", value=(cur_fv is not None), key="en_use_fix",
+                                             help="Pin this node's rate. Siblings in the same OR gate receive the remainder of the parent budget.")
+                    en_fv_input = None
+                    if en_use_fix:
+                        en_fv_input = st.text_input("Fixed Value", value=str(cur_fv) if cur_fv is not None else "",
+                                                     placeholder="e.g. 1.67e-9 or 0", key="en_fv",
+                                                     help="e.g. 0 for negligible, or a known component rate")
+                    if cur_fv is not None and not en_use_fix:
+                        st.markdown(f"<div style='font-size:9px;color:#f5c518;'>📌 Currently pinned to <b>{fmt(cur_fv)}</b> — uncheck removes pin</div>",
+                                    unsafe_allow_html=True)
+
                     c1, c2 = st.columns(2)
                     with c1:
                         if st.button("💾 APPLY", use_container_width=True, type="primary"):
+                            new_fv = None
+                            if en_use_fix and en_fv_input is not None:
+                                try:    new_fv = float(en_fv_input)
+                                except: new_fv = None
                             upd = []
                             for n in nodes:
                                 if n["id"] == eid:
                                     n = dict(n)
-                                    n["name"]   = new_name.strip() or n["name"]
-                                    n["gate"]   = new_gate
-                                    n["nodeId"] = new_node_id.strip() or n.get("nodeId", n["id"])
+                                    n["name"]       = new_name.strip() or n["name"]
+                                    n["gate"]       = new_gate
+                                    n["nodeId"]     = new_node_id.strip() or n.get("nodeId", n["id"])
+                                    n["fixedValue"] = new_fv
                                     if n["type"] != "HAZARD":
                                         n["type"]      = new_type
                                         n["parentIds"] = new_pids
@@ -1264,7 +1271,7 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                                 upd.append(n)
                             st.session_state.tree_state["focus_id"] = eid
                             st.session_state.nodes_since_calc += 1
-                            set_nodes(upd)  # no auto-recalc
+                            set_nodes(upd)
                             st.success("Updated. Press CALCULATE to refresh values.")
                             st.rerun()
                     with c2:
@@ -1450,20 +1457,26 @@ with tab_vals:
             color = LEVEL_COLORS[level]
             st.markdown(f"<div style='font-size:9px;letter-spacing:3px;color:{color};border-bottom:1px solid {color}33;padding-bottom:3px;margin:12px 0 5px;'>{level} — {len(lvl_nodes)} nodes</div>", unsafe_allow_html=True)
             for node in lvl_nodes:
-                pnames = " · ".join(by_id[p]["name"] for p in (node.get("parentIds") or []) if p in by_id) or "—"
-                cnames = " · ".join(n["name"] for n in nodes if node["id"] in (n.get("parentIds") or [])) or "—"
+                pnames    = " · ".join(by_id[p]["name"] for p in (node.get("parentIds") or []) if p in by_id) or "—"
+                cnames    = " · ".join(n["name"] for n in nodes if node["id"] in (n.get("parentIds") or [])) or "—"
                 is_shared = len(node.get("parentIds") or []) > 1
-                gc = "#4fc3f7" if node["gate"] == "OR" else "#ffb74d"
+                is_pinned = node.get("fixedValue") is not None
+                gc        = "#4fc3f7" if node["gate"] == "OR" else "#ffb74d"
+                val_color = "#e94560" if is_pinned else color
+                val_str   = fmt(node.get("calculatedValue"))
+                val_display = f"{val_str} 📌" if is_pinned else val_str
+                pin_note  = f'<div style="font-size:8px;color:#e94560;">📌 FIXED = {fmt(node.get("fixedValue"))}</div>' if is_pinned else ''
                 st.markdown(f"""
-                <div style="background:#141414;border:1px solid #222;border-radius:5px;padding:7px 11px;margin-bottom:3px;
+                <div style="background:#141414;border:1px solid {'#e9456044' if is_pinned else '#222'};border-radius:5px;padding:7px 11px;margin-bottom:3px;
                             display:grid;grid-template-columns:2fr 1fr 1fr 2fr 2fr;gap:8px;align-items:center;">
                   <div>
                     <div style="font-weight:700;font-size:11px;color:#ddd;">{node['name']}</div>
                     {'<div style="font-size:8px;color:#f5c518;">◈ SHARED</div>' if is_shared else ''}
+                    {pin_note}
                   </div>
                   <div style="font-size:9px;color:{color};font-weight:700;">{node['type']}</div>
                   <div style="font-size:9px;color:{gc};font-weight:700;">{node['gate']}</div>
-                  <div style="font-size:10px;color:{color};font-weight:700;font-family:monospace;">{fmt(node.get('calculatedValue'))}</div>
+                  <div style="font-size:10px;color:{val_color};font-weight:700;font-family:monospace;">{val_display}</div>
                   <div style="font-size:9px;color:#555;">↑ {pnames}<br>↓ {cnames}</div>
                 </div>""", unsafe_allow_html=True)
 
@@ -1508,6 +1521,8 @@ with tab_search:
                     cnames    = " · ".join(n["name"] for n in nodes if node["id"] in (n.get("parentIds") or [])) or "—"
                     is_shared = len(node.get("parentIds") or []) > 1
                     is_group  = node["type"] == "GROUP"
+                    is_pinned = node.get("fixedValue") is not None
+                    val_color = "#e94560" if is_pinned else color
 
                     # Highlight matched text in name
                     display_name = node["name"]
@@ -1520,8 +1535,9 @@ with tab_search:
                         pass
 
                     shape_style = "border-radius:50px;" if is_group else "border-radius:6px;"
+                    pin_border  = "border:2px solid #e94560;" if is_pinned else f"border:2px solid {color}55;"
                     st.markdown(f"""
-                    <div style="background:#141414;border:2px solid {color}55;{shape_style}
+                    <div style="background:#141414;{pin_border}{shape_style}
                                 padding:9px 14px;margin-bottom:5px;
                                 display:grid;grid-template-columns:2.5fr 0.8fr 0.8fr 1.5fr 2.5fr;gap:10px;align-items:center;">
                       <div>
@@ -1529,10 +1545,11 @@ with tab_search:
                         <div style="font-size:8px;color:#555;margin-top:1px;">id: {node['id']}</div>
                         {'<div style="font-size:8px;color:#f5c518;">◈ SHARED</div>' if is_shared else ''}
                         {'<div style="font-size:8px;color:#7e57c2;">◉ GROUP (Combined Faults)</div>' if is_group else ''}
+                        {f'<div style="font-size:8px;color:#e94560;">📌 FIXED = {fmt(node.get("fixedValue"))}</div>' if is_pinned else ''}
                       </div>
                       <div style="font-size:9px;color:{color};font-weight:700;">{node['type']}</div>
                       <div style="font-size:9px;color:{gc};font-weight:700;">{node['gate']}</div>
-                      <div style="font-size:10px;color:{color};font-weight:700;font-family:monospace;">{val}</div>
+                      <div style="font-size:10px;color:{val_color};font-weight:700;font-family:monospace;">{val}{'📌' if is_pinned else ''}</div>
                       <div style="font-size:9px;color:#555;">↑ {pnames}<br>↓ {cnames}</div>
                     </div>""", unsafe_allow_html=True)
         else:
