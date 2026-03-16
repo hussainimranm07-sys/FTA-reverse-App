@@ -377,16 +377,12 @@ def export_excel(nodes):
 # ── Tree HTML builder ─────────────────────────────────────────────────────
 def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
     """
-    D3-force interactive fault tree.
-    - Force simulation: nodes repel, edges attract, gravity towards hazard top
-    - Toggle force on/off (free drag mode when off)
-    - Click node: highlight all direct parents + children (connected nodes)
-    - Double-click: expand/collapse subtree
-    - Right-drag: pan  |  Scroll: zoom  |  Left-drag: move node
-    - Tree state (positions, zoom, pan) never resets unless data changes
+    Top-down layered fault tree with optional D3 force.
+    Default: strict layer layout  HAZARD → SF → FF/GROUP → IF
+    Force ON: physics relaxes positions while keeping layer gravity
     """
     if not nodes: return ""
-    import json as _json, hashlib
+    import json as _json
 
     by_id = {n["id"]: n for n in nodes}
 
@@ -405,19 +401,17 @@ def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
 
     if not show_nodes: return ""
 
-    shown_ids = {n["id"] for n in show_nodes}
+    shown_ids  = {n["id"] for n in show_nodes}
     shared_ids = {n["id"] for n in show_nodes
                   if len([p for p in (n.get("parentIds") or []) if p in shown_ids]) > 1}
 
-    ts            = tree_state or {}
-    init_scale    = ts.get("scale", 0.9)
-    init_tx       = ts.get("tx", 0)
-    init_ty       = ts.get("ty", 0)
+    ts             = tree_state or {}
     init_positions = ts.get("positions", {})
-    focus_id      = ts.get("focus_id")
+    focus_id       = ts.get("focus_id")
 
-    # Level ordering for Y gravity
-    LEVEL_Y = {"HAZARD": 0, "SF": 1, "FF": 2, "GROUP": 2.5, "IF": 3}
+    # Level → row index (0 = top)
+    LEVEL_ROW = {"HAZARD": 0, "SF": 1, "FF": 2, "GROUP": 2, "IF": 3}
+    LEVEL_LABEL = {0: "HAZARD", 1: "SF", 2: "FF / GROUP", 3: "IF"}
 
     nodes_js = _json.dumps([{
         "id":       n["id"],
@@ -432,7 +426,7 @@ def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
         "isGroup":  n["type"] == "GROUP",
         "color":    LEVEL_COLORS.get(n["type"], "#7e57c2"),
         "tcolor":   LEVEL_TEXT.get(n["type"], "#fff"),
-        "levelY":   LEVEL_Y.get(n["type"], 2),
+        "row":      LEVEL_ROW.get(n["type"], 2),
         "parents":  [p for p in (n.get("parentIds") or []) if p in shown_ids],
         "pnames":   [by_id[p]["name"] for p in (n.get("parentIds") or []) if p in shown_ids],
         "children": [c["id"] for c in show_nodes if n["id"] in (c.get("parentIds") or [])],
@@ -442,95 +436,136 @@ def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
     links_js = _json.dumps([
         {"source": pid, "target": n["id"],
          "andGate": by_id[pid]["gate"] == "AND" if pid in by_id else False,
-         "shared": n["id"] in shared_ids}
+         "shared":  n["id"] in shared_ids}
         for n in show_nodes
         for pid in (n.get("parentIds") or [])
         if pid in shown_ids
     ])
 
-    init_pos_js  = _json.dumps(init_positions)
-    focus_js     = f'"{focus_id}"' if focus_id else "null"
+    init_pos_js = _json.dumps(init_positions)
+    focus_js    = f'"{focus_id}"' if focus_id else "null"
+    level_labels_js = _json.dumps(LEVEL_LABEL)
 
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style>
 *{{box-sizing:border-box;margin:0;padding:0;}}
-body{{background:#0a0a0a;font-family:'JetBrains Mono','Fira Code',monospace;color:#e0e0e0;
-      overflow:hidden;height:100vh;display:flex;flex-direction:column;}}
-#toolbar{{display:flex;align-items:center;gap:5px;flex-wrap:wrap;padding:5px 10px;
-          background:#111;border-bottom:1px solid #1e1e1e;flex-shrink:0;font-size:10px;
-          color:#555;user-select:none;}}
-.tb-btn{{background:#1a1a1a;border:1px solid #2a2a2a;color:#aaa;border-radius:4px;
-         padding:3px 9px;cursor:pointer;font-family:inherit;font-size:10px;
-         transition:all 0.1s;white-space:nowrap;}}
-.tb-btn:hover{{background:#252525;color:#fff;border-color:#555;}}
+body{{background:#0a0a0a;font-family:'JetBrains Mono','Fira Code',monospace;
+      color:#e0e0e0;overflow:hidden;height:100vh;display:flex;flex-direction:column;}}
+
+/* ── Toolbar ── */
+#toolbar{{
+  display:flex;align-items:center;gap:8px;flex-wrap:nowrap;
+  padding:8px 14px;background:#111;border-bottom:2px solid #1a1a1a;
+  flex-shrink:0;user-select:none;min-height:46px;
+}}
+.tb-sep{{width:1px;height:22px;background:#2a2a2a;flex-shrink:0;}}
+.tb-btn{{
+  background:#1c1c1c;border:1.5px solid #333;color:#ccc;
+  border-radius:6px;padding:5px 13px;cursor:pointer;
+  font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;
+  letter-spacing:0.5px;transition:all 0.12s;white-space:nowrap;
+  flex-shrink:0;height:30px;display:flex;align-items:center;gap:5px;
+}}
+.tb-btn:hover{{background:#2a2a2a;color:#fff;border-color:#666;}}
 .tb-btn.active{{background:#e94560;border-color:#e94560;color:#fff;}}
-#zoom-lbl{{color:#555;min-width:38px;text-align:center;}}
-#search-box{{background:#1a1a1a;border:1px solid #2a2a2a;color:#ccc;border-radius:4px;
-             padding:3px 8px;font-family:inherit;font-size:10px;width:150px;outline:none;}}
-#search-box:focus{{border-color:#e94560;}}
+.tb-btn.active:hover{{background:#c73350;}}
+#zoom-lbl{{color:#666;font-size:11px;font-family:'JetBrains Mono',monospace;
+           min-width:44px;text-align:center;font-weight:700;}}
+#search-wrap{{display:flex;align-items:center;gap:5px;flex:1;max-width:280px;}}
+#search-box{{
+  background:#1c1c1c;border:1.5px solid #333;color:#ccc;border-radius:6px;
+  padding:5px 10px;font-family:'JetBrains Mono',monospace;font-size:11px;
+  outline:none;flex:1;height:30px;
+}}
+#search-box:focus{{border-color:#e94560;color:#fff;}}
 #search-box::placeholder{{color:#444;}}
-#srch-info{{color:#666;font-size:9px;min-width:55px;}}
-#hint{{color:#252525;font-size:9px;margin-left:4px;flex:1;text-align:right;}}
+#srch-info{{color:#666;font-size:10px;min-width:60px;font-family:'JetBrains Mono',monospace;}}
+
+/* ── Canvas ── */
+#canvas-wrap{{flex:1;position:relative;overflow:hidden;background:#0a0a0a;}}
 svg#tree{{position:absolute;top:0;left:0;width:100%;height:100%;}}
-#dp{{position:fixed;bottom:0;left:0;right:0;background:#141414f2;
-     border-top:2px solid #333;padding:7px 14px 9px;display:none;
-     backdrop-filter:blur(10px);z-index:200;}}
-.dg{{display:grid;grid-template-columns:repeat(5,1fr);gap:5px;margin:5px 0 4px;}}
-.dc{{background:#0a0a0a;border-radius:5px;padding:5px;text-align:center;}}
-.dcl{{font-size:7px;color:#555;letter-spacing:2px;margin-bottom:2px;}}
-.dcv{{font-size:11px;font-weight:700;}}
-.dr{{display:grid;grid-template-columns:1fr 1fr;gap:5px;}}
-.ds{{background:#0a0a0a;border-radius:5px;padding:5px;}}
-.dsl{{font-size:7px;color:#555;letter-spacing:2px;margin-bottom:2px;}}
-.dsv{{font-size:10px;color:#ccc;line-height:1.4;}}
-#dp-close{{position:absolute;top:6px;right:10px;background:none;border:none;
-            color:#555;font-size:15px;cursor:pointer;}}
-#dp-close:hover{{color:#fff;}}
+
+/* ── Lane labels ── */
+.lane-label{{
+  font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:700;
+  letter-spacing:2px;opacity:0.35;pointer-events:none;
+}}
+.lane-line{{stroke:#ffffff08;stroke-width:1;pointer-events:none;}}
+
+/* ── Detail panel ── */
+#dp{{
+  position:absolute;bottom:0;left:0;right:0;background:#111e;
+  border-top:2px solid #333;padding:8px 16px 10px;display:none;
+  backdrop-filter:blur(12px);z-index:200;
+}}
+.dg{{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin:5px 0 5px;}}
+.dc{{background:#0a0a0a;border-radius:6px;padding:6px;text-align:center;}}
+.dcl{{font-size:7px;color:#555;letter-spacing:2px;margin-bottom:2px;font-weight:700;}}
+.dcv{{font-size:12px;font-weight:700;}}
+.dr{{display:grid;grid-template-columns:1fr 1fr;gap:6px;}}
+.ds{{background:#0a0a0a;border-radius:6px;padding:6px;}}
+.dsl{{font-size:7px;color:#555;letter-spacing:2px;margin-bottom:2px;font-weight:700;}}
+.dsv{{font-size:10px;color:#ccc;line-height:1.5;}}
+#dp-close{{position:absolute;top:8px;right:12px;background:none;border:none;
+           color:#555;font-size:16px;cursor:pointer;padding:2px 6px;}}
+#dp-close:hover{{color:#fff;background:#222;border-radius:4px;}}
 </style>
 </head><body>
+
 <div id="toolbar">
-  <button class="tb-btn" onclick="zoomBy(0.15)">＋</button>
-  <button class="tb-btn" onclick="zoomBy(-0.15)">－</button>
-  <span id="zoom-lbl">90%</span>
-  <span style="color:#2a2a2a">|</span>
-  <button class="tb-btn" id="btn-force" onclick="toggleForce()" title="Toggle physics simulation">⚡ Force</button>
-  <button class="tb-btn" onclick="resetLayout()" title="Re-run layout from scratch">↺ Layout</button>
-  <button class="tb-btn" onclick="fitView()" title="Fit all nodes in view">⊡ Fit</button>
-  <button class="tb-btn" onclick="clearHL()" title="Clear selection">✕ Clear</button>
-  <span style="color:#2a2a2a">|</span>
-  <input id="search-box" type="text" placeholder="Search nodes…" oninput="doSearch(this.value)"/>
-  <button class="tb-btn" onclick="searchNext()">▼</button>
-  <button class="tb-btn" onclick="searchPrev()">▲</button>
-  <span id="srch-info"></span>
-  <span id="hint">Scroll=zoom · Right-drag=pan · Left-drag=move · Click=inspect · Dbl-click=expand/collapse</span>
+  <!-- Zoom -->
+  <button class="tb-btn" onclick="zoomBy(0.2)">＋</button>
+  <button class="tb-btn" onclick="zoomBy(-0.2)">－</button>
+  <span id="zoom-lbl">85%</span>
+  <div class="tb-sep"></div>
+  <!-- Layout -->
+  <button class="tb-btn" id="btn-layers" onclick="applyLayerLayout(true)" title="Reset to strict top-down layers">⊞ Layers</button>
+  <button class="tb-btn" onclick="fitView()" title="Fit all in view">⊡ Fit</button>
+  <button class="tb-btn" id="btn-force" onclick="toggleForce()" title="Toggle physics force">⚡ Force</button>
+  <div class="tb-sep"></div>
+  <!-- Selection -->
+  <button class="tb-btn" onclick="clearHL()">✕ Clear</button>
+  <div class="tb-sep"></div>
+  <!-- Search -->
+  <div id="search-wrap">
+    <input id="search-box" type="text" placeholder="Search nodes…" oninput="doSearch(this.value)"/>
+    <button class="tb-btn" onclick="searchPrev()">▲</button>
+    <button class="tb-btn" onclick="searchNext()">▼</button>
+    <span id="srch-info"></span>
+  </div>
 </div>
+
+<div id="canvas-wrap">
 <svg id="tree">
   <defs>
-    <marker id="arr" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
-      <path d="M0,0 L6,3 L0,6 Z" fill="#2a2a2a"/>
+    <marker id="arr"    markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 Z" fill="#333"/>
     </marker>
-    <marker id="arr-hl" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
-      <path d="M0,0 L6,3 L0,6 Z" fill="#4fc3f7"/>
+    <marker id="arr-hl" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 Z" fill="#4fc3f7"/>
     </marker>
-    <marker id="arr-sh" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
-      <path d="M0,0 L6,3 L0,6 Z" fill="#f5c51888"/>
+    <marker id="arr-sh" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 Z" fill="#f5c518aa"/>
     </marker>
   </defs>
   <g id="zoom-layer">
+    <g id="lanes-layer"></g>
     <g id="links-layer"></g>
     <g id="nodes-layer"></g>
   </g>
 </svg>
+</div>
+
 <div id="dp">
   <button id="dp-close" onclick="closeDP()">✕</button>
-  <div style="font-size:8px;color:#888;letter-spacing:3px;margin-bottom:2px;">SELECTED NODE</div>
-  <div id="dp-title" style="font-size:13px;font-weight:700;margin-bottom:3px;"></div>
+  <div style="font-size:8px;color:#888;letter-spacing:3px;margin-bottom:3px;">SELECTED NODE</div>
+  <div id="dp-title" style="font-size:14px;font-weight:700;margin-bottom:4px;"></div>
   <div class="dg">
     <div class="dc"><div class="dcl">TYPE</div><div class="dcv" id="dp-type"></div></div>
     <div class="dc"><div class="dcl">GATE</div><div class="dcv" id="dp-gate"></div></div>
     <div class="dc"><div class="dcl">VALUE</div><div class="dcv" id="dp-value"></div></div>
-    <div class="dc"><div class="dcl">NODE ID</div><div class="dcv" id="dp-nid" style="font-size:9px;"></div></div>
+    <div class="dc"><div class="dcl">NODE ID</div><div class="dcv" id="dp-nid" style="font-size:10px;"></div></div>
     <div class="dc"><div class="dcl">SHARED</div><div class="dcv" id="dp-shared"></div></div>
   </div>
   <div class="dr">
@@ -541,504 +576,503 @@ svg#tree{{position:absolute;top:0;left:0;width:100%;height:100%;}}
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
 <script>
-// ── Data ──────────────────────────────────────────────────────────────
-const RAW_NODES = {nodes_js};
-const RAW_LINKS = {links_js};
-const INIT_POS  = {init_pos_js};
-const FOCUS_ID  = {focus_js};
-const GCOLORS   = {{OR:"#4fc3f7", AND:"#ffb74d"}};
-const NW = 148, NH = 80;  // node box dimensions
+// ── Constants ─────────────────────────────────────────────────────────
+const RAW_NODES   = {nodes_js};
+const RAW_LINKS   = {links_js};
+const INIT_POS    = {init_pos_js};
+const FOCUS_ID    = {focus_js};
+const LEVEL_LABELS= {level_labels_js};
+const GCOLORS     = {{OR:"#4fc3f7", AND:"#ffb74d"}};
+const NW=150, NH=82, HGAP=30, VGAP=160;  // node size + gaps
+const LANE_X=58;   // left margin for lane labels
 
 // ── State ─────────────────────────────────────────────────────────────
-let forceOn     = true;
-let selId       = null;
-let collapsed   = new Set();
-let searchMatches = [], searchIdx = 0;
-let transform   = d3.zoomIdentity.scale({init_scale}).translate({init_tx}/{init_scale}, {init_ty}/{init_scale});
+let forceOn   = false;   // OFF by default — layered layout
+let selId     = null;
+let collapsed = new Set();
+let searchMatches=[], searchIdx=0;
 
-// Build node/link maps
-const nodeMap = {{}};
-RAW_NODES.forEach(n => nodeMap[n.id] = n);
+const nodeMap={{}};
+RAW_NODES.forEach(n=>nodeMap[n.id]=n);
 
-// ── SVG setup ─────────────────────────────────────────────────────────
+// ── SVG / zoom ─────────────────────────────────────────────────────────
+const canvasWrap = document.getElementById("canvas-wrap");
 const svg    = d3.select("svg#tree");
 const zoomG  = svg.select("#zoom-layer");
+const lanesG = svg.select("#lanes-layer");
 const linksG = svg.select("#links-layer");
 const nodesG = svg.select("#nodes-layer");
 
-const zoom = d3.zoom()
-  .scaleExtent([0.05, 4])
-  .filter(e => e.button === 2 || e.type === "wheel")
+const zoomBeh = d3.zoom()
+  .scaleExtent([0.04, 5])
+  .filter(e => e.button===2 || e.type==="wheel")
   .on("zoom", e => {{
-    transform = e.transform;
-    zoomG.attr("transform", transform);
-    document.getElementById("zoom-lbl").textContent = Math.round(transform.k * 100) + "%";
+    zoomG.attr("transform", e.transform);
+    document.getElementById("zoom-lbl").textContent=Math.round(e.transform.k*100)+"%";
   }});
 
-svg.call(zoom)
-   .call(zoom.transform, transform)
-   .on("contextmenu", e => e.preventDefault());
+svg.call(zoomBeh).on("contextmenu", e=>e.preventDefault());
+svg.on("click", ()=>closeDP());
 
-// ── Force simulation ──────────────────────────────────────────────────
-function getVisible() {{
-  const hidden = new Set();
-  collapsed.forEach(cid => {{
-    // collect descendants
-    const q = [cid];
-    while (q.length) {{
-      const cur = q.shift();
-      nodeMap[cur]?.children?.forEach(ch => {{
-        if (!hidden.has(ch)) {{ hidden.add(ch); q.push(ch); }}
-      }});
+// ── Layered layout ─────────────────────────────────────────────────────
+function computeLayerLayout() {{
+  // Group visible nodes by row
+  const visible = getVisible();
+  const byRow={{}};
+  visible.forEach(n=>{{(byRow[n.row]||(byRow[n.row]=[])).push(n);}});
+
+  const W = canvasWrap.getBoundingClientRect().width  || 1200;
+  const rows = Object.keys(byRow).map(Number).sort((a,b)=>a-b);
+
+  rows.forEach(row=>{{
+    const group = byRow[row];
+    const count = group.length;
+    // Sort by parent x position for cleaner edges
+    group.sort((a,b)=>{{
+      const ax=group.find(n=>n.id===a.id)?.x||0;
+      return (a.parents[0]||"").localeCompare(b.parents[0]||"");
+    }});
+    group.forEach((n,i)=>{{
+      const saved = INIT_POS[n.id];
+      if(saved && !forceOn) {{
+        n.x = saved.x; n.y = saved.y;
+      }} else {{
+        // Distribute evenly across width
+        const totalW = count * NW + (count-1) * HGAP;
+        const startX = LANE_X + Math.max(0, (W - totalW)/2);
+        n.x = startX + i*(NW+HGAP) + NW/2;
+        n.y = 60 + row * VGAP;
+      }}
+      n.fx = forceOn ? null : n.x;
+      n.fy = forceOn ? null : n.y;
+    }});
+  }});
+}}
+
+// ── Lane background lines + labels ─────────────────────────────────────
+function renderLanes() {{
+  lanesG.selectAll("*").remove();
+  const visible = getVisible();
+  const byRow={{}};
+  visible.forEach(n=>{{(byRow[n.row]||(byRow[n.row]=[])).push(n);}});
+  const rows = Object.keys(byRow).map(Number).sort((a,b)=>a-b);
+
+  rows.forEach(row=>{{
+    const y = 60 + row * VGAP;
+    const W = canvasWrap.getBoundingClientRect().width || 1200;
+    // Lane separator line (above each row except first)
+    if(row>0) {{
+      lanesG.append("line")
+        .attr("class","lane-line")
+        .attr("x1",0).attr("x2",W*3)
+        .attr("y1",y-VGAP/2).attr("y2",y-VGAP/2);
     }}
+    // Lane label on left
+    const label = LEVEL_LABELS[row]||"";
+    const colMap = {{0:"#ff4d4d",1:"#ff8c42",2:"#f5c518",3:"#4caf7d"}};
+    lanesG.append("text")
+      .attr("class","lane-label")
+      .attr("x",8).attr("y",y+5)
+      .attr("fill",colMap[row]||"#888")
+      .text(label);
+    // Colored left border stripe
+    lanesG.append("rect")
+      .attr("x",0).attr("y",y-VGAP/2+1)
+      .attr("width",3).attr("height",VGAP-2)
+      .attr("fill",colMap[row]||"#333")
+      .attr("opacity",0.5)
+      .attr("pointer-events","none");
   }});
-  return RAW_NODES.filter(n => !hidden.has(n.id));
 }}
 
-function getVisibleLinks(visibleIds) {{
-  const s = new Set(visibleIds);
-  return RAW_LINKS.filter(l => s.has(l.source.id||l.source) && s.has(l.target.id||l.target));
-}}
-
-let simNodes = [], simLinks = [];
+// ── Simulation ─────────────────────────────────────────────────────────
+let simNodes=[], simLinks=[];
 
 const simulation = d3.forceSimulation()
-  .force("link", d3.forceLink().id(d => d.id).distance(120).strength(0.6))
-  .force("charge", d3.forceManyBody().strength(-600).distanceMax(500))
-  .force("collide", d3.forceCollide(95))
-  .force("x", d3.forceX(d => {{
-    // Spread nodes horizontally by their index among same-level nodes
-    const sameLevel = simNodes.filter(n => n.levelY === d.levelY);
-    const idx = sameLevel.indexOf(d);
-    const total = sameLevel.length;
-    const svgW = svg.node().getBoundingClientRect().width || 1200;
-    return (idx + 0.5) / total * svgW;
-  }}).strength(0.08))
-  .force("y", d3.forceY(d => {{
-    const svgH = svg.node().getBoundingClientRect().height || 700;
-    return (d.levelY / 3.5) * (svgH * 0.85) + 40;
-  }}).strength(0.35))
-  .alphaDecay(0.025)
-  .velocityDecay(0.4)
+  .force("link",    d3.forceLink().id(d=>d.id).distance(120).strength(0.5))
+  .force("charge",  d3.forceManyBody().strength(-500).distanceMax(400))
+  .force("collide", d3.forceCollide(85))
+  .force("y",       d3.forceY(d=>60+d.row*VGAP).strength(0.6))  // strong layer gravity
+  .force("x",       d3.forceX(d=>d.x||400).strength(0.05))
+  .alphaDecay(0.03).velocityDecay(0.45)
   .on("tick", ticked);
 
-function initSimulation() {{
+simulation.stop(); // stopped by default
+
+// ── Visibility / collapse ──────────────────────────────────────────────
+function getVisible() {{
+  const hidden=new Set();
+  collapsed.forEach(cid=>descendantsOf(cid).forEach(d=>hidden.add(d)));
+  return RAW_NODES.filter(n=>!hidden.has(n.id));
+}}
+function descendantsOf(id) {{
+  const r=new Set(),q=[id];
+  while(q.length){{
+    const cur=q.shift();
+    (nodeMap[cur]?.children||[]).forEach(ch=>{{if(!r.has(ch)){{r.add(ch);q.push(ch);}}}});
+  }}
+  return r;
+}}
+
+// ── Init / re-render ───────────────────────────────────────────────────
+function initAll() {{
   const visible = getVisible();
-  simNodes = visible.map(n => {{
-    const saved = INIT_POS[n.id];
-    const existing = simNodes.find(s => s.id === n.id);
-    const svgW = svg.node().getBoundingClientRect().width || 1200;
-    const svgH = svg.node().getBoundingClientRect().height || 700;
-    return Object.assign(n, {{
-      x: saved?.x ?? existing?.x ?? (Math.random() * svgW),
-      y: saved?.y ?? existing?.y ?? (n.levelY / 3.5 * svgH * 0.85 + 40),
-      vx: 0, vy: 0,
-      fx: saved?.fx ?? null,
-      fy: saved?.fy ?? null,
+  const existingById={{}};
+  simNodes.forEach(n=>existingById[n.id]=n);
+
+  simNodes = visible.map(n=>{{
+    const ex = existingById[n.id];
+    return Object.assign({{...n}}, {{
+      x: ex?.x ?? (INIT_POS[n.id]?.x) ?? null,
+      y: ex?.y ?? (INIT_POS[n.id]?.y) ?? null,
+      vx:0, vy:0, fx:null, fy:null
     }});
   }});
 
-  const visIds = new Set(simNodes.map(n => n.id));
+  const visSet=new Set(simNodes.map(n=>n.id));
   simLinks = RAW_LINKS
-    .filter(l => visIds.has(l.source.id||l.source) && visIds.has(l.target.id||l.target))
-    .map(l => ({{...l}}));
+    .filter(l=>visSet.has(l.source?.id||l.source) && visSet.has(l.target?.id||l.target))
+    .map(l=>({{...l}}));
 
   simulation.nodes(simNodes);
   simulation.force("link").links(simLinks);
 
-  if (!forceOn) simulation.stop();
-  else simulation.alpha(0.3).restart();
-
+  computeLayerLayout();
+  renderLanes();
   renderLinks();
   renderNodes();
+  ticked();
+
+  if(forceOn) simulation.alpha(0.5).restart();
 }}
 
-// ── Render links ──────────────────────────────────────────────────────
-function renderLinks() {{
-  const sel = linksG.selectAll("line.link").data(simLinks, d =>
-    (d.source.id||d.source) + "--" + (d.target.id||d.target));
+// ── Apply strict layer layout ──────────────────────────────────────────
+function applyLayerLayout(animate) {{
+  if(forceOn) {{ toggleForce(); }}   // turn force off
+  // Clear saved positions so layout recalculates
+  simNodes.forEach(n=>{{n.fx=null;n.fy=null;}});
+  computeLayerLayout();
+  simNodes.forEach(n=>{{n.fx=n.x;n.fy=n.y;}});
+  ticked();
+  renderLanes();
+  setTimeout(()=>fitView(), 50);
+}}
 
-  sel.enter().append("line")
-    .attr("class", "link")
-    .attr("stroke-width", d => d.shared ? 1 : 1.8)
-    .attr("stroke-dasharray", d => d.andGate ? "6,3" : (d.shared ? "3,5" : null))
-    .attr("opacity", d => d.shared ? 0.45 : 0.85)
-    .attr("marker-end", d => d.shared ? "url(#arr-sh)" : "url(#arr)")
+// ── Toggle force ───────────────────────────────────────────────────────
+function toggleForce() {{
+  forceOn=!forceOn;
+  const btn=document.getElementById("btn-force");
+  if(forceOn){{
+    btn.classList.add("active"); btn.textContent="⚡ Force ON";
+    simNodes.forEach(n=>{{n.fx=null;n.fy=null;}});
+    simulation.alpha(0.4).restart();
+  }}else{{
+    btn.classList.remove("active"); btn.textContent="⚡ Force";
+    simulation.stop();
+    simNodes.forEach(n=>{{n.fx=n.x;n.fy=n.y;}});
+  }}
+}}
+
+// ── Render links ───────────────────────────────────────────────────────
+function renderLinks(){{
+  const sel=linksG.selectAll("path.link").data(simLinks,
+    d=>(d.source?.id||d.source)+"--"+(d.target?.id||d.target));
+
+  sel.enter().append("path")
+    .attr("class","link")
+    .attr("fill","none")
+    .attr("stroke-width", d=>d.shared?1.2:2)
+    .attr("stroke-dasharray", d=>d.andGate?"8,4": d.shared?"4,6":null)
+    .attr("opacity", d=>d.shared?0.5:0.9)
+    .attr("marker-end","url(#arr)")
     .merge(sel);
 
   sel.exit().remove();
 }}
 
-// ── Render nodes ──────────────────────────────────────────────────────
-function renderNodes() {{
-  const sel = nodesG.selectAll("g.node-g").data(simNodes, d => d.id);
-
-  const entered = sel.enter().append("g")
-    .attr("class", "node-g")
-    .attr("cursor", "grab")
-    .on("click", (e, d) => {{ e.stopPropagation(); selectNode(d.id); }})
-    .on("dblclick", (e, d) => {{ e.stopPropagation(); toggleCollapse(d.id); }})
+// ── Render nodes ───────────────────────────────────────────────────────
+function renderNodes(){{
+  const sel=nodesG.selectAll("g.node-g").data(simNodes,d=>d.id);
+  const entered=sel.enter().append("g")
+    .attr("class","node-g")
+    .style("cursor","grab")
+    .on("click",(e,d)=>{{e.stopPropagation();selectNode(d.id);}})
+    .on("dblclick",(e,d)=>{{e.stopPropagation();toggleCollapse(d.id);}})
     .call(d3.drag()
-      .filter(e => e.button === 0)
-      .on("start", (e, d) => {{
+      .filter(e=>e.button===0)
+      .on("start",(e,d)=>{{
         e.sourceEvent.stopPropagation();
-        if (!e.active && forceOn) simulation.alphaTarget(0.05).restart();
-        d.fx = d.x; d.fy = d.y;
+        if(!e.active&&forceOn) simulation.alphaTarget(0.05).restart();
+        d.fx=d.x;d.fy=d.y;
       }})
-      .on("drag", (e, d) => {{ d.fx = e.x; d.fy = e.y; }})
-      .on("end", (e, d) => {{
-        if (!e.active && forceOn) simulation.alphaTarget(0);
-        // Keep position pinned only if force is off
-        if (forceOn) {{ d.fx = null; d.fy = null; }}
-        savePositions();
+      .on("drag",(e,d)=>{{d.fx=e.x;d.fy=e.y;}})
+      .on("end",(e,d)=>{{
+        if(!e.active&&forceOn) simulation.alphaTarget(0);
+        if(forceOn){{d.fx=null;d.fy=null;}}
       }})
     );
 
-  // Background rect (for GROUP: oval via rx/ry; else rectangle)
+  // Node background
   entered.append("rect")
-    .attr("class", "node-rect")
-    .attr("width",  d => d.isGroup ? 120 : NW)
-    .attr("height", d => d.isGroup ? 64  : NH)
-    .attr("x",      d => d.isGroup ? -60 : -NW/2)
-    .attr("y",      d => d.isGroup ? -32 : -NH/2)
-    .attr("rx",     d => d.isGroup ? 60  : 8)
-    .attr("ry",     d => d.isGroup ? 32  : 8)
-    .attr("fill",   d => d.color)
-    .attr("stroke", d => d.isPinned ? "#e94560" : d.color)
-    .attr("stroke-width",    d => d.isPinned ? 2.5 : 1.5)
-    .attr("stroke-dasharray", d => d.isPinned ? "5,3" : null);
+    .attr("class","node-bg")
+    .attr("width", d=>d.isGroup?124:NW)
+    .attr("height",d=>d.isGroup?66:NH)
+    .attr("x",     d=>d.isGroup?-62:-NW/2)
+    .attr("y",     d=>d.isGroup?-33:-NH/2)
+    .attr("rx",    d=>d.isGroup?62:9)
+    .attr("ry",    d=>d.isGroup?33:9)
+    .attr("fill",  d=>d.color)
+    .attr("stroke",d=>d.isPinned?"#e94560":d.color)
+    .attr("stroke-width",    d=>d.isPinned?2.5:1.5)
+    .attr("stroke-dasharray",d=>d.isPinned?"6,3":null);
 
-  // Node type label
+  // Type badge (top of node)
   entered.append("text")
-    .attr("class", "node-type")
-    .attr("y", d => d.isGroup ? -14 : -NH/2 + 12)
-    .attr("text-anchor", "middle")
-    .attr("fill", d => d.tcolor)
-    .attr("opacity", 0.7)
-    .attr("font-size", 7)
-    .attr("font-family", "JetBrains Mono, monospace")
-    .attr("letter-spacing", 1.5)
-    .text(d => d.isGroup ? "COMBINED" : d.type + (d.shared ? " ◈" : "") + (d.isPinned ? " 📌" : ""));
+    .attr("y",d=>d.isGroup?-16:-NH/2+13)
+    .attr("text-anchor","middle")
+    .attr("fill",d=>d.tcolor)
+    .attr("font-size",7).attr("font-weight",700)
+    .attr("font-family","JetBrains Mono,monospace")
+    .attr("letter-spacing",2).attr("opacity",0.65)
+    .text(d=>d.isGroup?"COMBINED":d.type+(d.shared?" ◈":"")+(d.isPinned?" 📌":""));
 
-  // Node name (wrapped)
+  // Node name via foreignObject for word-wrap
   entered.append("foreignObject")
-    .attr("class", "node-fo")
-    .attr("x",      d => d.isGroup ? -55 : -NW/2 + 6)
-    .attr("y",      d => d.isGroup ? -22 : -NH/2 + 16)
-    .attr("width",  d => d.isGroup ? 110 : NW - 12)
-    .attr("height", d => d.isGroup ? 28  : 36)
+    .attr("x",     d=>d.isGroup?-56:-NW/2+7)
+    .attr("y",     d=>d.isGroup?-20:-NH/2+18)
+    .attr("width", d=>d.isGroup?112:NW-14)
+    .attr("height",d=>d.isGroup?28:34)
     .append("xhtml:div")
-    .attr("xmlns", "http://www.w3.org/1999/xhtml")
-    .style("font-size", "9.5px")
-    .style("font-weight", "700")
-    .style("font-family", "JetBrains Mono, monospace")
-    .style("color", d => d.tcolor)
-    .style("text-align", "center")
-    .style("word-break", "break-word")
-    .style("line-height", "1.2")
-    .style("overflow", "hidden")
-    .text(d => d.name);
+    .attr("xmlns","http://www.w3.org/1999/xhtml")
+    .style("font-size","9.5px").style("font-weight","700")
+    .style("font-family","JetBrains Mono,monospace")
+    .style("color",d=>d.tcolor)
+    .style("text-align","center").style("word-break","break-word")
+    .style("line-height","1.25").style("overflow","hidden")
+    .text(d=>d.name);
 
   // Value box
   entered.append("rect")
-    .attr("class", "val-bg")
-    .attr("x",      d => d.isGroup ? -44 : -NW/2 + 8)
-    .attr("y",      d => d.isGroup ? 10  : NH/2 - 22)
-    .attr("width",  d => d.isGroup ? 88  : NW - 16)
-    .attr("height", 18)
-    .attr("rx", 3)
-    .attr("fill", "rgba(0,0,0,0.28)");
+    .attr("x",     d=>d.isGroup?-46:-NW/2+9)
+    .attr("y",     d=>d.isGroup?12:NH/2-24)
+    .attr("width", d=>d.isGroup?92:NW-18)
+    .attr("height",19).attr("rx",4)
+    .attr("fill","rgba(0,0,0,0.3)");
 
   entered.append("text")
-    .attr("class", "val-txt")
-    .attr("y",    d => d.isGroup ? 23 : NH/2 - 8)
-    .attr("text-anchor", "middle")
-    .attr("fill", d => d.isPinned ? "#e94560" : d.tcolor)
-    .attr("font-size", 10)
-    .attr("font-weight", 700)
-    .attr("font-family", "JetBrains Mono, monospace")
-    .text(d => d.value + (d.isPinned ? " 📌" : ""));
+    .attr("class","val-txt")
+    .attr("y",d=>d.isGroup?25:NH/2-10)
+    .attr("text-anchor","middle")
+    .attr("fill",d=>d.isPinned?"#e94560":d.tcolor)
+    .attr("font-size",10).attr("font-weight",700)
+    .attr("font-family","JetBrains Mono,monospace")
+    .text(d=>d.value+(d.isPinned?" 📌":""));
 
   // Gate badge
-  entered.filter(d => d.children && d.children.length > 0)
-    .append("rect")
-    .attr("class", "gate-bg")
-    .attr("x", -16).attr("y", d => NH/2 + 2)
-    .attr("width", 32).attr("height", 13)
-    .attr("rx", 3)
-    .attr("fill", "#0d0d0d")
-    .attr("stroke", d => GCOLORS[d.gate] || "#aaa")
-    .attr("stroke-width", 1);
+  entered.filter(d=>(d.children||[]).length>0)
+    .append("g").attr("class","gate-badge")
+    .call(g=>{{
+      g.append("rect")
+        .attr("x",-18).attr("y",d=>NH/2+3)
+        .attr("width",36).attr("height",14)
+        .attr("rx",4).attr("fill","#0d0d0d")
+        .attr("stroke",d=>GCOLORS[d.gate]||"#aaa")
+        .attr("stroke-width",1.2);
+      g.append("text")
+        .attr("y",d=>NH/2+13)
+        .attr("text-anchor","middle")
+        .attr("fill",d=>GCOLORS[d.gate]||"#aaa")
+        .attr("font-size",8).attr("font-weight",700)
+        .attr("font-family","JetBrains Mono,monospace")
+        .attr("letter-spacing",1)
+        .text(d=>d.gate);
+    }});
 
-  entered.filter(d => d.children && d.children.length > 0)
-    .append("text")
-    .attr("class", "gate-txt")
-    .attr("y", d => NH/2 + 12)
-    .attr("text-anchor", "middle")
-    .attr("fill", d => GCOLORS[d.gate] || "#aaa")
-    .attr("font-size", 8)
-    .attr("font-weight", 700)
-    .attr("font-family", "JetBrains Mono, monospace")
-    .attr("letter-spacing", 1)
-    .text(d => d.gate);
-
-  // Collapse indicator for nodes with children
-  entered.filter(d => d.children && d.children.length > 0)
-    .append("circle")
-    .attr("class", "collapse-btn")
-    .attr("cx", d => d.isGroup ? 50 : NW/2 - 8)
-    .attr("cy", d => d.isGroup ? -28 : -NH/2 + 8)
-    .attr("r", 7)
-    .attr("fill", "#1a1a1a")
-    .attr("stroke", "#333")
-    .attr("cursor", "pointer")
-    .on("click", (e, d) => {{ e.stopPropagation(); toggleCollapse(d.id); }});
-
-  entered.filter(d => d.children && d.children.length > 0)
-    .append("text")
-    .attr("class", "collapse-icon")
-    .attr("x", d => d.isGroup ? 50 : NW/2 - 8)
-    .attr("y", d => d.isGroup ? -24 : -NH/2 + 12)
-    .attr("text-anchor", "middle")
-    .attr("fill", "#888")
-    .attr("font-size", 10)
-    .attr("font-weight", 700)
-    .attr("font-family", "monospace")
-    .attr("pointer-events", "none")
-    .text(d => collapsed.has(d.id) ? "+" : "−");
+  // Collapse toggle (top-right corner of node)
+  entered.filter(d=>(d.children||[]).length>0)
+    .append("g").attr("class","col-btn")
+    .call(g=>{{
+      g.append("circle")
+        .attr("cx",d=>d.isGroup?52:NW/2-9)
+        .attr("cy",d=>-NH/2+9)
+        .attr("r",9).attr("fill","#1a1a1a")
+        .attr("stroke","#333").attr("stroke-width",1)
+        .style("cursor","pointer")
+        .on("click",(e,d)=>{{e.stopPropagation();toggleCollapse(d.id);}});
+      g.append("text")
+        .attr("class","col-icon")
+        .attr("x",d=>d.isGroup?52:NW/2-9)
+        .attr("y",d=>-NH/2+14)
+        .attr("text-anchor","middle")
+        .attr("fill","#888").attr("font-size",12)
+        .attr("font-weight",700).attr("font-family","monospace")
+        .attr("pointer-events","none")
+        .text(d=>collapsed.has(d.id)?"+":"−");
+    }});
 
   sel.exit().remove();
-
-  // Update collapse icon state after re-render
-  nodesG.selectAll("text.collapse-icon")
-    .text(d => collapsed.has(d.id) ? "+" : "−");
+  // Update collapse icons
+  nodesG.selectAll("text.col-icon").text(d=>collapsed.has(d.id)?"+":"−");
 }}
 
 // ── Tick ──────────────────────────────────────────────────────────────
-function ticked() {{
-  linksG.selectAll("line.link")
-    .attr("x1", d => (d.source.x||0))
-    .attr("y1", d => (d.source.y||0) + NH/2)
-    .attr("x2", d => (d.target.x||0))
-    .attr("y2", d => (d.target.y||0) - NH/2 - 6);
-
+function ticked(){{
+  // Curved paths for edges — elbow routing between layers
+  linksG.selectAll("path.link").attr("d",d=>{{
+    const sx=d.source.x||0, sy=(d.source.y||0)+NH/2+2;
+    const tx=d.target.x||0, ty=(d.target.y||0)-NH/2-8;
+    const my=(sy+ty)/2;
+    return `M${{sx}},${{sy}} C${{sx}},${{my}} ${{tx}},${{my}} ${{tx}},${{ty}}`;
+  }});
   nodesG.selectAll("g.node-g")
-    .attr("transform", d => `translate(${{d.x||0}},${{d.y||0}})`);
-}}
-
-// ── Force toggle ──────────────────────────────────────────────────────
-function toggleForce() {{
-  forceOn = !forceOn;
-  const btn = document.getElementById("btn-force");
-  if (forceOn) {{
-    btn.classList.add("active");
-    btn.textContent = "⚡ Force ON";
-    // Release all fx/fy pins (except manually dragged when force is off)
-    simNodes.forEach(n => {{ n.fx = null; n.fy = null; }});
-    simulation.alpha(0.3).restart();
-  }} else {{
-    btn.classList.remove("active");
-    btn.textContent = "⚡ Force OFF";
-    simulation.stop();
-    // Pin everything at current position
-    simNodes.forEach(n => {{ n.fx = n.x; n.fy = n.y; }});
-  }}
-}}
-
-// ── Save positions back (for Python to persist) ───────────────────────
-function savePositions() {{
-  const pos = {{}};
-  simNodes.forEach(n => {{ pos[n.id] = {{x: n.x, y: n.y, fx: n.fx, fy: n.fy}}; }});
-  try {{ window.parent.postMessage({{type:"fta_positions", positions: pos}}, "*"); }} catch(e) {{}}
-}}
-
-// ── Collapse / expand ─────────────────────────────────────────────────
-function toggleCollapse(id) {{
-  if (collapsed.has(id)) collapsed.delete(id);
-  else collapsed.add(id);
-  initSimulation();
-}}
-
-// ── Reset layout from scratch ─────────────────────────────────────────
-function resetLayout() {{
-  // Clear saved positions and re-randomise
-  simNodes.forEach(n => {{ n.fx = null; n.fy = null; n.x = undefined; n.y = undefined; }});
-  initSimulation();
-  if (!forceOn) {{ forceOn = true; toggleForce(); }}
-  else simulation.alpha(1).restart();
-}}
-
-// ── Fit all nodes in view ─────────────────────────────────────────────
-function fitView() {{
-  if (!simNodes.length) return;
-  const xs = simNodes.map(n => n.x||0);
-  const ys = simNodes.map(n => n.y||0);
-  const minX = Math.min(...xs) - NW, maxX = Math.max(...xs) + NW;
-  const minY = Math.min(...ys) - NH, maxY = Math.max(...ys) + NH;
-  const svgEl = svg.node();
-  const W = svgEl.getBoundingClientRect().width  || 1000;
-  const H = svgEl.getBoundingClientRect().height || 700;
-  const k  = Math.min(0.95, Math.min(W/(maxX-minX), H/(maxY-minY)));
-  const tx_ = W/2 - k*(minX+maxX)/2;
-  const ty_ = H/2 - k*(minY+maxY)/2;
-  svg.transition().duration(500)
-    .call(zoom.transform, d3.zoomIdentity.translate(tx_, ty_).scale(k));
+    .attr("transform",d=>`translate(${{d.x||0}},${{d.y||0}})`);
 }}
 
 // ── Zoom helpers ──────────────────────────────────────────────────────
-function zoomBy(delta) {{
-  svg.transition().duration(200).call(zoom.scaleBy, 1 + delta);
+function zoomBy(delta){{
+  svg.transition().duration(180).call(zoomBeh.scaleBy,1+delta);
+}}
+function fitView(){{
+  if(!simNodes.length) return;
+  const xs=simNodes.map(n=>n.x||0), ys=simNodes.map(n=>n.y||0);
+  const minX=Math.min(...xs)-NW, maxX=Math.max(...xs)+NW;
+  const minY=Math.min(...ys)-NH, maxY=Math.max(...ys)+NH;
+  const cW=canvasWrap.getBoundingClientRect();
+  const W=cW.width||1000, H=cW.height||650;
+  const k=Math.min(0.95,0.92*Math.min(W/(maxX-minX),H/(maxY-minY)));
+  const tx=W/2-k*(minX+maxX)/2, ty=H/2-k*(minY+maxY)/2;
+  svg.transition().duration(500)
+    .call(zoomBeh.transform,d3.zoomIdentity.translate(tx,ty).scale(k));
 }}
 
-// ── Selection + path highlight ────────────────────────────────────────
-function selectNode(id) {{
-  if (selId === id) {{ selId = null; clearHL(); closeDP(); return; }}
-  selId = id;
-  const node = nodeMap[id]; if (!node) return;
+// ── Collapse ──────────────────────────────────────────────────────────
+function toggleCollapse(id){{
+  collapsed.has(id)?collapsed.delete(id):collapsed.add(id);
+  initAll();
+}}
 
-  // Direct parents and children of clicked node only
-  const directParents  = new Set(node.parents || []);
-  const directChildren = new Set(node.children || []);
-  const connected      = new Set([...directParents, ...directChildren, id]);
+// ── Selection + highlight ─────────────────────────────────────────────
+function selectNode(id){{
+  if(selId===id){{selId=null;clearHL();closeDP();return;}}
+  selId=id;
+  const n=nodeMap[id]; if(!n) return;
+  const parents  = new Set(n.parents||[]);
+  const children = new Set(n.children||[]);
 
-  // Style nodes
-  nodesG.selectAll("g.node-g").each(function(d) {{
-    const el   = d3.select(this);
-    const rect = el.select("rect.node-rect");
-    if (d.id === id) {{
-      rect.attr("stroke", "#e94560").attr("stroke-width", 3)
-          .attr("filter", "drop-shadow(0 0 8px #e9456099)");
-    }} else if (directParents.has(d.id)) {{
-      rect.attr("stroke", "#4fc3f7").attr("stroke-width", 2.5)
-          .attr("filter", "drop-shadow(0 0 6px #4fc3f755)");
-    }} else if (directChildren.has(d.id)) {{
-      rect.attr("stroke", "#ff8c42").attr("stroke-width", 2.5)
-          .attr("filter", "drop-shadow(0 0 6px #ff8c4255)");
-    }} else {{
-      rect.attr("filter", null);
-      el.attr("opacity", 0.25);
+  nodesG.selectAll("g.node-g").each(function(d){{
+    const el=d3.select(this), rect=el.select("rect.node-bg");
+    if(d.id===id){{
+      rect.attr("stroke","#e94560").attr("stroke-width",3.5)
+          .attr("filter","drop-shadow(0 0 10px #e9456099)");
+      el.attr("opacity",1);
+    }}else if(parents.has(d.id)){{
+      rect.attr("stroke","#4fc3f7").attr("stroke-width",3)
+          .attr("filter","drop-shadow(0 0 8px #4fc3f766)");
+      el.attr("opacity",1);
+    }}else if(children.has(d.id)){{
+      rect.attr("stroke","#ff8c42").attr("stroke-width",3)
+          .attr("filter","drop-shadow(0 0 8px #ff8c4266)");
+      el.attr("opacity",1);
+    }}else{{
+      rect.attr("filter",null).attr("stroke",d.isPinned?"#e94560":d.color)
+          .attr("stroke-width",d.isPinned?2.5:1.5);
+      el.attr("opacity",0.18);
     }}
   }});
 
-  // Style links
-  linksG.selectAll("line.link").each(function(d) {{
-    const src = d.source.id || d.source;
-    const tgt = d.target.id || d.target;
-    const isPath = (src === id || tgt === id);
+  linksG.selectAll("path.link").each(function(d){{
+    const src=d.source.id||d.source, tgt=d.target.id||d.target;
+    const onPath=src===id||tgt===id;
     d3.select(this)
-      .attr("stroke", isPath ? (d.shared ? "#f5c518" : "#4fc3f7") : "#1a1a1a")
-      .attr("stroke-width", isPath ? 2.5 : 1)
-      .attr("opacity", isPath ? 1 : 0.15)
-      .attr("marker-end", isPath ? "url(#arr-hl)" : "url(#arr)");
+      .attr("stroke",onPath?(d.shared?"#f5c518":"#4fc3f7"):"#222")
+      .attr("stroke-width",onPath?2.5:1)
+      .attr("opacity",onPath?1:0.1)
+      .attr("marker-end",onPath?"url(#arr-hl)":"url(#arr)");
   }});
 
-  showDP(id, node);
+  showDP(id,n);
 }}
 
-function clearHL() {{
-  selId = null;
-  nodesG.selectAll("g.node-g")
-    .attr("opacity", 1)
-    .select("rect.node-rect")
-    .attr("stroke", d => d.isPinned ? "#e94560" : d.color)
-    .attr("stroke-width", d => d.isPinned ? 2.5 : 1.5)
-    .attr("filter", null);
-
-  linksG.selectAll("line.link")
-    .attr("stroke", d => d.shared ? "#f5c51866" : "#2a2a2a")
-    .attr("stroke-width", d => d.shared ? 1 : 1.8)
-    .attr("opacity", d => d.shared ? 0.45 : 0.85)
-    .attr("marker-end", d => d.shared ? "url(#arr-sh)" : "url(#arr)");
+function clearHL(){{
+  selId=null;
+  nodesG.selectAll("g.node-g").attr("opacity",1)
+    .select("rect.node-bg")
+    .attr("stroke",d=>d.isPinned?"#e94560":d.color)
+    .attr("stroke-width",d=>d.isPinned?2.5:1.5)
+    .attr("filter",null);
+  linksG.selectAll("path.link")
+    .attr("stroke",d=>d.shared?"#f5c51877":"#2d2d2d")
+    .attr("stroke-width",d=>d.shared?1.2:2)
+    .attr("opacity",d=>d.shared?0.5:0.9)
+    .attr("marker-end","url(#arr)");
 }}
 
 // ── Detail panel ──────────────────────────────────────────────────────
-function showDP(id, node) {{
-  const dp = document.getElementById("dp");
-  dp.style.display = "block";
-  dp.style.borderTopColor = node.color;
-  document.getElementById("dp-title").innerHTML =
-    `<span style="color:${{node.color}}">${{node.name}}</span>` +
-    (node.shared ? ' <span style="background:#f5c518;color:#111;font-size:8px;padding:1px 5px;border-radius:5px;font-weight:700;">SHARED</span>' : '') +
-    (node.isPinned ? ` <span style="background:#e94560;color:#fff;font-size:8px;padding:1px 5px;border-radius:5px;font-weight:700;">📌 FIXED ${{node.fixedVal}}</span>` : '');
-  document.getElementById("dp-type").textContent  = node.isGroup ? "GROUP" : node.type;
-  document.getElementById("dp-type").style.color  = node.color;
-  document.getElementById("dp-gate").textContent  = node.gate;
-  document.getElementById("dp-gate").style.color  = GCOLORS[node.gate] || "#aaa";
-  document.getElementById("dp-value").textContent = node.isPinned ? `${{node.value}} 📌` : node.value;
-  document.getElementById("dp-value").style.color = node.isPinned ? "#e94560" : node.color;
-  document.getElementById("dp-nid").textContent   = node.nodeId || id;
-  document.getElementById("dp-shared").textContent = node.shared ? "YES" : "NO";
-  document.getElementById("dp-shared").style.color = node.shared ? "#f5c518" : "#555";
-  document.getElementById("dp-par").textContent   = (node.pnames||[]).join(" · ") || "(top event)";
-  document.getElementById("dp-chi").textContent   = (node.cnames||[]).join(" · ") || "(leaf node)";
+const GCOLOR_MAP={{OR:"#4fc3f7",AND:"#ffb74d"}};
+function showDP(id,node){{
+  const dp=document.getElementById("dp");
+  dp.style.display="block"; dp.style.borderTopColor=node.color;
+  document.getElementById("dp-title").innerHTML=
+    `<span style="color:${{node.color}}">${{node.name}}</span>`+
+    (node.shared?' <span style="background:#f5c518;color:#111;font-size:8px;padding:1px 6px;border-radius:5px;font-weight:700;">SHARED</span>':'')+
+    (node.isPinned?` <span style="background:#e94560;color:#fff;font-size:8px;padding:1px 6px;border-radius:5px;font-weight:700;">📌 FIXED ${{node.fixedVal}}</span>`:'');
+  document.getElementById("dp-type").textContent=node.isGroup?"GROUP":node.type;
+  document.getElementById("dp-type").style.color=node.color;
+  document.getElementById("dp-gate").textContent=node.gate;
+  document.getElementById("dp-gate").style.color=GCOLOR_MAP[node.gate]||"#aaa";
+  document.getElementById("dp-value").textContent=node.isPinned?`${{node.value}} 📌`:node.value;
+  document.getElementById("dp-value").style.color=node.isPinned?"#e94560":node.color;
+  document.getElementById("dp-nid").textContent=node.nodeId||id;
+  document.getElementById("dp-shared").textContent=node.shared?"YES":"NO";
+  document.getElementById("dp-shared").style.color=node.shared?"#f5c518":"#555";
+  document.getElementById("dp-par").textContent=(node.pnames||[]).join(" · ")||"(top event)";
+  document.getElementById("dp-chi").textContent=(node.cnames||[]).join(" · ")||"(leaf node)";
 }}
-function closeDP() {{
-  document.getElementById("dp").style.display = "none";
-  clearHL();
-}}
+function closeDP(){{document.getElementById("dp").style.display="none";clearHL();}}
 
 // ── Search ────────────────────────────────────────────────────────────
-function doSearch(q) {{
-  nodesG.selectAll("rect.node-rect").attr("outline", null);
-  searchMatches = []; searchIdx = 0;
-  if (!q.trim()) {{ document.getElementById("srch-info").textContent = ""; return; }}
-  const lq = q.toLowerCase();
-  RAW_NODES.forEach(n => {{
-    if (n.name.toLowerCase().includes(lq) || n.type.toLowerCase().includes(lq) ||
-        n.value.toLowerCase().includes(lq) || (n.nodeId||"").toLowerCase().includes(lq)) {{
+function doSearch(q){{
+  nodesG.selectAll("rect.node-bg").attr("filter",null);
+  searchMatches=[];searchIdx=0;
+  if(!q.trim()){{document.getElementById("srch-info").textContent="";return;}}
+  const lq=q.toLowerCase();
+  RAW_NODES.forEach(n=>{{
+    if(n.name.toLowerCase().includes(lq)||n.type.toLowerCase().includes(lq)||
+       n.value.toLowerCase().includes(lq)||(n.nodeId||"").toLowerCase().includes(lq))
       searchMatches.push(n.id);
-    }}
   }});
-  document.getElementById("srch-info").textContent = searchMatches.length ? `${{searchMatches.length}} found` : "0";
-  highlightSearch();
-  if (searchMatches.length) panToNode(searchMatches[0]);
+  document.getElementById("srch-info").textContent=
+    searchMatches.length?`${{searchMatches.length}} found`:"0";
+  nodesG.selectAll("g.node-g").select("rect.node-bg")
+    .attr("filter",d=>searchMatches.includes(d.id)?"drop-shadow(0 0 8px #f5c518)":null);
+  if(searchMatches.length) panTo(searchMatches[0]);
 }}
-function highlightSearch() {{
-  nodesG.selectAll("g.node-g").select("rect.node-rect")
-    .attr("outline", d => searchMatches.includes(d.id) ? "3px solid #f5c518" : null)
-    .attr("filter",  d => searchMatches.includes(d.id) ? "drop-shadow(0 0 6px #f5c518)" : null);
+function searchNext(){{
+  if(!searchMatches.length)return;
+  searchIdx=(searchIdx+1)%searchMatches.length;
+  panTo(searchMatches[searchIdx]);
+  document.getElementById("srch-info").textContent=`${{searchIdx+1}}/${{searchMatches.length}}`;
 }}
-function searchNext() {{
-  if (!searchMatches.length) return;
-  searchIdx = (searchIdx + 1) % searchMatches.length;
-  panToNode(searchMatches[searchIdx]);
-  document.getElementById("srch-info").textContent = `${{searchIdx+1}}/${{searchMatches.length}}`;
+function searchPrev(){{
+  if(!searchMatches.length)return;
+  searchIdx=(searchIdx-1+searchMatches.length)%searchMatches.length;
+  panTo(searchMatches[searchIdx]);
+  document.getElementById("srch-info").textContent=`${{searchIdx+1}}/${{searchMatches.length}}`;
 }}
-function searchPrev() {{
-  if (!searchMatches.length) return;
-  searchIdx = (searchIdx - 1 + searchMatches.length) % searchMatches.length;
-  panToNode(searchMatches[searchIdx]);
-  document.getElementById("srch-info").textContent = `${{searchIdx+1}}/${{searchMatches.length}}`;
-}}
-function panToNode(id) {{
-  const n = simNodes.find(s => s.id === id); if (!n) return;
-  const svgEl = svg.node();
-  const W = svgEl.getBoundingClientRect().width  || 1000;
-  const H = svgEl.getBoundingClientRect().height || 700;
-  const k  = transform.k;
-  svg.transition().duration(400).call(
-    zoom.transform,
-    d3.zoomIdentity.translate(W/2 - k*n.x, H/2 - k*n.y).scale(k)
-  );
+function panTo(id){{
+  const n=simNodes.find(s=>s.id===id); if(!n) return;
+  const cW=canvasWrap.getBoundingClientRect();
+  const W=cW.width||1000,H=cW.height||650;
+  const curT=d3.zoomTransform(svg.node());
+  svg.transition().duration(400).call(zoomBeh.transform,
+    d3.zoomIdentity.translate(W/2-curT.k*n.x, H/3-curT.k*n.y).scale(curT.k));
 }}
 
-// ── Init ──────────────────────────────────────────────────────────────
-svg.on("click", () => {{ closeDP(); }});
-initSimulation();
-
-// Focus pan if requested
-if (FOCUS_ID) {{
-  setTimeout(() => panToNode(FOCUS_ID), 800);
-}}
-
-// Auto-fit on first load if no saved positions
-if (!Object.keys(INIT_POS).length) {{
-  setTimeout(() => fitView(), 1200);
-}}
-
-// Start with force button showing correct state
-document.getElementById("btn-force").classList.add("active");
-document.getElementById("btn-force").textContent = "⚡ Force ON";
+// ── Boot ──────────────────────────────────────────────────────────────
+initAll();
+// Apply clean layer layout on first load
+applyLayerLayout(false);
+if(FOCUS_ID) setTimeout(()=>panTo(FOCUS_ID),600);
 </script>
 </body></html>"""
 
