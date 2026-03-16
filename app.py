@@ -408,9 +408,9 @@ def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
     init_pos  = ts.get("positions", {})
     focus_id  = ts.get("focus_id")
 
-    LEVEL_ROW   = {"HAZARD": 0, "SF": 1, "FF": 2, "GROUP": 2, "IF": 3}
-    LEVEL_COLOR = {0: "#ff4d4d", 1: "#ff8c42", 2: "#f5c518", 3: "#4caf7d"}
-    LEVEL_LABEL = {0: "HAZARD", 1: "SF", 2: "FF", 3: "IF"}
+    LEVEL_ROW   = {"HAZARD": 0, "SF": 1, "FF": 2, "GROUP": 2.5, "IF": 3}
+    LEVEL_COLOR = {0: "#ff4d4d", 1: "#ff8c42", 2: "#f5c518", 2.5: "#7e57c2", 3: "#4caf7d"}
+    LEVEL_LABEL = {0: "HAZARD", 1: "SF", 2: "FF", 2.5: "GROUP", 3: "IF"}
 
     nodes_js = _json.dumps([{
         "id":       n["id"],
@@ -443,7 +443,7 @@ def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
 
     init_pos_js    = _json.dumps(init_pos)
     focus_js       = f'"{focus_id}"' if focus_id else "null"
-    level_label_js = _json.dumps(LEVEL_LABEL)
+    level_label_js = _json.dumps({str(k): v for k, v in LEVEL_LABEL.items()})
     level_color_js = _json.dumps({str(k): v for k, v in LEVEL_COLOR.items()})
 
     html = """<!DOCTYPE html>
@@ -657,17 +657,22 @@ function updateLanes(){
   const vis=getVis();
   const rows=[...new Set(vis.map(n=>n.row))].sort((a,b)=>a-b);
   const t=getT(); const H=wrap.getBoundingClientRect().height||700;
-  rows.forEach(row=>{
+  rows.forEach((row,ri)=>{
     const yw=layY(row),ys=t.apply([0,yw])[1];
-    const yn=row<3?t.apply([0,layY(row+1)])[1]:H+200;
+    // next row is the next entry in the sorted list, or H+200 if last
+    const nextRow=rows[ri+1];
+    const yn=nextRow!==undefined?t.apply([0,layY(nextRow)])[1]:H+200;
     const bh=Math.max(40,yn-ys);
     if(ys>H+50||ys+bh<-50)return;
+    const rowKey=String(row);
+    const col=LCOLORS[rowKey]||"#888";
     const d=document.createElement("div"); d.className="lb";
-    d.style.top=(ys-VG*t.k*.46)+"px";
-    d.style.height=Math.max(40,VG*t.k*.92)+"px";
-    const col=LCOLORS[row]||"#888";
+    // For GROUP (row=2.5) make the band narrower since it's an intermediate layer
+    const bandH=row===2.5?Math.max(30,VG*t.k*.5):Math.max(40,VG*t.k*.92);
+    d.style.top=(ys-bandH*.46)+"px";
+    d.style.height=bandH+"px";
     const stripe=document.createElement("div"); stripe.className="ls"; stripe.style.background=col; d.appendChild(stripe);
-    const tag=document.createElement("div"); tag.className="lt"; tag.style.color=col; tag.textContent=LLABELS[row]||""; d.appendChild(tag);
+    const tag=document.createElement("div"); tag.className="lt"; tag.style.color=col; tag.textContent=LLABELS[rowKey]||""; d.appendChild(tag);
     el.appendChild(d);
   });
 }
@@ -1127,35 +1132,19 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                 """)
 
             node_name  = st.text_input("Node Name", placeholder="e.g. Power Failure", key="add_name")
+
             custom_id  = st.text_input("Node ID (optional)", placeholder="e.g. FF-01, IF-286",
                                        key="add_cid",
-                                       help="If this ID already exists, you'll be asked to link as shared.")
-            parent_opts = {f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name']}": n["id"]
-                           for n in nodes if n["type"] in VALID_PARENT_TYPES}
-            sel_labels  = st.multiselect("Parent Node(s)", list(parent_opts.keys()), key="add_par")
-            sel_pids    = [parent_opts[l] for l in sel_labels]
-            node_type   = st.selectbox("Type", VALID_CHILD_TYPES, key="add_type",
-                                       help="GROUP = Combined Faults oval")
-            gate        = st.radio("Gate", ["OR","AND"], horizontal=True, key="add_gate")
+                                       help="Type your reference ID. Searches live as you type.")
 
-            # Fixed value option
-            use_fixed  = st.checkbox("📌 Pin to fixed value", key="add_use_fixed",
-                                     help="Overrides calculated value. The engine will subtract this node's contribution from the parent budget and give the remainder to siblings. Use for negligible or known-value nodes.")
-            fixed_val_input = None
-            if use_fixed:
-                fixed_val_input = st.text_input("Fixed Value", placeholder="e.g. 1.67e-9 or 0",
-                                                key="add_fixed_val",
-                                                help="This node will always carry this exact failure rate regardless of tree distribution.")
-
-            # ── Duplicate Node ID detection ───────────────────────────
-            # Rules:
-            # 1. Only trigger if user has typed at least 3 characters
-            # 2. Exact match only on nodeId field (== not 'in')
-            # 3. Match is case-sensitive (IF-196 ≠ IF-195, IF-196 ≠ if-196)
-            # 4. A node whose nodeId was never set (empty/None) never matches
+            # ── Live Node ID search ──────────────────────────────────
+            # Shows a compact info card while typing:
+            #   • Green  = ID is free — safe to create
+            #   • Yellow = ID already exists — can link as shared OR still add new
+            # ADD NODE button is ALWAYS present — no blocking popups.
             cid_clean = custom_id.strip()
             existing_with_id = []
-            if len(cid_clean) >= 3:
+            if len(cid_clean) >= 2:
                 existing_with_id = [
                     n for n in nodes
                     if (n.get("nodeId") or "").strip() == cid_clean
@@ -1163,88 +1152,105 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                 ]
             duplicate_found = len(existing_with_id) > 0
 
-            if duplicate_found:
-                ex = existing_with_id[0]
-                ex_color   = LEVEL_COLORS.get(ex["type"], "#888")
-                ex_parents = " · ".join(by_id[p]["name"] for p in (ex.get("parentIds") or []) if p in by_id) or "none"
-                ex_nid     = ex.get("nodeId", ex["id"])
-                st.markdown(f"""
-                <div style="background:#1a1200;border:2px solid #f5c518;border-radius:8px;padding:10px 12px;margin:8px 0;">
-                  <div style="font-size:9px;color:#f5c518;font-weight:700;letter-spacing:1px;margin-bottom:5px;">
-                    ⚠ NODE ID ALREADY EXISTS IN TREE
-                  </div>
-                  <div style="font-size:10px;color:#ddd;margin-bottom:3px;">
-                    You typed: <code style="background:#2a2a00;color:#f5c518;padding:1px 5px;border-radius:3px;font-size:10px;">{cid_clean}</code>
-                    &nbsp;→ matches existing node:
-                    <b style="color:{ex_color};">{ex['name']}</b>
-                  </div>
-                  <div style="font-size:9px;color:#888;line-height:1.6;">
-                    Type: <span style="color:{ex_color};">{ex['type']}</span> &nbsp;·&nbsp;
-                    Gate: {ex['gate']} &nbsp;·&nbsp;
-                    Value: <span style="color:{ex_color};font-family:monospace;">{fmt(ex.get('calculatedValue'))}</span><br>
-                    Parents: {ex_parents}
-                  </div>
-                  <div style="font-size:9px;color:#aaa;margin-top:6px;padding-top:6px;border-top:1px solid #2a2a00;">
-                    <b>🔗 Link Shared</b> — add new parents to this existing node (it appears in multiple places)<br>
-                    <b>➕ New Node</b> — create a separate new node that shares the same reference ID label
-                  </div>
-                </div>""", unsafe_allow_html=True)
-                col_share, col_new = st.columns(2)
-                with col_share:
-                    if st.button("🔗 LINK SHARED", use_container_width=True, type="primary"):
-                        if not sel_pids:
-                            st.error("Select at least one parent")
-                        else:
-                            updated = []
-                            for n in nodes:
-                                if n["id"] == ex["id"]:
-                                    n = dict(n)
-                                    existing_pids = list(n.get("parentIds") or [])
-                                    new_pids_to_add = [p for p in sel_pids if p not in existing_pids]
-                                    n["parentIds"] = existing_pids + new_pids_to_add
-                                updated.append(n)
-                            st.session_state.tree_state["focus_id"] = ex["id"]
-                            st.session_state.nodes_since_calc += 1
-                            set_nodes(updated)
-                            st.success(f"Linked '{ex['name']}' as shared. Press CALCULATE to update values.")
-                            st.rerun()
-                with col_new:
-                    if st.button("➕ NEW NODE", use_container_width=True):
-                        if not node_name.strip(): st.error("Enter node name")
-                        elif not sel_pids:        st.error("Select at least one parent")
-                        else:
-                            fv = None
-                            if use_fixed and fixed_val_input:
-                                try: fv = float(fixed_val_input)
-                                except: pass
-                            nid = str(uuid.uuid4())[:7]
-                            new_node = {"id": nid, "nodeId": cid_clean,
-                                        "name": node_name.strip(), "type": node_type,
-                                        "gate": gate, "fixedValue": fv,
-                                        "targetValue": None, "calculatedValue": fv,
-                                        "parentIds": sel_pids}
-                            st.session_state.tree_state["focus_id"] = nid
-                            st.session_state.nodes_since_calc += 1
-                            set_nodes(nodes + [new_node])
-                            st.rerun()
-            else:
-                if st.button("✅ ADD NODE", use_container_width=True, type="primary"):
-                    if not node_name.strip(): st.error("Enter node name")
-                    elif not sel_pids:        st.error("Select at least one parent")
-                    else:
-                        fv = None
-                        if use_fixed and fixed_val_input:
-                            try:    fv = float(fixed_val_input)
-                            except: st.error("Fixed value must be a number e.g. 1.67e-9"); fv = None
-                        nid = cid_clean if cid_clean and not any(n["id"]==cid_clean for n in nodes) else str(uuid.uuid4())[:7]
-                        new_node = {"id": nid, "nodeId": cid_clean or nid,
-                                    "name": node_name.strip(), "type": node_type, "gate": gate,
-                                    "fixedValue": fv,
-                                    "targetValue": None, "calculatedValue": fv, "parentIds": sel_pids}
-                        st.session_state.tree_state["focus_id"] = sel_pids[0] if sel_pids else nid
+            if cid_clean and len(cid_clean) >= 2:
+                if duplicate_found:
+                    ex        = existing_with_id[0]
+                    ex_color  = LEVEL_COLORS.get(ex["type"], "#888")
+                    ex_pnames = " · ".join(
+                        by_id[p]["name"] for p in (ex.get("parentIds") or []) if p in by_id
+                    ) or "none"
+                    st.markdown(f"""
+                    <div style="background:#1a1100;border:1.5px solid #f5c518;border-radius:7px;
+                                padding:8px 11px;margin:4px 0 6px 0;">
+                      <div style="font-size:9px;color:#f5c518;font-weight:700;letter-spacing:1px;margin-bottom:3px;">
+                        ⚠ &nbsp;{cid_clean} already exists in tree
+                      </div>
+                      <div style="font-size:10px;color:#ddd;font-weight:700;">
+                        <span style="color:{ex_color};">{ex['name']}</span>
+                        <span style="color:#555;font-size:9px;margin-left:5px;">[{ex['type']} · {ex['gate']}]</span>
+                      </div>
+                      <div style="font-size:9px;color:#777;margin-top:2px;">
+                        Parents: {ex_pnames} &nbsp;·&nbsp;
+                        Value: <span style="font-family:monospace;color:{ex_color};">{fmt(ex.get('calculatedValue'))}</span>
+                      </div>
+                      <div style="font-size:9px;color:#aaa;margin-top:4px;">
+                        Press <b>✅ ADD NODE</b> to create a new separate node with this ID &nbsp;|&nbsp;
+                        or press <b>🔗 Link Shared</b> to reuse the existing node
+                      </div>
+                    </div>""", unsafe_allow_html=True)
+                else:
+                    st.markdown(f"""
+                    <div style="background:#0a1a0a;border:1.5px solid #4caf7d;border-radius:7px;
+                                padding:6px 11px;margin:4px 0 6px 0;">
+                      <div style="font-size:9px;color:#4caf7d;font-weight:700;">
+                        ✓ &nbsp;{cid_clean} is available — ready to create
+                      </div>
+                    </div>""", unsafe_allow_html=True)
+
+            parent_opts = {f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name']}": n["id"]
+                           for n in nodes if n["type"] in VALID_PARENT_TYPES}
+            sel_labels  = st.multiselect("Parent Node(s)", list(parent_opts.keys()), key="add_par")
+            sel_pids    = [parent_opts[l] for l in sel_labels]
+            node_type   = st.selectbox("Type", VALID_CHILD_TYPES, key="add_type",
+                                       help="GROUP = Combined Faults oval (placed between FF and IF layers)")
+            gate        = st.radio("Gate", ["OR","AND"], horizontal=True, key="add_gate")
+
+            # Fixed value option
+            use_fixed  = st.checkbox("📌 Pin to fixed value", key="add_use_fixed",
+                                     help="Overrides calculated value. Subtracts from parent budget, gives remainder to siblings.")
+            fixed_val_input = None
+            if use_fixed:
+                fixed_val_input = st.text_input("Fixed Value", placeholder="e.g. 1.67e-9 or 0",
+                                                key="add_fixed_val",
+                                                help="Node always carries this exact failure rate.")
+
+            # ── Action buttons ────────────────────────────────────────
+            # ADD NODE is always present — never blocked by duplicate detection
+            if duplicate_found and sel_pids:
+                btn_share, btn_add = st.columns([1, 1])
+                with btn_share:
+                    if st.button("🔗 Link Shared", use_container_width=True, type="primary",
+                                 help="Add your selected parent(s) to the existing node — shared node pattern"):
+                        ex = existing_with_id[0]
+                        updated = []
+                        for n in nodes:
+                            if n["id"] == ex["id"]:
+                                n = dict(n)
+                                existing_pids  = list(n.get("parentIds") or [])
+                                new_pids_to_add = [p for p in sel_pids if p not in existing_pids]
+                                n["parentIds"] = existing_pids + new_pids_to_add
+                            updated.append(n)
+                        st.session_state.tree_state["focus_id"] = ex["id"]
                         st.session_state.nodes_since_calc += 1
-                        set_nodes(nodes + [new_node])
+                        set_nodes(updated)
+                        st.success(f"Linked '{ex['name']}' as shared. Press CALCULATE to update values.")
                         st.rerun()
+                with btn_add:
+                    add_btn = st.button("✅ Add New", use_container_width=True,
+                                        help="Create a brand-new node — the duplicate ID is just a label")
+            else:
+                add_btn = st.button("✅ ADD NODE", use_container_width=True, type="primary")
+
+            if add_btn:
+                if not node_name.strip():
+                    st.error("Enter a node name")
+                elif not sel_pids:
+                    st.error("Select at least one parent")
+                else:
+                    fv = None
+                    if use_fixed and fixed_val_input:
+                        try:    fv = float(fixed_val_input)
+                        except: st.error("Fixed value must be a number e.g. 1.67e-9"); fv = None
+                    nid = cid_clean if cid_clean and not any(n["id"] == cid_clean for n in nodes) \
+                          else str(uuid.uuid4())[:7]
+                    new_node = {"id": nid, "nodeId": cid_clean or nid,
+                                "name": node_name.strip(), "type": node_type, "gate": gate,
+                                "fixedValue": fv, "targetValue": None, "calculatedValue": fv,
+                                "parentIds": sel_pids}
+                    st.session_state.tree_state["focus_id"] = sel_pids[0] if sel_pids else nid
+                    st.session_state.nodes_since_calc += 1
+                    set_nodes(nodes + [new_node])
+                    st.rerun()
 
             st.markdown("---")
             # Delete node
