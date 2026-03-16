@@ -169,14 +169,20 @@ def export_json(nodes):
 def export_cypher(nodes):
     """
     Generate Cypher statements to recreate the FTA in Neo4j.
+    Includes: fixedValue (pinned nodes), nodeId (user reference), GROUP type.
     Run in Neo4j Browser or via neo4j-shell.
     """
     by_id = {n["id"]: n for n in nodes}
+    n_pinned = sum(1 for n in nodes if n.get("fixedValue") is not None)
+    n_shared  = sum(1 for n in nodes if len(n.get("parentIds") or []) > 1)
     lines = [
         "// ── FTA Fault Tree — Cypher Export ──────────────────────────",
-        f"// Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        f"// Total nodes: {len(nodes)}",
-        "// Run this in Neo4j Browser to create the full graph.",
+        f"// Generated:    {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        f"// Total nodes:  {len(nodes)}",
+        f"// Pinned nodes: {n_pinned}  (fixedValue set — budget subtracted from siblings)",
+        f"// Shared nodes: {n_shared}  (multiple parents — MAX allocation rule applied)",
+        "//",
+        "// Run in Neo4j Browser to create the full graph.",
         "",
         "// STEP 1: Clear existing FTA nodes (optional — comment out to merge)",
         "// MATCH (n:FTANode) DETACH DELETE n;",
@@ -184,40 +190,67 @@ def export_cypher(nodes):
         "// STEP 2: Create all nodes",
     ]
     for n in nodes:
-        val   = n.get("calculatedValue")
-        val_s = fmt(val) if val is not None else "null"
-        name  = n["name"].replace("'", "\\'")
+        val       = n.get("calculatedValue")
+        fv        = n.get("fixedValue")
+        val_s     = fmt(val) if val is not None else "null"
+        fv_s      = fmt(fv)  if fv  is not None else "null"
+        name      = n["name"].replace("'", "\\'")
+        node_id   = (n.get("nodeId") or n["id"]).replace("'", "\\'")
         is_shared = len(n.get("parentIds") or []) > 1
+        is_pinned = fv is not None
+        is_group  = n["type"] == "GROUP"
         lines.append(
-            f"CREATE (:FTANode {{id:'{n['id']}', name:'{name}', "
+            f"CREATE (:FTANode {{"
+            f"id:'{n['id']}', nodeId:'{node_id}', name:'{name}', "
             f"type:'{n['type']}', gate:'{n['gate']}', "
             f"calculatedValue:{val_s if val is not None else 'null'}, "
-            f"valueStr:'{val_s}', shared:{str(is_shared).lower()}}});"
+            f"fixedValue:{fv_s if fv is not None else 'null'}, "
+            f"valueStr:'{val_s}', "
+            f"shared:{str(is_shared).lower()}, "
+            f"pinned:{str(is_pinned).lower()}, "
+            f"isGroup:{str(is_group).lower()}"
+            f"}});"
         )
 
     lines += ["", "// STEP 3: Create relationships (FEEDS_INTO = child → parent)"]
     for n in nodes:
         for pid in (n.get("parentIds") or []):
             if pid in by_id:
-                pname = by_id[pid]["name"].replace("'", "\\'")
-                cname = n["name"].replace("'", "\\'")
                 lines.append(
                     f"MATCH (c:FTANode {{id:'{n['id']}'}}), (p:FTANode {{id:'{pid}'}}) "
-                    f"CREATE (c)-[:FEEDS_INTO {{gate:'{by_id[pid]['gate']}'}}]->(p);"
+                    f"CREATE (c)-[:FEEDS_INTO {{gate:'{by_id[pid]['gate']}', "
+                    f"childPinned:{str(n.get('fixedValue') is not None).lower()}}}]->(p);"
                 )
 
     lines += [
         "",
         "// STEP 4: Useful queries",
+        "",
         "// Show full graph:",
         "// MATCH (n:FTANode)-[r]->(m) RETURN n,r,m;",
         "",
-        "// Show all shared nodes:",
-        "// MATCH (n:FTANode) WHERE n.shared=true RETURN n.name, n.type, n.valueStr;",
+        "// Show all shared nodes with their values:",
+        "// MATCH (n:FTANode) WHERE n.shared=true",
+        "// RETURN n.nodeId, n.name, n.type, n.valueStr ORDER BY n.type;",
         "",
-        "// Show path from IF to HAZARD:",
+        "// Show all pinned (fixed-value) nodes:",
+        "// MATCH (n:FTANode) WHERE n.pinned=true",
+        "// RETURN n.nodeId, n.name, n.fixedValue, n.valueStr;",
+        "",
+        "// Show path from any IF to its HAZARD with values:",
         "// MATCH p=(i:FTANode {type:'IF'})-[:FEEDS_INTO*]->(h:FTANode {type:'HAZARD'})",
-        "// RETURN p LIMIT 5;",
+        "// RETURN [node IN nodes(p) | node.nodeId + ':' + node.valueStr] AS path LIMIT 10;",
+        "",
+        "// Find all IFs contributing to a specific hazard (e.g. 'SF-10'):",
+        "// MATCH p=(i:FTANode {type:'IF'})-[:FEEDS_INTO*]->(h:FTANode)",
+        "// WHERE h.name CONTAINS 'SF-10'",
+        "// RETURN i.nodeId, i.name, i.valueStr ORDER BY i.calculatedValue DESC;",
+        "",
+        "// Budget check: verify OR-gate children sum ≤ parent for all nodes:",
+        "// MATCH (p:FTANode {gate:'OR'})<-[:FEEDS_INTO]-(c:FTANode)",
+        "// WITH p, sum(c.calculatedValue) AS childSum",
+        "// WHERE childSum > p.calculatedValue * 1.01",
+        "// RETURN p.nodeId, p.name, p.valueStr, childSum AS actualSum;",
     ]
     return "\n".join(lines).encode("utf-8")
 
@@ -241,69 +274,102 @@ def export_excel(nodes):
 
     by_id    = {n["id"]: n for n in nodes}
     wb       = openpyxl.Workbook()
-    fills    = {lvl: PatternFill("solid", fgColor=c.replace("#","FF")) for lvl, c in
-                [("HAZARD","FFFF4D4D"),("SF","FFFF8C42"),("FF","FFF5C518"),("IF","FF4CAF7D")]}
+    fills    = {lvl: PatternFill("solid", fgColor=c) for lvl, c in
+                [("HAZARD","FFFF4D4D"),("SF","FFFF8C42"),("FF","FFF5C518"),
+                 ("IF","FF4CAF7D"),("GROUP","FF7E57C2")]}
     hdr_fill = PatternFill("solid", fgColor="FF0F3460")
+    pin_fill = PatternFill("solid", fgColor="FF3A0A14")  # dark red bg for pinned
 
-    def hdr_font(c): return Font(bold=True,color="FFFFFFFF",name="Courier New")
-    def row_font(lvl): return Font(name="Courier New",size=10,
-                                   color="FF111111" if lvl=="FF" else "FFFFFFFF")
-    def ctr(): return Alignment(horizontal="center",vertical="center")
-    def lft(): return Alignment(horizontal="left",  vertical="center")
+    def hdr_font(c): return Font(bold=True, color="FFFFFFFF", name="Courier New")
+    def row_font(lvl):
+        dark_text = lvl in ("FF",)
+        return Font(name="Courier New", size=10, color="FF111111" if dark_text else "FFFFFFFF")
+    def ctr(): return Alignment(horizontal="center", vertical="center")
+    def lft(): return Alignment(horizontal="left",   vertical="center", wrap_text=True)
 
-    # ── Sheet 1: All nodes ──
+    # ── Sheet 1: All nodes ──────────────────────────────────────────────
     ws = wb.active; ws.title = "FTA Nodes"
-    hdrs = ["Level","Type","Node Name","Gate","Calc. Value","Parent Nodes","Child Nodes","Shared"]
-    for ci,h in enumerate(hdrs,1):
-        c=ws.cell(1,ci,h); c.font=hdr_font(None); c.fill=hdr_fill; c.alignment=ctr()
-    row=2
-    for lvl in LEVEL_ORDER:
-        for n in [x for x in nodes if x["type"]==lvl]:
-            pnames = " | ".join(by_id[p]["name"] for p in (n.get("parentIds") or []) if p in by_id)
-            cnames = " | ".join(x["name"] for x in nodes if n["id"] in (x.get("parentIds") or []))
-            vals   = [LEVEL_ORDER.index(lvl)+1, sanitize_xl(lvl), sanitize_xl(n["name"]),
-                      sanitize_xl(n["gate"]), n.get("calculatedValue"),
-                      sanitize_xl(pnames or "-"), sanitize_xl(cnames or "-"),
-                      "YES" if len(n.get("parentIds") or [])>1 else "NO"]
-            for ci,v in enumerate(vals,1):
-                cell=ws.cell(row,ci,sanitize_xl(v) if isinstance(v,str) else v)
-                cell.font=row_font(lvl); cell.fill=fills.get(lvl,hdr_fill)
-                cell.alignment=lft() if ci==3 else ctr()
-            row+=1
-    for ci,w in enumerate([8,10,28,8,16,30,30,8],1):
-        ws.column_dimensions[get_column_letter(ci)].width=w
+    hdrs = ["Level", "Type", "Node Name", "Node ID", "Gate",
+            "Calc. Value", "Fixed Value (📌)", "Shared", "Parent Nodes", "Child Nodes"]
+    for ci, h in enumerate(hdrs, 1):
+        c = ws.cell(1, ci, h); c.font = hdr_font(None); c.fill = hdr_fill; c.alignment = ctr()
+    row = 2
+    for lvl in DISPLAY_ORDER:
+        for n in [x for x in nodes if x["type"] == lvl]:
+            pnames   = " | ".join(by_id[p]["name"] for p in (n.get("parentIds") or []) if p in by_id)
+            cnames   = " | ".join(x["name"] for x in nodes if n["id"] in (x.get("parentIds") or []))
+            fv       = n.get("fixedValue")
+            fv_str   = fmt(fv) if fv is not None else ""
+            is_pinned = fv is not None
+            vals = [
+                DISPLAY_ORDER.index(lvl) + 1,
+                sanitize_xl(lvl),
+                sanitize_xl(n["name"]),
+                sanitize_xl(n.get("nodeId", n["id"])),
+                sanitize_xl(n["gate"]),
+                n.get("calculatedValue"),
+                sanitize_xl(fv_str),
+                "YES" if len(n.get("parentIds") or []) > 1 else "NO",
+                sanitize_xl(pnames or "-"),
+                sanitize_xl(cnames or "-"),
+            ]
+            node_fill = pin_fill if is_pinned else fills.get(lvl, hdr_fill)
+            for ci, v in enumerate(vals, 1):
+                cell = ws.cell(row, ci, sanitize_xl(v) if isinstance(v, str) else v)
+                cell.font      = row_font(lvl)
+                cell.fill      = node_fill
+                cell.alignment = lft() if ci in (3, 9, 10) else ctr()
+            # Mark fixed value cell red text
+            if is_pinned:
+                ws.cell(row, 7).font = Font(name="Courier New", size=10,
+                                            color="FFFF4D4D", bold=True)
+            row += 1
+    for ci, w in enumerate([8, 10, 28, 12, 8, 16, 16, 8, 30, 30], 1):
+        ws.column_dimensions[get_column_letter(ci)].width = w
 
-    # ── Sheet 2: Per-hazard hierarchy ──
-    ws2=wb.create_sheet("Hierarchy"); ws2.sheet_view.showGridLines=False
-    ws2.cell(1,1,"FTA HIERARCHY - TOP TO BOTTOM").font=Font(bold=True,size=14,name="Courier New",color="FFE94560")
-    ws2.cell(2,1,f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}").font=Font(size=9,name="Courier New",color="FF888888")
-    row=4
+    # ── Sheet 2: Per-hazard hierarchy ───────────────────────────────────
+    ws2 = wb.create_sheet("Hierarchy"); ws2.sheet_view.showGridLines = False
+    ws2.cell(1, 1, "FTA HIERARCHY - TOP TO BOTTOM").font = Font(
+        bold=True, size=14, name="Courier New", color="FFE94560")
+    ws2.cell(2, 1, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}").font = Font(
+        size=9, name="Courier New", color="FF888888")
+    row = 4
     def write_hier(nid, depth, seen):
         nonlocal row
         if nid in seen: return
         seen.add(nid)
-        n=by_id.get(nid)
+        n = by_id.get(nid)
         if not n: return
-        label=f"{'    '*depth}{'  -> ' if depth else ''}{n['name']}"
-        shared=" [SHARED]" if len(n.get("parentIds") or [])>1 else ""
-        c1=ws2.cell(row,1,sanitize_xl(label))
-        c2=ws2.cell(row,2,sanitize_xl(f"{n['type']}[{n['gate']}]"))
-        c3=ws2.cell(row,3,sanitize_xl(fmt(n.get("calculatedValue"))))
-        c4=ws2.cell(row,4,sanitize_xl(shared))
-        fhex={"HAZARD":"FFFF4D4D","SF":"FFFF8C42","FF":"FFF5C518","IF":"FF4CAF7D"}.get(n["type"],"FF222222")
-        for c in [c1,c2,c3,c4]:
-            c.font=Font(name="Courier New",size=10,bold=(depth==0),
-                        color="FF111111" if n["type"]=="FF" else "FFFFFFFF")
-            c.fill=PatternFill("solid",fgColor=fhex)
-        c3.alignment=Alignment(horizontal="right",vertical="center")
-        row+=1
+        label  = f"{'    ' * depth}{'  -> ' if depth else ''}{n['name']}"
+        tags   = []
+        if len(n.get("parentIds") or []) > 1: tags.append("[SHARED]")
+        if n.get("fixedValue") is not None:    tags.append(f"[FIXED={fmt(n['fixedValue'])}]")
+        if n["type"] == "GROUP":               tags.append("[GROUP]")
+        tag_str = " ".join(tags)
+        fhex = {"HAZARD":"FFFF4D4D","SF":"FFFF8C42","FF":"FFF5C518",
+                "IF":"FF4CAF7D","GROUP":"FF7E57C2"}.get(n["type"], "FF1A3A6B")
+        dark_text = n["type"] in ("FF",)
+        txt_color = "FF111111" if dark_text else "FFFFFFFF"
+        c1 = ws2.cell(row, 1, sanitize_xl(label))
+        c2 = ws2.cell(row, 2, sanitize_xl(f"{n['type']}[{n['gate']}]"))
+        c3 = ws2.cell(row, 3, sanitize_xl(fmt(n.get("calculatedValue"))))
+        c4 = ws2.cell(row, 4, sanitize_xl(tag_str))
+        for c in [c1, c2, c3, c4]:
+            c.font = Font(name="Courier New", size=10, bold=(depth == 0), color=txt_color)
+            c.fill = PatternFill("solid", fgColor=fhex)
+        c3.alignment = Alignment(horizontal="right", vertical="center")
+        if n.get("fixedValue") is not None:
+            c3.font = Font(name="Courier New", size=10, bold=True,
+                           color="FFFF4D4D")  # red for pinned
+        row += 1
         for child in [x for x in nodes if nid in (x.get("parentIds") or [])]:
-            write_hier(child["id"],depth+1,seen)
-    for h in [n for n in nodes if n["type"]=="HAZARD"]:
-        write_hier(h["id"],0,set())
-        row+=1  # blank line between hazards
-    for ci,w in enumerate([50,16,16,12],1):
-        ws2.column_dimensions[get_column_letter(ci)].width=w
+            write_hier(child["id"], depth + 1, seen)
+
+    for h in [n for n in nodes if n["type"] == "HAZARD"]:
+        write_hier(h["id"], 0, set())
+        row += 1  # blank line between hazards
+    for ci, w in enumerate([50, 16, 16, 24], 1):
+        ws2.column_dimensions[get_column_letter(ci)].width = w
 
     buf=io.BytesIO(); wb.save(buf); buf.seek(0)
     return buf.getvalue()
@@ -923,7 +989,7 @@ st.markdown(f"""
       ⚠ FTA REVERSE ENGINEER
     </div>
     <div style="font-size:9px;color:#888;letter-spacing:3px;margin-top:1px;">
-      FAULT TREE ANALYSIS · TOP-DOWN DISTRIBUTION · {len(nodes)} nodes · {len(hazards)} hazard(s)
+      FAULT TREE ANALYSIS · TOP-DOWN DISTRIBUTION · {len(nodes)} nodes · {len(hazards)} hazard(s){f" · {sum(1 for n in nodes if n.get('fixedValue') is not None)} pinned 📌" if any(n.get('fixedValue') is not None for n in nodes) else ""}
     </div>
   </div>
   <div style="text-align:right;">
@@ -1481,11 +1547,12 @@ with tab_vals:
                 </div>""", unsafe_allow_html=True)
 
         st.markdown("---")
-        cols = st.columns(5)
-        counts = [(lvl, len(show_by_level[lvl])) for lvl in DISPLAY_ORDER] + [("TOTAL", len(show))]
+        cols = st.columns(6)
+        counts = [(lvl, len(show_by_level[lvl])) for lvl in DISPLAY_ORDER]
+        counts += [("TOTAL", len(show)), ("📌 PINNED", sum(1 for n in show if n.get("fixedValue") is not None))]
         for i,(lvl,cnt) in enumerate(counts):
-            with cols[i%5]:
-                c = LEVEL_COLORS.get(lvl,"#e94560")
+            with cols[i%6]:
+                c = "#e94560" if lvl == "📌 PINNED" else LEVEL_COLORS.get(lvl,"#e94560")
                 st.markdown(f"""<div style="background:#141414;border:1px solid {c}44;border-radius:5px;padding:8px;text-align:center;">
                   <div style="font-size:8px;color:#555;letter-spacing:2px;">{lvl}</div>
                   <div style="font-size:18px;font-weight:700;color:{c};">{cnt}</div>
