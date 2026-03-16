@@ -1430,77 +1430,151 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
         else:
             edit_opts  = {f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name']}": n["id"] for n in nodes}
             edit_label = st.selectbox("Select node to edit", ["— select —"] + list(edit_opts.keys()), key="edit_sel")
+
             if edit_label != "— select —":
-                eid  = edit_opts[edit_label]
-                en   = next((n for n in nodes if n["id"] == eid), None)
+                eid = edit_opts[edit_label]
+                en  = next((n for n in nodes if n["id"] == eid), None)
+
+                # ── Detect node switch — clear stale widget state ──────
+                prev_eid = st.session_state.get("_edit_prev_eid")
+                if prev_eid != eid:
+                    # Node changed — purge old widget values so fields
+                    # show the newly selected node's data, not the old one
+                    for k in ["en_name","en_nid","en_gate","en_type","en_par",
+                               "en_tgt","en_use_fix","en_fv"]:
+                        st.session_state.pop(k, None)
+                    st.session_state["_edit_prev_eid"] = eid
+
                 if en:
-                    color = LEVEL_COLORS.get(en["type"], "#888")
+                    color     = LEVEL_COLORS.get(en["type"], "#888")
                     is_shared = len(en.get("parentIds") or []) > 1
-                    st.markdown(f"""<div style="background:#141414;border:2px solid {color};border-radius:8px;padding:8px 12px;margin-bottom:8px;">
-                      <div style="font-size:8px;color:#888;letter-spacing:2px;">EDITING</div>
-                      <div style="font-weight:700;color:{color};">{en['name']}</div>
-                      <div style="font-size:9px;color:#666;">{en['type']} · {en['gate']}
+                    ex_pnames = " · ".join(
+                        by_id[p]["name"] for p in (en.get("parentIds") or []) if p in by_id
+                    ) or "—"
+
+                    st.markdown(f"""
+                    <div style="background:#141414;border:2px solid {color};border-radius:8px;
+                                padding:8px 12px;margin-bottom:8px;">
+                      <div style="font-size:8px;color:#888;letter-spacing:2px;margin-bottom:2px;">EDITING</div>
+                      <div style="font-weight:700;color:{color};font-size:13px;">{en['name']}</div>
+                      <div style="font-size:9px;color:#666;margin-top:2px;">
+                        {en['type']} · {en['gate']} · {en.get('nodeId', en['id'])}
                         {'&nbsp;<span style="background:#f5c518;color:#111;font-size:7px;padding:1px 4px;border-radius:3px;font-weight:700;">SHARED</span>' if is_shared else ''}
-                      </div></div>""", unsafe_allow_html=True)
+                      </div>
+                      <div style="font-size:9px;color:#555;margin-top:2px;">Parents: {ex_pnames}</div>
+                    </div>""", unsafe_allow_html=True)
+
+                    # ── Edit fields ───────────────────────────────────────
                     new_name    = st.text_input("Name", value=en["name"], key="en_name")
-                    new_node_id = st.text_input("Node ID", value=en.get("nodeId", en["id"]), key="en_nid")
-                    new_gate    = st.radio("Gate", ["OR","AND"], index=0 if en["gate"]=="OR" else 1,
-                                           horizontal=True, key="en_gate")
+
+                    # Node ID split: prefix + number (same as ADD tab)
+                    cur_nid = en.get("nodeId", en["id"])
+                    # Try to parse existing nodeId into prefix/number
+                    import re as _re
+                    nid_match = _re.match(r'^([A-Za-z]+)-(.+)$', cur_nid)
+                    cur_prefix = nid_match.group(1).upper() if nid_match else "IF"
+                    cur_num    = nid_match.group(2) if nid_match else cur_nid
+
+                    st.markdown("<div style='font-size:9px;color:#aaa;margin:4px 0 2px;'>Node ID</div>",
+                                unsafe_allow_html=True)
+                    ec1, ec2 = st.columns([1, 2])
+                    with ec1:
+                        valid_prefixes = ["IF","FF","SF","GROUP","HAZ","OTHER"]
+                        prefix_idx = valid_prefixes.index(cur_prefix) if cur_prefix in valid_prefixes else 0
+                        edit_prefix = st.selectbox("Prefix", valid_prefixes,
+                                                   index=prefix_idx, key="en_nid_prefix",
+                                                   label_visibility="collapsed")
+                    with ec2:
+                        edit_num = st.text_input("Number", value=cur_num,
+                                                 key="en_nid_num", label_visibility="collapsed",
+                                                 placeholder="196, 23a …")
+                    new_node_id = f"{edit_prefix}-{edit_num.strip()}" if edit_num.strip() else cur_nid
+
+                    new_gate = st.radio("Gate", ["OR","AND"],
+                                        index=0 if en["gate"] == "OR" else 1,
+                                        horizontal=True, key="en_gate")
+
+                    new_type = en["type"]
+                    new_pids = list(en.get("parentIds") or [])
+                    new_tgt  = None
+
                     if en["type"] != "HAZARD":
                         ti       = VALID_CHILD_TYPES.index(en["type"]) if en["type"] in VALID_CHILD_TYPES else 0
                         new_type = st.selectbox("Type", VALID_CHILD_TYPES, index=ti, key="en_type")
                         avail_p  = {f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name']}": n["id"]
                                     for n in nodes if n["type"] in VALID_PARENT_TYPES and n["id"] != eid}
-                        cur_pl   = [lbl for lbl,pid in avail_p.items() if pid in (en.get("parentIds") or [])]
-                        new_pl   = st.multiselect("Parents", list(avail_p.keys()), default=cur_pl, key="en_par",
-                                                   help="Add/remove parents to link as shared node.")
+                        cur_pl   = [lbl for lbl, pid in avail_p.items()
+                                    if pid in (en.get("parentIds") or [])]
+                        new_pl   = st.multiselect("Parents", list(avail_p.keys()),
+                                                   default=cur_pl, key="en_par",
+                                                   help="Add/remove parents — links this node as shared.")
                         new_pids = [avail_p[l] for l in new_pl]
                     else:
-                        new_type = "HAZARD"; new_pids = []
-                        new_tgt  = st.text_input("Target Rate", value=str(en.get("targetValue","")), key="en_tgt")
+                        new_tgt = st.text_input("Target Rate",
+                                                value=str(en.get("targetValue", "")),
+                                                key="en_tgt")
 
                     # ── Fixed value pin ──────────────────────────────────
                     cur_fv     = en.get("fixedValue")
-                    en_use_fix = st.checkbox("📌 Pin to fixed value", value=(cur_fv is not None), key="en_use_fix",
-                                             help="Pin this node's rate. Siblings in the same OR gate receive the remainder of the parent budget.")
+                    en_use_fix = st.checkbox("📌 Pin to fixed value",
+                                             value=(cur_fv is not None),
+                                             key="en_use_fix",
+                                             help="Pin this node's rate. Siblings get the remainder.")
                     en_fv_input = None
                     if en_use_fix:
-                        en_fv_input = st.text_input("Fixed Value", value=str(cur_fv) if cur_fv is not None else "",
-                                                     placeholder="e.g. 1.67e-9 or 0", key="en_fv",
-                                                     help="e.g. 0 for negligible, or a known component rate")
+                        en_fv_input = st.text_input(
+                            "Fixed Value",
+                            value=str(cur_fv) if cur_fv is not None else "",
+                            placeholder="e.g. 1.67e-9 or 0",
+                            key="en_fv",
+                            help="e.g. 0 for negligible, 1e-12 for residual")
                     if cur_fv is not None and not en_use_fix:
-                        st.markdown(f"<div style='font-size:9px;color:#f5c518;'>📌 Currently pinned to <b>{fmt(cur_fv)}</b> — uncheck removes pin</div>",
-                                    unsafe_allow_html=True)
+                        st.markdown(
+                            f"<div style='font-size:9px;color:#f5c518;margin-top:2px;'>"
+                            f"📌 Currently pinned to <b>{fmt(cur_fv)}</b> — uncheck removes pin</div>",
+                            unsafe_allow_html=True)
 
+                    # ── Buttons ──────────────────────────────────────────
                     c1, c2 = st.columns(2)
                     with c1:
                         if st.button("💾 APPLY", use_container_width=True, type="primary"):
                             new_fv = None
                             if en_use_fix and en_fv_input is not None:
                                 try:    new_fv = float(en_fv_input)
-                                except: new_fv = None
+                                except: st.error("Fixed value must be a number e.g. 1.67e-9")
+
                             upd = []
                             for n in nodes:
                                 if n["id"] == eid:
                                     n = dict(n)
                                     n["name"]       = new_name.strip() or n["name"]
                                     n["gate"]       = new_gate
-                                    n["nodeId"]     = new_node_id.strip() or n.get("nodeId", n["id"])
+                                    n["nodeId"]     = new_node_id
                                     n["fixedValue"] = new_fv
                                     if n["type"] != "HAZARD":
                                         n["type"]      = new_type
-                                        n["parentIds"] = new_pids
+                                        n["parentIds"] = new_pids if new_pids else n.get("parentIds", [])
                                     else:
-                                        try:
-                                            tv = float(new_tgt)
-                                            n["targetValue"] = tv; n["calculatedValue"] = tv
-                                        except: pass
+                                        if new_tgt:
+                                            try:
+                                                tv = float(new_tgt)
+                                                n["targetValue"]    = tv
+                                                n["calculatedValue"] = tv
+                                            except: pass
                                 upd.append(n)
-                            st.session_state.tree_state["focus_id"] = eid
+
+                            # Clear stale widget state and force tree rebuild
+                            for k in ["en_name","en_nid_prefix","en_nid_num","en_gate",
+                                      "en_type","en_par","en_tgt","en_use_fix","en_fv",
+                                      "_edit_prev_eid"]:
+                                st.session_state.pop(k, None)
+
+                            st.session_state.nodes_hash       = ""   # force tree redraw
                             st.session_state.nodes_since_calc += 1
+                            st.session_state.tree_state["focus_id"] = eid
                             set_nodes(upd)
-                            st.success("Updated. Press CALCULATE to refresh values.")
-                            st.rerun()
+                            st.rerun(scope="app")   # full page rerun so tree redraws
+
                     with c2:
                         if en["type"] != "HAZARD":
                             if st.button("🗑 DELETE", use_container_width=True):
@@ -1508,22 +1582,29 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                                 for n in temp_nodes:
                                     if eid in (n.get("parentIds") or []):
                                         n["parentIds"] = [p for p in n["parentIds"] if p != eid]
+                                # Cascade delete orphans
                                 changed = True
                                 while changed:
                                     changed = False
                                     orphan_ids = {n["id"] for n in temp_nodes
-                                                  if n["type"] != "HAZARD" and not n.get("parentIds")}
+                                                  if n["type"] != "HAZARD"
+                                                  and not n.get("parentIds")}
                                     if orphan_ids:
                                         temp_nodes = [n for n in temp_nodes if n["id"] not in orphan_ids]
                                         for n in temp_nodes:
                                             before = len(n.get("parentIds") or [])
-                                            n["parentIds"] = [p for p in (n.get("parentIds") or []) if p not in orphan_ids]
+                                            n["parentIds"] = [p for p in (n.get("parentIds") or [])
+                                                              if p not in orphan_ids]
                                             if len(n.get("parentIds") or []) != before:
                                                 changed = True
+
+                                for k in ["_edit_prev_eid","edit_sel"]:
+                                    st.session_state.pop(k, None)
+                                st.session_state.nodes_hash       = ""
                                 st.session_state.nodes_since_calc += 1
                                 st.session_state.tree_state["focus_id"] = None
                                 set_nodes(temp_nodes)
-                                st.rerun()
+                                st.rerun(scope="app")
 
 with st.sidebar:
     render_sidebar()
