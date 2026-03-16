@@ -1147,25 +1147,46 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                                                 key="add_fixed_val",
                                                 help="This node will always carry this exact failure rate regardless of tree distribution.")
 
-            # Duplicate ID detection
+            # ── Duplicate Node ID detection ───────────────────────────
+            # Rules:
+            # 1. Only trigger if user has typed at least 3 characters
+            # 2. Exact match only on nodeId field (== not 'in')
+            # 3. Match is case-sensitive (IF-196 ≠ IF-195, IF-196 ≠ if-196)
+            # 4. A node whose nodeId was never set (empty/None) never matches
             cid_clean = custom_id.strip()
-            existing_with_id = [n for n in nodes if n.get("nodeId","") == cid_clean and cid_clean != ""]
-            duplicate_found  = len(existing_with_id) > 0
+            existing_with_id = []
+            if len(cid_clean) >= 3:
+                existing_with_id = [
+                    n for n in nodes
+                    if (n.get("nodeId") or "").strip() == cid_clean
+                    and (n.get("nodeId") or "").strip() != ""
+                ]
+            duplicate_found = len(existing_with_id) > 0
 
             if duplicate_found:
                 ex = existing_with_id[0]
-                ex_color  = LEVEL_COLORS.get(ex["type"], "#888")
+                ex_color   = LEVEL_COLORS.get(ex["type"], "#888")
                 ex_parents = " · ".join(by_id[p]["name"] for p in (ex.get("parentIds") or []) if p in by_id) or "none"
+                ex_nid     = ex.get("nodeId", ex["id"])
                 st.markdown(f"""
                 <div style="background:#1a1200;border:2px solid #f5c518;border-radius:8px;padding:10px 12px;margin:8px 0;">
-                  <div style="font-size:9px;color:#f5c518;font-weight:700;letter-spacing:1px;margin-bottom:4px;">
-                    ⚠ NODE ID ALREADY EXISTS
+                  <div style="font-size:9px;color:#f5c518;font-weight:700;letter-spacing:1px;margin-bottom:5px;">
+                    ⚠ NODE ID ALREADY EXISTS IN TREE
                   </div>
-                  <div style="font-size:10px;color:#ddd;">
-                    <b style="color:{ex_color};">{ex['name']}</b> [{ex['type']} · {ex['gate']}]
+                  <div style="font-size:10px;color:#ddd;margin-bottom:3px;">
+                    You typed: <code style="background:#2a2a00;color:#f5c518;padding:1px 5px;border-radius:3px;font-size:10px;">{cid_clean}</code>
+                    &nbsp;→ matches existing node:
+                    <b style="color:{ex_color};">{ex['name']}</b>
                   </div>
-                  <div style="font-size:9px;color:#888;margin-top:3px;">
-                    Parents: {ex_parents} · Value: <span style="color:{ex_color};font-family:monospace;">{fmt(ex.get('calculatedValue'))}</span>
+                  <div style="font-size:9px;color:#888;line-height:1.6;">
+                    Type: <span style="color:{ex_color};">{ex['type']}</span> &nbsp;·&nbsp;
+                    Gate: {ex['gate']} &nbsp;·&nbsp;
+                    Value: <span style="color:{ex_color};font-family:monospace;">{fmt(ex.get('calculatedValue'))}</span><br>
+                    Parents: {ex_parents}
+                  </div>
+                  <div style="font-size:9px;color:#aaa;margin-top:6px;padding-top:6px;border-top:1px solid #2a2a00;">
+                    <b>🔗 Link Shared</b> — add new parents to this existing node (it appears in multiple places)<br>
+                    <b>➕ New Node</b> — create a separate new node that shares the same reference ID label
                   </div>
                 </div>""", unsafe_allow_html=True)
                 col_share, col_new = st.columns(2)
@@ -1184,18 +1205,24 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                                 updated.append(n)
                             st.session_state.tree_state["focus_id"] = ex["id"]
                             st.session_state.nodes_since_calc += 1
-                            set_nodes(updated)  # no auto-recalc
-                            st.success(f"Linked as shared. Press CALCULATE to update values.")
+                            set_nodes(updated)
+                            st.success(f"Linked '{ex['name']}' as shared. Press CALCULATE to update values.")
                             st.rerun()
                 with col_new:
                     if st.button("➕ NEW NODE", use_container_width=True):
                         if not node_name.strip(): st.error("Enter node name")
                         elif not sel_pids:        st.error("Select at least one parent")
                         else:
+                            fv = None
+                            if use_fixed and fixed_val_input:
+                                try: fv = float(fixed_val_input)
+                                except: pass
                             nid = str(uuid.uuid4())[:7]
                             new_node = {"id": nid, "nodeId": cid_clean,
-                                        "name": node_name.strip(), "type": node_type, "gate": gate,
-                                        "targetValue": None, "calculatedValue": None, "parentIds": sel_pids}
+                                        "name": node_name.strip(), "type": node_type,
+                                        "gate": gate, "fixedValue": fv,
+                                        "targetValue": None, "calculatedValue": fv,
+                                        "parentIds": sel_pids}
                             st.session_state.tree_state["focus_id"] = nid
                             st.session_state.nodes_since_calc += 1
                             set_nodes(nodes + [new_node])
