@@ -599,85 +599,6 @@ function ownerSF(id,depth){
 }
 
 // ── column layout ─────────────────────────────────────────────────────
-function computeCols(reset){
-  const vis=getVis();
-  const W=wrap.getBoundingClientRect().width||1200;
-  const sfNodes=vis.filter(n=>n.type==="SF");
-
-  // Count IF descendants per SF for proportional width
-  const leafCount={};
-  sfNodes.forEach(sf=>{
-    const sub=subIds(sf.id);
-    leafCount[sf.id]=Math.max(1,[...sub].filter(id=>{const n=NM[id];return n&&n.type==="IF"&&vis.find(v=>v.id===id);}).length);
-  });
-  const total=Object.values(leafCount).reduce((a,b)=>a+b,0)||1;
-  const usable=W-40;
-
-  // Build column ranges
-  const cols={};
-  let cx=20;
-  sfNodes.forEach(sf=>{
-    const w=Math.max(NW+HG*3,(leafCount[sf.id]/total)*usable);
-    cols[sf.id]={x0:cx,x1:cx+w,mid:cx+w/2,w};
-    cx+=w;
-  });
-
-  vis.forEach(n=>{
-    const sn=sN.find(s=>s.id===n.id); if(!sn) return;
-    // Is this node in the force-active subtree?
-    const inForce=forceOn&&forceSub&&subIds(forceSub).has(n.id);
-    if(inForce){sn.fx=null;sn.fy=null;return;}
-
-    if(!reset&&uP[n.id]){sn.x=uP[n.id].x;sn.y=uP[n.id].y;sn.fx=sn.x;sn.fy=sn.y;return;}
-
-    if(n.type==="HAZARD"){sn.x=W/2;sn.y=layY(0);sn.bx=W/2;}
-    else {
-      const sf=ownerSF(n.id,0);
-      const col=sf&&cols[sf];
-      if(n.type==="SF"&&col){sn.x=col.mid;sn.y=layY(1);sn.bx=col.mid;}
-      else if(col){
-        // Siblings of same type within column
-        const sibs=vis.filter(s=>s.type===n.type&&ownerSF(s.id,0)===sf);
-        const idx=sibs.findIndex(s=>s.id===n.id);
-        const cnt=sibs.length||1;
-        const sp=Math.min(NW+HG,col.w/(cnt+.5));
-        sn.x=col.mid-sp*(cnt-1)/2+idx*sp;
-        sn.y=layY(n.row);
-        sn.bx=col.mid;
-      }else{sn.x=W/2;sn.y=layY(n.row);sn.bx=W/2;}
-    }
-    uP[n.id]={x:sn.x,y:sn.y};
-    sn.fx=sn.x; sn.fy=sn.y;
-  });
-}
-
-// ── lane overlay ──────────────────────────────────────────────────────
-function updateLanes(){
-  const el=document.getElementById("lanes"); el.innerHTML="";
-  const vis=getVis();
-  const rows=[...new Set(vis.map(n=>n.row))].sort((a,b)=>a-b);
-  const t=getT(); const H=wrap.getBoundingClientRect().height||700;
-  rows.forEach((row,ri)=>{
-    const yw=layY(row),ys=t.apply([0,yw])[1];
-    // next row is the next entry in the sorted list, or H+200 if last
-    const nextRow=rows[ri+1];
-    const yn=nextRow!==undefined?t.apply([0,layY(nextRow)])[1]:H+200;
-    const bh=Math.max(40,yn-ys);
-    if(ys>H+50||ys+bh<-50)return;
-    const rowKey=String(row);
-    const col=LCOLORS[rowKey]||"#888";
-    const d=document.createElement("div"); d.className="lb";
-    // For GROUP (row=2.5) make the band narrower since it's an intermediate layer
-    const bandH=row===2.5?Math.max(30,VG*t.k*.5):Math.max(40,VG*t.k*.92);
-    d.style.top=(ys-bandH*.46)+"px";
-    d.style.height=bandH+"px";
-    const stripe=document.createElement("div"); stripe.className="ls"; stripe.style.background=col; d.appendChild(stripe);
-    const tag=document.createElement("div"); tag.className="lt"; tag.style.color=col; tag.textContent=LLABELS[rowKey]||""; d.appendChild(tag);
-    el.appendChild(d);
-  });
-}
-
-// ── refresh ────────────────────────────────────────────────────────────
 function refresh(){
   const vis=getVis(); const ex={};
   sN.forEach(n=>ex[n.id]=n);
@@ -685,7 +606,7 @@ function refresh(){
   const vs=new Set(sN.map(n=>n.id));
   sL=RLINKS.filter(l=>vs.has(l.sid)&&vs.has(l.tid)).map(l=>{const s=sN.find(n=>n.id===l.sid),t=sN.find(n=>n.id===l.tid);return s&&t?{source:s,target:t,andGate:l.andGate,shared:l.shared}:null;}).filter(Boolean);
   sim.nodes(sN); sim.force("link").links(sL); sim.force("x").x(d=>d.bx||400);
-  computeCols(false); drawLinks(); drawNodes(); tick(); updateLanes();
+  computeRTLayout(false); drawLinks(); drawNodes(); tick(); updateLanes();
   if(forceOn) sim.alpha(.3).restart();
 }
 
@@ -708,7 +629,7 @@ function drawNodes(){
     .on("dblclick",(e,d)=>{e.stopPropagation();toggleCollapse(d.id);})
     .call(d3.drag().filter(e=>e.button===0)
       .on("start",(e,d)=>{e.sourceEvent.stopPropagation();if(forceOn&&!e.active)sim.alphaTarget(.05).restart();d.fx=d.x;d.fy=d.y;})
-      .on("drag",(e,d)=>{d.x=d.fx=e.x;d.y=d.fy=e.y;uP[d.id]={x:e.x,y:e.y};tick();})
+      .on("drag",(e,d)=>{d.x=d.fx=e.x;d.y=d.fy=e.y;uP[d.id]={x:e.x,y:e.y,manual:true};tick();})
       .on("end",(e,d)=>{if(forceOn&&!e.active)sim.alphaTarget(0);const inF=forceOn&&forceSub&&subIds(forceSub).has(d.id);if(!inF){d.fx=d.x;d.fy=d.y;}else{d.fx=null;d.fy=null;}})
     );
   ent.append("rect").attr("class","nb");
@@ -763,13 +684,88 @@ function tick(){
   });
   ng.selectAll("g.nd").attr("transform",d=>`translate(${d.x||0},${d.y||0})`);
 }
+function computeRTLayout(reset){
+  // Reingold-Tilford style: center each parent over its children.
+  // Width of each subtree slot is proportional to its leaf count.
+  // Every time a node is added the whole tree rebalances cleanly.
+  const vis=getVis();
+  const W=wrap.getBoundingClientRect().width||1400;
+  const SLOT=NW+HG;
+
+  const visSet=new Set(vis.map(n=>n.id));
+  // Build child adjacency from visible nodes
+  const childMap={};
+  vis.forEach(n=>{childMap[n.id]=[];});
+  vis.forEach(n=>{
+    (n.parents||[]).forEach(pid=>{
+      if(visSet.has(pid)&&childMap[pid]) childMap[pid].push(n.id);
+    });
+  });
+
+  // Count visible leaves in each subtree
+  const lc={};
+  function cLeaves(id){
+    if(lc[id]!==undefined) return lc[id];
+    const ch=childMap[id]||[];
+    lc[id]=ch.length?ch.reduce((s,c)=>s+cLeaves(c),0):1;
+    return lc[id];
+  }
+  vis.forEach(n=>cLeaves(n.id));
+
+  // Assign x: distribute slice among children proportional to leaf counts,
+  // then center parent over its children.
+  const posMap={};
+  function assignX(id,left,width){
+    const ch=childMap[id]||[];
+    if(!ch.length){posMap[id]=left+width/2;return;}
+    const tot=lc[id]||1;
+    let cur=left;
+    ch.forEach(cid=>{
+      const w=(lc[cid]/tot)*width;
+      assignX(cid,cur,Math.max(w,SLOT));
+      cur+=Math.max(w,SLOT);
+    });
+    const xs=ch.map(c=>posMap[c]);
+    posMap[id]=(Math.min(...xs)+Math.max(...xs))/2;
+  }
+
+  // Roots = visible nodes with no visible parents
+  const roots=vis.filter(n=>(n.parents||[]).every(p=>!visSet.has(p)));
+  const totLeaves=roots.reduce((s,r)=>s+cLeaves(r.id),0)||1;
+  const MARGIN=50;
+  const usable=Math.max(W-MARGIN*2,roots.length*SLOT*3);
+  let cur=MARGIN;
+  roots.forEach(r=>{
+    const w=Math.max((lc[r.id]/totLeaves)*usable,SLOT*2);
+    assignX(r.id,cur,w);
+    cur+=w;
+  });
+
+  // Apply to simNodes
+  vis.forEach(n=>{
+    const sn=sN.find(s=>s.id===n.id); if(!sn) return;
+    const inForce=forceOn&&forceSub&&subIds(forceSub).has(n.id);
+    if(inForce){sn.fx=null;sn.fy=null;return;}
+    // Respect manual drag only if not resetting
+    if(!reset&&uP[n.id]?.manual){
+      sn.x=uP[n.id].x; sn.y=uP[n.id].y;
+      sn.fx=sn.x; sn.fy=sn.y;
+      return;
+    }
+    const nx=posMap[n.id]??sn.x??W/2;
+    const ny=layY(n.row);
+    sn.x=nx; sn.y=ny; sn.bx=nx;
+    sn.fx=nx; sn.fy=ny;
+    uP[n.id]={x:nx,y:ny,manual:false};
+  });
+}
 
 function doColumnLayout(reset){
   if(forceOn) stopForce();
-  if(reset) sN.forEach(n=>delete uP[n.id]);
-  computeCols(reset);
+  if(reset) sN.forEach(n=>{delete uP[n.id];n.fx=null;n.fy=null;});
+  computeRTLayout(reset);
   tick(); updateLanes();
-  setTimeout(doFit,60);
+  setTimeout(doFit,80);
 }
 
 function toggleForce(){
@@ -795,7 +791,7 @@ function stopForce(){
   document.getElementById("fst").classList.remove("show");
   forceOn=false; forceSub=null;
   sim.stop();
-  sN.forEach(n=>{n.fx=n.x;n.fy=n.y;uP[n.id]={x:n.x,y:n.y};});
+  sN.forEach(n=>{n.fx=n.x;n.fy=n.y;uP[n.id]={x:n.x,y:n.y,manual:true};});
   drawNodes();
 }
 
@@ -1133,25 +1129,41 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
 
             node_name = st.text_input("Node Name", placeholder="e.g. Pack mechanical damage due to crash", key="add_name")
 
-            # ── Node ID (mandatory) ──────────────────────────────────
-            c_id, c_ft = st.columns([2, 1])
-            with c_id:
-                custom_id = st.text_input(
-                    "Node ID ★ required",
-                    placeholder="e.g. IF-196, FF-01",
-                    key="add_cid",
-                    help="Mandatory reference ID. Searched live across the full tree as you type."
+            # ── Node ID (mandatory) — split into type prefix + number ──
+            # Column 1: prefix dropdown (SF, FF, IF, GROUP)
+            # Column 2: alphanumeric number (196, 23a, 56b)
+            # Column 3: FT Label (optional, e.g. FT-46)
+            st.markdown("<div style='font-size:9px;color:#ff8c42;font-weight:700;letter-spacing:1px;margin:4px 0 2px 0;'>NODE ID ★ required</div>", unsafe_allow_html=True)
+            c_prefix, c_num, c_ft = st.columns([1, 1, 1])
+            with c_prefix:
+                id_prefix = st.selectbox(
+                    "Type",
+                    ["IF", "FF", "SF", "GROUP", "HAZ", "OTHER"],
+                    key="add_id_prefix",
+                    label_visibility="collapsed",
+                    help="Node type prefix: IF / FF / SF / GROUP / HAZ"
+                )
+            with c_num:
+                id_num = st.text_input(
+                    "Number",
+                    placeholder="e.g. 196, 23a, 56b",
+                    key="add_id_num",
+                    label_visibility="collapsed",
+                    help="Alphanumeric part of the ID e.g. 196, 23a, 56b"
                 )
             with c_ft:
                 ft_label = st.text_input(
-                    "FT Label (optional)",
-                    placeholder="e.g. FT-46",
+                    "FT Label",
+                    placeholder="FT-46 (optional)",
                     key="add_ft",
-                    help="Fault tree label e.g. FT-46. Appended as a tag on the node."
+                    label_visibility="collapsed",
+                    help="Fault tree reference label e.g. FT-46"
                 )
 
-            cid_clean = custom_id.strip()
-            ft_clean  = ft_label.strip()
+            # Compose full Node ID from prefix + number
+            id_num_clean = id_num.strip()
+            ft_clean     = ft_label.strip()
+            cid_clean    = f"{id_prefix}-{id_num_clean}" if id_num_clean else ""
 
             # ── Live search: check BOTH nodeId AND name ───────────────
             # nodeId search: exact match (IF-196 ≠ IF-195)
