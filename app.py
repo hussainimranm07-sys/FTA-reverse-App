@@ -689,7 +689,7 @@ function drawNodes(){
     .attr("rx",d=>d.isGroup?63:9).attr("ry",d=>d.isGroup?34:9)
     .attr("fill",d=>d.color)
     .attr("stroke",d=>{
-      if(d.isDuplicate) return "#e94560";
+      if(d.isDuplicate) return "#f5c518";
       if(forceSub===d.id&&forceOn) return "#f5c518";
       if(d.isPinned) return "#e94560";
       return d.color;
@@ -698,7 +698,7 @@ function drawNodes(){
     .attr("stroke-dasharray",d=>d.isDuplicate?"6,3":d.isPinned?"6,3":null)
     .attr("opacity",d=>d.isDuplicate?1:1);
   all.select("text.nt").attr("y",d=>d.isGroup?-16:-NH/2+13).attr("fill",d=>d.tcolor)
-    .text(d=>d.isGroup?"COMBINED":d.type+(d.shared?" ◈":"")+(d.isPinned?" 📌":"")+(d.isDuplicate?" ⚠":""));
+    .text(d=>d.isGroup?"COMBINED":d.type+(d.shared?" ◈":"")+(d.isPinned?" 📌":"")+(d.isDuplicate?" ◈":""));
   all.select("foreignObject.nf")
     .attr("x",d=>d.isGroup?-57:-NW/2+7).attr("y",d=>d.isGroup?-22:-NH/2+17)
     .attr("width",d=>d.isGroup?114:NW-14).attr("height",d=>d.isGroup?28:40)
@@ -904,7 +904,7 @@ function clearHL(){
   selId=null;
   ng.selectAll("g.nd").attr("opacity",1).select("rect.nb")
     .attr("stroke",d=>{
-      if(d.isDuplicate) return "#e94560";
+      if(d.isDuplicate) return "#f5c518";
       if(forceSub===d.id&&forceOn) return "#f5c518";
       if(d.isPinned) return "#e94560";
       return d.color;
@@ -1721,7 +1721,11 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                                 set_nodes(temp_nodes)
                                 st.rerun(scope="app")
 
-    # ── SHARED tab ────────────────────────────────────────────────────
+    # ── SHARED tab ────────────────────────────────────────────────────────
+    # Model: "shared instances" = multiple nodes with the same nodeId.
+    # Each is a separate physical node in a different branch of the tree.
+    # They represent the same real-world failure appearing in multiple places.
+    # Constraint: only nodes with IDENTICAL nodeId can be in the same group.
     with tab_shared:
         nodes  = st.session_state.nodes
         by_id  = {n["id"]: n for n in nodes}
@@ -1730,186 +1734,235 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
             st.markdown("<div style='color:#555;font-size:11px;'>No nodes yet.</div>",
                         unsafe_allow_html=True)
         else:
-            # ── Section 1: Shared nodes (one node, multiple parents) ──
-            shared_nodes = [n for n in nodes
-                            if len(n.get("parentIds") or []) > 1]
-
-            # ── Section 2: Duplicate nodeId groups ───────────────────
             from collections import defaultdict as _dd2
+
+            # Build groups: nodeId → list of nodes (only nodeId groups with 2+ members)
             nid_map = _dd2(list)
             for n in nodes:
                 nid = (n.get("nodeId") or "").strip()
                 if nid:
                     nid_map[nid].append(n)
-            dup_groups = {nid: grp for nid, grp in nid_map.items() if len(grp) > 1}
+            # Shared instance groups = same nodeId, multiple nodes
+            shared_groups = {nid: grp for nid, grp in nid_map.items() if len(grp) > 1}
+            # Single-parent shared (Link Shared pattern) = one node, multiple parents
+            true_shared   = [n for n in nodes if len(n.get("parentIds") or []) > 1]
 
-            # ── Summary badges ────────────────────────────────────────
-            cs, cd = st.columns(2)
-            with cs:
-                sc = "#f5c518" if shared_nodes else "#333"
-                st.markdown(f"""<div style="background:#141414;border:1.5px solid {sc};
-                    border-radius:6px;padding:8px;text-align:center;">
-                  <div style="font-size:8px;color:#555;letter-spacing:2px;">SHARED NODES</div>
-                  <div style="font-size:22px;font-weight:700;color:{sc};">{len(shared_nodes)}</div>
-                  <div style="font-size:8px;color:#555;">same node, multiple parents</div>
+            # ── Summary ───────────────────────────────────────────────
+            c1, c2 = st.columns(2)
+            with c1:
+                sc = "#f5c518" if shared_groups else "#333"
+                st.markdown(f"""<div style="background:#141414;border:1.5px solid {sc}44;
+                    border-radius:6px;padding:7px;text-align:center;">
+                  <div style="font-size:8px;color:#555;letter-spacing:2px;">INSTANCE GROUPS</div>
+                  <div style="font-size:22px;font-weight:700;color:{sc};">{len(shared_groups)}</div>
+                  <div style="font-size:8px;color:#555;">same nodeId, multiple branches</div>
                 </div>""", unsafe_allow_html=True)
-            with cd:
-                dc = "#e94560" if dup_groups else "#333"
-                st.markdown(f"""<div style="background:#141414;border:1.5px solid {dc};
-                    border-radius:6px;padding:8px;text-align:center;">
-                  <div style="font-size:8px;color:#555;letter-spacing:2px;">DUPLICATE IDs</div>
-                  <div style="font-size:22px;font-weight:700;color:{dc};">{len(dup_groups)}</div>
-                  <div style="font-size:8px;color:#555;">same nodeId, different nodes</div>
+            with c2:
+                tc = "#4fc3f7" if true_shared else "#333"
+                st.markdown(f"""<div style="background:#141414;border:1.5px solid {tc}44;
+                    border-radius:6px;padding:7px;text-align:center;">
+                  <div style="font-size:8px;color:#555;letter-spacing:2px;">LINK-SHARED</div>
+                  <div style="font-size:22px;font-weight:700;color:{tc};">{len(true_shared)}</div>
+                  <div style="font-size:8px;color:#555;">one node, multiple parents</div>
                 </div>""", unsafe_allow_html=True)
 
-            # ── Shared nodes list ─────────────────────────────────────
-            if shared_nodes:
+            st.markdown(
+                "<div style='font-size:8px;color:#555;margin:6px 0;'>"
+                "🟡 Dotted yellow border in tree = node appears in multiple branches (same NodeID).</div>",
+                unsafe_allow_html=True)
+
+            # ── Expandable group per nodeId ───────────────────────────
+            if shared_groups:
                 st.markdown("---")
                 st.markdown(
-                    "<div style='font-size:9px;color:#f5c518;letter-spacing:2px;"
-                    "margin-bottom:6px;'>◈ SHARED NODES</div>",
+                    "<div style='font-size:9px;color:#f5c518;font-weight:700;"
+                    "letter-spacing:2px;margin-bottom:6px;'>◈ INSTANCE GROUPS</div>",
                     unsafe_allow_html=True)
-                for n in shared_nodes:
+
+                for nid_label, grp in sorted(shared_groups.items()):
+                    grp_color = LEVEL_COLORS.get(grp[0]["type"], "#888")
+                    grp_vals  = [fmt(n.get("calculatedValue")) for n in grp]
+
+                    with st.expander(
+                        f"◈ {nid_label}  ·  {len(grp)} instances  ·  {grp[0]['type']}",
+                        expanded=False
+                    ):
+                        # Each instance card
+                        for inst in grp:
+                            ic = LEVEL_COLORS.get(inst["type"], "#888")
+                            iv = fmt(inst.get("calculatedValue"))
+                            ip = [by_id[p]["name"] for p in (inst.get("parentIds") or []) if p in by_id]
+                            ich= [c["name"] for c in nodes if inst["id"] in (c.get("parentIds") or [])]
+                            ift= inst.get("ftLabel","")
+
+                            st.markdown(f"""
+                            <div style="background:#141414;border:1.5px solid #f5c51844;
+                                        border-left:3px solid {ic};
+                                        border-radius:0 6px 6px 0;padding:7px 10px;margin-bottom:5px;">
+                              <div style="display:flex;align-items:center;gap:6px;margin-bottom:2px;">
+                                <span style="font-weight:700;font-size:10px;color:#ddd;">{inst['name']}</span>
+                                {f'<code style="background:#1a1a2e;color:#7e57c2;font-size:7px;padding:1px 4px;border-radius:3px;">{ift}</code>' if ift else ''}
+                                <span style="font-size:11px;color:{ic};font-family:monospace;font-weight:700;margin-left:auto;">{iv}</span>
+                              </div>
+                              <div style="font-size:8px;color:#666;">
+                                {inst['type']} · {inst['gate']}
+                                {'&nbsp;📌 FIXED' if inst.get('fixedValue') is not None else ''}
+                              </div>
+                              <div style="font-size:8px;color:#555;margin-top:2px;">
+                                ↑ Parent: <b style="color:#ccc">{ip[0] if ip else "(none)"}</b>
+                                {(' · '.join(ip[1:])) if len(ip)>1 else ''}
+                              </div>
+                              <div style="font-size:8px;color:#444;">
+                                ↓ {", ".join(ich) if ich else "(leaf — no children yet)"}
+                              </div>
+                            </div>""", unsafe_allow_html=True)
+
+                            # Per-instance actions
+                            ba, bb, bc = st.columns(3)
+                            with ba:
+                                # Edit this instance inline
+                                with st.popover("✏️ Edit", use_container_width=True):
+                                    st.markdown(f"<div style='font-size:9px;color:#aaa;margin-bottom:4px;'>Editing <b>{nid_label}</b> instance</div>", unsafe_allow_html=True)
+                                    e_name = st.text_input("Name", value=inst["name"],
+                                                           key=f"sh_name_{inst['id']}")
+                                    e_gate = st.radio("Gate", ["OR","AND"],
+                                                      index=0 if inst["gate"]=="OR" else 1,
+                                                      key=f"sh_gate_{inst['id']}", horizontal=True)
+                                    e_fv_on= st.checkbox("📌 Pin value",
+                                                         value=inst.get("fixedValue") is not None,
+                                                         key=f"sh_fv_on_{inst['id']}")
+                                    e_fv   = None
+                                    if e_fv_on:
+                                        e_fv = st.text_input("Fixed value",
+                                            value=str(inst.get("fixedValue","")) ,
+                                            key=f"sh_fv_{inst['id']}", placeholder="e.g. 1e-12")
+                                    if st.button("💾 Apply", key=f"sh_apply_{inst['id']}",
+                                                 type="primary", use_container_width=True):
+                                        fv_parsed = None
+                                        if e_fv_on and e_fv:
+                                            try: fv_parsed = float(e_fv)
+                                            except: pass
+                                        upd = []
+                                        for nd in nodes:
+                                            nd = dict(nd)
+                                            if nd["id"] == inst["id"]:
+                                                nd["name"]       = e_name.strip() or nd["name"]
+                                                nd["gate"]       = e_gate
+                                                nd["fixedValue"] = fv_parsed
+                                            upd.append(nd)
+                                        st.session_state.nodes_hash = ""
+                                        st.session_state.nodes_since_calc += 1
+                                        set_nodes(upd)
+                                        st.rerun(scope="app")
+                            with bb:
+                                # Add another instance of the same nodeId to a new parent
+                                with st.popover("➕ Add copy", use_container_width=True):
+                                    st.markdown(f"<div style='font-size:9px;color:#aaa;margin-bottom:4px;'>Add <b>{nid_label}</b> to another parent</div>", unsafe_allow_html=True)
+                                    avail_p = {
+                                        f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name']}": n["id"]
+                                        for n in nodes
+                                        if n["type"] in VALID_PARENT_TYPES
+                                    }
+                                    new_p_lbl = st.selectbox("Parent", ["— select —"] + list(avail_p.keys()),
+                                                             key=f"sh_newp_{inst['id']}")
+                                    if new_p_lbl != "— select —":
+                                        new_pid = avail_p[new_p_lbl]
+                                        # Check nodeId constraint — warn if parent already has this nodeId
+                                        already = any(
+                                            n.get("nodeId","") == nid_label and new_pid in (n.get("parentIds") or [])
+                                            for n in nodes
+                                        )
+                                        if already:
+                                            st.warning(f"{nid_label} already exists under that parent.")
+                                        else:
+                                            if st.button("➕ Add instance",
+                                                         key=f"sh_addcopy_{inst['id']}",
+                                                         type="primary", use_container_width=True):
+                                                import uuid as _uuid
+                                                new_n = {
+                                                    "id":              str(_uuid.uuid4())[:7],
+                                                    "nodeId":          nid_label,
+                                                    "ftLabel":         inst.get("ftLabel",""),
+                                                    "name":            inst["name"],
+                                                    "type":            inst["type"],
+                                                    "gate":            inst["gate"],
+                                                    "fixedValue":      inst.get("fixedValue"),
+                                                    "targetValue":     None,
+                                                    "calculatedValue": inst.get("fixedValue"),
+                                                    "parentIds":       [new_pid],
+                                                }
+                                                st.session_state.nodes_hash = ""
+                                                st.session_state.nodes_since_calc += 1
+                                                st.session_state.tree_state["focus_id"] = new_pid
+                                                set_nodes(nodes + [new_n])
+                                                st.rerun(scope="app")
+                            with bc:
+                                # Remove this instance (unlink from its parent)
+                                if len(grp) > 1:  # can't remove last instance
+                                    if st.button("🗑 Remove",
+                                                 key=f"sh_rm_{inst['id']}",
+                                                 use_container_width=True,
+                                                 help=f"Remove this instance of {nid_label} from '{ip[0] if ip else '?'}'"):
+                                        upd = [dict(nd) for nd in nodes if nd["id"] != inst["id"]]
+                                        # Re-parent inst's children to inst's parent if any
+                                        for nd in upd:
+                                            if inst["id"] in (nd.get("parentIds") or []):
+                                                nd["parentIds"] = [
+                                                    (ip[0] if ip else p) if p == inst["id"] else p
+                                                    for p in nd["parentIds"]
+                                                ]
+                                        st.session_state.nodes_hash = ""
+                                        st.session_state.nodes_since_calc += 1
+                                        set_nodes(upd)
+                                        st.rerun(scope="app")
+                                else:
+                                    st.markdown(
+                                        "<div style='font-size:8px;color:#333;padding:4px;'>last instance</div>",
+                                        unsafe_allow_html=True)
+
+            # ── True shared nodes (Link Shared — one node multiple parents) ──
+            if true_shared:
+                st.markdown("---")
+                st.markdown(
+                    "<div style='font-size:9px;color:#4fc3f7;font-weight:700;"
+                    "letter-spacing:2px;margin-bottom:6px;'>◈ LINK-SHARED NODES</div>",
+                    unsafe_allow_html=True)
+                st.markdown(
+                    "<div style='font-size:8px;color:#555;margin-bottom:8px;'>"
+                    "One node, connected to multiple parents via Link Shared. "
+                    "The engine takes MAX value across all parent paths.</div>",
+                    unsafe_allow_html=True)
+                for n in true_shared:
                     color  = LEVEL_COLORS.get(n["type"], "#888")
                     val    = fmt(n.get("calculatedValue"))
                     pnames = [by_id[p]["name"] for p in (n.get("parentIds") or []) if p in by_id]
                     cnames = [c["name"] for c in nodes if n["id"] in (c.get("parentIds") or [])]
-                    nid    = n.get("nodeId", n["id"])
+                    nid_d  = n.get("nodeId", n["id"])
                     st.markdown(f"""
-                    <div style="background:#141414;border:1.5px solid #f5c51844;
-                                border-radius:6px;padding:7px 10px;margin-bottom:4px;">
-                      <div style="display:flex;align-items:center;gap:6px;margin-bottom:3px;">
-                        <code style="background:#1a1a2e;color:{color};font-size:9px;
-                               padding:1px 5px;border-radius:3px;">{nid}</code>
+                    <div style="background:#141414;border:1.5px solid #4fc3f733;
+                                border-left:3px solid #4fc3f7;
+                                border-radius:0 6px 6px 0;padding:7px 10px;margin-bottom:4px;">
+                      <div style="display:flex;align-items:center;gap:6px;margin-bottom:2px;">
+                        <code style="background:#0a1a2e;color:#4fc3f7;font-size:9px;
+                               padding:1px 5px;border-radius:3px;">{nid_d}</code>
                         <span style="font-weight:700;font-size:10px;color:#ddd;">{n['name']}</span>
-                        <span style="font-size:8px;color:{color};margin-left:auto;">{n['type']}</span>
+                        <span style="font-size:11px;color:{color};font-family:monospace;
+                               font-weight:700;margin-left:auto;">{val}</span>
                       </div>
-                      <div style="font-size:9px;color:#888;">
-                        Value: <span style="color:{color};font-family:monospace;">{val}</span>
-                        &nbsp;·&nbsp; {len(pnames)} parents
+                      <div style="font-size:8px;color:#555;">
+                        {len(pnames)} parents &nbsp;·&nbsp; {n['type']} [{n['gate']}]
                       </div>
                       <div style="font-size:8px;color:#555;margin-top:2px;">
-                        ↑ {" · ".join(pnames) or "—"}<br>
-                        ↓ {" · ".join(cnames) or "(leaf)"}
+                        ↑ {" · ".join(pnames)}
+                      </div>
+                      <div style="font-size:8px;color:#444;">
+                        ↓ {", ".join(cnames) if cnames else "(leaf)"}
                       </div>
                     </div>""", unsafe_allow_html=True)
 
-            # ── Duplicate nodeId groups ───────────────────────────────
-            if dup_groups:
-                st.markdown("---")
+            if not shared_groups and not true_shared:
                 st.markdown(
-                    "<div style='font-size:9px;color:#e94560;letter-spacing:2px;"
-                    "margin-bottom:4px;'>⚠ DUPLICATE NODE IDs</div>",
-                    unsafe_allow_html=True)
-                st.markdown(
-                    "<div style='font-size:9px;color:#555;margin-bottom:8px;'>"
-                    "These nodes share the same reference ID. "
-                    "Use <b>🔗 Merge</b> to combine them into one shared node, "
-                    "or keep them as separate nodes in different fault trees.</div>",
-                    unsafe_allow_html=True)
-
-                for nid_label, grp in dup_groups.items():
-                    color = LEVEL_COLORS.get(grp[0]["type"], "#888")
-                    st.markdown(f"""
-                    <div style="background:#1a0a0a;border:2px solid #e9456066;
-                                border-radius:7px;padding:8px 10px;margin-bottom:8px;">
-                      <div style="font-size:9px;color:#e94560;font-weight:700;
-                                  letter-spacing:1px;margin-bottom:6px;">
-                        ⚠ &nbsp;{nid_label} &nbsp;·&nbsp; {len(grp)} nodes
-                      </div>""", unsafe_allow_html=True)
-
-                    for idx_g, dn in enumerate(grp):
-                        dn_color  = LEVEL_COLORS.get(dn["type"], "#888")
-                        dn_val    = fmt(dn.get("calculatedValue"))
-                        dn_pnames = [by_id[p]["name"] for p in (dn.get("parentIds") or []) if p in by_id]
-                        dn_cnames = [c["name"] for c in nodes if dn["id"] in (c.get("parentIds") or [])]
-                        st.markdown(f"""
-                        <div style="background:#141414;border:1px solid #e9456033;
-                                    border-radius:5px;padding:6px 9px;margin-bottom:4px;">
-                          <div style="font-weight:700;font-size:10px;color:#ddd;">{dn['name']}</div>
-                          <div style="font-size:8px;color:#666;margin-top:1px;">
-                            {dn['type']} · {dn['gate']} &nbsp;·&nbsp;
-                            Value: <span style="color:{dn_color};font-family:monospace;">{dn_val}</span>
-                          </div>
-                          <div style="font-size:8px;color:#555;margin-top:2px;">
-                            ↑ {" · ".join(dn_pnames) or "(no parents)"}
-                          </div>
-                          <div style="font-size:8px;color:#444;">
-                            ↓ {" · ".join(dn_cnames) or "(leaf)"}
-                          </div>
-                        </div>""", unsafe_allow_html=True)
-
-                    # Merge action — combine all into one shared node
-                    # Strategy: keep the node with the most children (most connected),
-                    # add all parents from others to it, delete the rest
-                    st.markdown(
-                        "<div style='font-size:8px;color:#aaa;margin:4px 0 4px;'>"
-                        "Merge keeps the most-connected node and links all parents to it. "
-                        "Children of deleted nodes are re-parented automatically.</div>",
-                        unsafe_allow_html=True)
-
-                    m1, m2 = st.columns(2)
-                    with m1:
-                        if st.button(f"🔗 Merge '{nid_label}'",
-                                     key=f"merge_{nid_label}",
-                                     use_container_width=True,
-                                     type="primary"):
-                            # Pick canonical: most children, then most parents
-                            def score(x):
-                                ch = sum(1 for c in nodes if x["id"] in (c.get("parentIds") or []))
-                                pa = len(x.get("parentIds") or [])
-                                return (ch, pa)
-                            canon = max(grp, key=score)
-                            others = [x for x in grp if x["id"] != canon["id"]]
-
-                            # Collect all parent ids from duplicates
-                            all_pids = list(canon.get("parentIds") or [])
-                            for o in others:
-                                for pid in (o.get("parentIds") or []):
-                                    if pid not in all_pids:
-                                        all_pids.append(pid)
-
-                            # Build updated node list
-                            other_ids = {o["id"] for o in others}
-                            updated = []
-                            for nd in nodes:
-                                if nd["id"] in other_ids:
-                                    continue  # drop duplicates
-                                nd = dict(nd)
-                                if nd["id"] == canon["id"]:
-                                    nd["parentIds"] = all_pids  # all parents on canonical
-                                # Re-parent any children that pointed to removed nodes
-                                if nd.get("parentIds"):
-                                    new_pids = []
-                                    for pid in nd["parentIds"]:
-                                        if pid in other_ids:
-                                            # Replace with canonical
-                                            if canon["id"] not in new_pids:
-                                                new_pids.append(canon["id"])
-                                        else:
-                                            new_pids.append(pid)
-                                    nd["parentIds"] = new_pids
-                                updated.append(nd)
-
-                            st.session_state.nodes_hash = ""
-                            st.session_state.nodes_since_calc += 1
-                            st.session_state.tree_state["focus_id"] = canon["id"]
-                            set_nodes(updated)
-                            st.success(
-                                f"Merged {len(others)+1} nodes into '{canon['name']}' "
-                                f"({len(all_pids)} parents linked). Press CALCULATE.")
-                            st.rerun()
-                    with m2:
-                        if st.button(f"✕ Keep separate",
-                                     key=f"keep_{nid_label}",
-                                     use_container_width=True,
-                                     help="Keep as distinct nodes — they will remain highlighted "
-                                          "with dotted red border in the tree"):
-                            st.info("Kept separate. They remain highlighted in the tree.")
-
-            if not shared_nodes and not dup_groups:
-                st.markdown(
-                    "<div style='text-align:center;color:#333;font-size:11px;margin-top:20px;'>"
+                    "<div style='text-align:center;color:#333;font-size:11px;margin-top:24px;'>"
                     "✓ No shared or duplicate nodes found</div>",
                     unsafe_allow_html=True)
 
