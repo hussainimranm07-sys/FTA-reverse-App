@@ -163,7 +163,17 @@ def is_named(n): return not is_snap(n)
 
 # ── Export: JSON ──────────────────────────────────────────────────────────
 def export_json(nodes):
-    return json.dumps(nodes, indent=2).encode("utf-8")
+    """Export all nodes. Ensures every node has all standard fields."""
+    clean = []
+    for n in nodes:
+        nc = dict(n)
+        nc.setdefault("nodeId",   nc.get("id",""))
+        nc.setdefault("ftLabel",  "")
+        nc.setdefault("fixedValue", None)
+        nc.setdefault("targetValue", None)
+        nc.setdefault("calculatedValue", None)
+        clean.append(nc)
+    return json.dumps(clean, indent=2).encode("utf-8")
 
 # ── Export: Cypher (Neo4j) ────────────────────────────────────────────────
 def export_cypher(nodes):
@@ -196,12 +206,13 @@ def export_cypher(nodes):
         fv_s      = fmt(fv)  if fv  is not None else "null"
         name      = n["name"].replace("'", "\\'")
         node_id   = (n.get("nodeId") or n["id"]).replace("'", "\\'")
+        ft_lbl    = (n.get("ftLabel") or "").replace("'", "\\'")
         is_shared = len(n.get("parentIds") or []) > 1
         is_pinned = fv is not None
         is_group  = n["type"] == "GROUP"
         lines.append(
             f"CREATE (:FTANode {{"
-            f"id:'{n['id']}', nodeId:'{node_id}', name:'{name}', "
+            f"id:'{n['id']}', nodeId:'{node_id}', ftLabel:'{ft_lbl}', name:'{name}', "
             f"type:'{n['type']}', gate:'{n['gate']}', "
             f"calculatedValue:{val_s if val is not None else 'null'}, "
             f"fixedValue:{fv_s if fv is not None else 'null'}, "
@@ -289,8 +300,9 @@ def export_excel(nodes):
 
     # ── Sheet 1: All nodes ──────────────────────────────────────────────
     ws = wb.active; ws.title = "FTA Nodes"
-    hdrs = ["Level", "Type", "Node Name", "Node ID", "Gate",
-            "Calc. Value", "Fixed Value (📌)", "Shared", "Parent Nodes", "Child Nodes"]
+    hdrs = ["Level", "Type", "Node Name", "Node ID", "FT Label",
+            "Gate", "Calc. Value", "Fixed Value (📌)", "Shared",
+            "Parent Nodes", "Child Nodes"]
     for ci, h in enumerate(hdrs, 1):
         c = ws.cell(1, ci, h); c.font = hdr_font(None); c.fill = hdr_fill; c.alignment = ctr()
     row = 2
@@ -301,11 +313,13 @@ def export_excel(nodes):
             fv       = n.get("fixedValue")
             fv_str   = fmt(fv) if fv is not None else ""
             is_pinned = fv is not None
+            ft_lbl   = n.get("ftLabel", "")
             vals = [
                 DISPLAY_ORDER.index(lvl) + 1,
                 sanitize_xl(lvl),
                 sanitize_xl(n["name"]),
                 sanitize_xl(n.get("nodeId", n["id"])),
+                sanitize_xl(ft_lbl),
                 sanitize_xl(n["gate"]),
                 n.get("calculatedValue"),
                 sanitize_xl(fv_str),
@@ -318,13 +332,13 @@ def export_excel(nodes):
                 cell = ws.cell(row, ci, sanitize_xl(v) if isinstance(v, str) else v)
                 cell.font      = row_font(lvl)
                 cell.fill      = node_fill
-                cell.alignment = lft() if ci in (3, 9, 10) else ctr()
+                cell.alignment = lft() if ci in (3, 10, 11) else ctr()
             # Mark fixed value cell red text
             if is_pinned:
-                ws.cell(row, 7).font = Font(name="Courier New", size=10,
+                ws.cell(row, 8).font = Font(name="Courier New", size=10,
                                             color="FFFF4D4D", bold=True)
             row += 1
-    for ci, w in enumerate([8, 10, 28, 12, 8, 16, 16, 8, 30, 30], 1):
+    for ci, w in enumerate([8, 10, 30, 12, 10, 8, 16, 16, 8, 30, 30], 1):
         ws.column_dimensions[get_column_letter(ci)].width = w
 
     # ── Sheet 2: Per-hazard hierarchy ───────────────────────────────────
@@ -342,9 +356,13 @@ def export_excel(nodes):
         if not n: return
         label  = f"{'    ' * depth}{'  -> ' if depth else ''}{n['name']}"
         tags   = []
-        if len(n.get("parentIds") or []) > 1: tags.append("[SHARED]")
-        if n.get("fixedValue") is not None:    tags.append(f"[FIXED={fmt(n['fixedValue'])}]")
-        if n["type"] == "GROUP":               tags.append("[GROUP]")
+        nid_tag = n.get("nodeId", "")
+        ft_tag  = n.get("ftLabel", "")
+        if nid_tag:                                tags.append(f"[{nid_tag}]")
+        if ft_tag:                                 tags.append(f"[{ft_tag}]")
+        if len(n.get("parentIds") or []) > 1:      tags.append("[SHARED]")
+        if n.get("fixedValue") is not None:        tags.append(f"[FIXED={fmt(n['fixedValue'])}]")
+        if n["type"] == "GROUP":                   tags.append("[GROUP]")
         tag_str = " ".join(tags)
         fhex = {"HAZARD":"FFFF4D4D","SF":"FFFF8C42","FF":"FFF5C518",
                 "IF":"FF4CAF7D","GROUP":"FF7E57C2"}.get(n["type"], "FF1A3A6B")
@@ -890,6 +908,22 @@ function panTo(id){
 refresh();
 doColumnLayout(true);
 if(FOCUSID) setTimeout(()=>panTo(FOCUSID),700);
+
+// ── Position save-back ────────────────────────────────────────────────
+// Sends current node positions to Python via postMessage so they survive
+// page rerenders (CALCULATE, file load, etc.)
+function savePositions(){
+  const pos={};
+  sN.forEach(n=>{if(n.x!=null)pos[n.id]={x:Math.round(n.x),y:Math.round(n.y),manual:!!(uP[n.id]?.manual)};});
+  try{
+    window.parent.postMessage(JSON.stringify({type:"fta_pos",data:pos}),"*");
+  }catch(e){}
+}
+// Save after drag ends — already handled via uP, but also save on stop-force
+// and periodically every 30s in case of drift
+setInterval(savePositions, 30000);
+// Save when user stops interacting
+document.addEventListener("pointerup", ()=>setTimeout(savePositions,500));
 </script></body></html>"""
 
     # Substitute data placeholders
@@ -923,7 +957,8 @@ DEFS = {"nodes":[],"save_status":"idle","save_msg":"","gist_loaded":False,
         "active_file":"my_tree.json","file_list":[],"selected_id":None,
         "tree_filter":"ALL",
         "nodes_since_calc": 0,
-        "nodes_hash": "",      # hash of last rendered tree — only rebuild when changed
+        "pending_node_names": [],   # names of nodes added without calculating
+        "nodes_hash": "",
         "tree_state": {
             "scale": 1.0, "tx": 0, "ty": 0,
             "collapsed": [],
@@ -978,6 +1013,7 @@ def set_nodes(n, recalc=False):
     if recalc:
         n = recalculate(n)
         st.session_state.nodes_since_calc = 0
+        st.session_state.pending_node_names = []
         st.session_state.nodes_hash = ""
     st.session_state.nodes = n
     save_current(n)
@@ -1073,6 +1109,7 @@ def render_sidebar():
                             st.session_state.save_msg = f"Loaded '{fn}'"
                             st.session_state.selected_id = None
                             st.session_state.nodes_since_calc = 0
+                            st.session_state.pending_node_names = []
                             st.session_state.nodes_hash = ""
                             st.rerun(scope="app")
                     with cc:
@@ -1093,6 +1130,7 @@ def render_sidebar():
                             st.session_state.save_msg = f"Loaded snapshot '{fn}'"
                             st.session_state.selected_id = None
                             st.session_state.nodes_since_calc = 0
+                            st.session_state.pending_node_names = []
                             st.session_state.nodes_hash = ""
                             st.rerun(scope="app")
                     with cc:
@@ -1393,6 +1431,9 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                     }
                     st.session_state.tree_state["focus_id"] = sel_pids[0] if sel_pids else nid
                     st.session_state.nodes_since_calc += 1
+                    pnn = st.session_state.get("pending_node_names", [])
+                    pnn.append(f"{cid_clean} {display_name[:30]}")
+                    st.session_state.pending_node_names = pnn[-20:]  # keep last 20
                     set_nodes(nodes + [new_node])
                     st.rerun()
 
@@ -1440,6 +1481,7 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                 set_nodes([])
                 st.session_state.selected_id = None
                 st.session_state.nodes_since_calc = 0
+                st.session_state.pending_node_names = []
                 st.session_state.nodes_hash = ""
                 st.rerun(scope="app")
 
@@ -1461,7 +1503,7 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                 if prev_eid != eid:
                     # Node changed — purge old widget values so fields
                     # show the newly selected node's data, not the old one
-                    for k in ["en_name","en_nid","en_gate","en_type","en_par",
+                    for k in ["en_name","en_nid_prefix","en_nid_num","en_ft","en_gate","en_type","en_par",
                                "en_tgt","en_use_fix","en_fv"]:
                         st.session_state.pop(k, None)
                     st.session_state["_edit_prev_eid"] = eid
@@ -1478,27 +1520,31 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                                 padding:8px 12px;margin-bottom:8px;">
                       <div style="font-size:8px;color:#888;letter-spacing:2px;margin-bottom:2px;">EDITING</div>
                       <div style="font-weight:700;color:{color};font-size:13px;">{en['name']}</div>
-                      <div style="font-size:9px;color:#666;margin-top:2px;">
-                        {en['type']} · {en['gate']} · {en.get('nodeId', en['id'])}
-                        {'&nbsp;<span style="background:#f5c518;color:#111;font-size:7px;padding:1px 4px;border-radius:3px;font-weight:700;">SHARED</span>' if is_shared else ''}
+                      <div style="display:flex;align-items:center;gap:10px;margin-top:3px;">
+                        <div style="font-size:9px;color:#666;">
+                          {en['type']} · {en['gate']} · {en.get('nodeId', en['id'])}
+                          {'&nbsp;<span style="background:#f5c518;color:#111;font-size:7px;padding:1px 4px;border-radius:3px;font-weight:700;">SHARED</span>' if is_shared else ''}
+                        </div>
+                        <div style="font-size:11px;color:{color};font-family:monospace;font-weight:700;margin-left:auto;">
+                          {fmt(en.get('calculatedValue'))}{'📌' if en.get('fixedValue') is not None else ''}
+                        </div>
                       </div>
                       <div style="font-size:9px;color:#555;margin-top:2px;">Parents: {ex_pnames}</div>
                     </div>""", unsafe_allow_html=True)
 
                     # ── Edit fields ───────────────────────────────────────
-                    new_name    = st.text_input("Name", value=en["name"], key="en_name")
+                    new_name = st.text_input("Name", value=en["name"], key="en_name")
 
-                    # Node ID split: prefix + number (same as ADD tab)
+                    # Node ID split: prefix + number + FT label
                     cur_nid = en.get("nodeId", en["id"])
-                    # Try to parse existing nodeId into prefix/number
                     import re as _re
-                    nid_match = _re.match(r'^([A-Za-z]+)-(.+)$', cur_nid)
+                    nid_match  = _re.match(r'^([A-Za-z]+)-(.+)$', cur_nid)
                     cur_prefix = nid_match.group(1).upper() if nid_match else "IF"
                     cur_num    = nid_match.group(2) if nid_match else cur_nid
 
-                    st.markdown("<div style='font-size:9px;color:#aaa;margin:4px 0 2px;'>Node ID</div>",
+                    st.markdown("<div style='font-size:9px;color:#aaa;margin:4px 0 2px;'>Node ID  &nbsp;·&nbsp; FT Label</div>",
                                 unsafe_allow_html=True)
-                    ec1, ec2 = st.columns([1, 2])
+                    ec1, ec2, ec3 = st.columns([1, 2, 1])
                     with ec1:
                         valid_prefixes = ["IF","FF","SF","GROUP","HAZ","OTHER"]
                         prefix_idx = valid_prefixes.index(cur_prefix) if cur_prefix in valid_prefixes else 0
@@ -1509,7 +1555,12 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                         edit_num = st.text_input("Number", value=cur_num,
                                                  key="en_nid_num", label_visibility="collapsed",
                                                  placeholder="196, 23a …")
-                    new_node_id = f"{edit_prefix}-{edit_num.strip()}" if edit_num.strip() else cur_nid
+                    with ec3:
+                        edit_ft = st.text_input("FT", value=en.get("ftLabel",""),
+                                                key="en_ft", label_visibility="collapsed",
+                                                placeholder="FT-46")
+                    new_node_id  = f"{edit_prefix}-{edit_num.strip()}" if edit_num.strip() else cur_nid
+                    new_ft_label = edit_ft.strip()
 
                     new_gate = st.radio("Gate", ["OR","AND"],
                                         index=0 if en["gate"] == "OR" else 1,
@@ -1571,6 +1622,7 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                                     n["name"]       = new_name.strip() or n["name"]
                                     n["gate"]       = new_gate
                                     n["nodeId"]     = new_node_id
+                                    n["ftLabel"]    = new_ft_label
                                     n["fixedValue"] = new_fv
                                     if n["type"] != "HAZARD":
                                         n["type"]      = new_type
@@ -1585,7 +1637,7 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                                 upd.append(n)
 
                             # Clear stale widget state and force tree rebuild
-                            for k in ["en_name","en_nid_prefix","en_nid_num","en_gate",
+                            for k in ["en_name","en_nid_prefix","en_nid_num","en_ft","en_gate",
                                       "en_type","en_par","en_tgt","en_use_fix","en_fv",
                                       "_edit_prev_eid"]:
                                 st.session_state.pop(k, None)
@@ -1638,10 +1690,16 @@ if nsc > 0:
     warn_color  = "#ff4d4d" if nsc >= 10 else "#f5c518"
     warn_bg     = "#1a0000" if nsc >= 10 else "#1a1200"
     warn_icon   = "🔴" if nsc >= 10 else "🟡"
+    pending     = st.session_state.get("pending_node_names", [])
     warn_msg    = (f"{warn_icon} **{nsc} node{'s' if nsc!=1 else ''} added without calculating** — "
                    f"values shown are stale. Press **▶ CALCULATE** to update.")
+    if pending:
+        names_preview = ", ".join(f"`{n}`" for n in pending[-5:])
+        if len(pending) > 5:
+            names_preview = f"…{len(pending)-5} more, " + names_preview
+        warn_msg += f"  \nPending: {names_preview}"
     if nsc >= 10:
-        warn_msg += f"  \n⚠ {nsc} nodes is a lot to add without calculating — please press CALCULATE now."
+        warn_msg += f"  \n⚠ {nsc} nodes without calculating — values are likely very stale."
     st.markdown(
         f'<div style="background:{warn_bg};border:2px solid {warn_color};border-radius:8px;'
         f'padding:9px 14px;margin-bottom:8px;font-size:11px;color:{warn_color};">'
@@ -1660,7 +1718,7 @@ with a1:
             save_current(new_nodes)
             st.session_state.nodes = new_nodes
             st.session_state.nodes_since_calc = 0
-            st.session_state.nodes_hash = ""
+            st.session_state.pending_node_names = []
             st.session_state.nodes_hash = ""
             st.rerun()
 with a2:
@@ -1728,9 +1786,6 @@ with tab_tree:
             "</div>", unsafe_allow_html=True)
 
         # ── Hash-based cache: only rebuild iframe when node data changes ──
-        # Sidebar actions (add node before CALCULATE) do NOT change
-        # calculatedValue, so the hash stays the same and the tree iframe
-        # is NOT destroyed — your zoom, positions, collapse state survive.
         import hashlib as _hl, json as _js
         _hash_data = _js.dumps([{
             "id": n["id"], "name": n["name"], "type": n["type"],
@@ -1740,6 +1795,12 @@ with tab_tree:
         } for n in nodes], sort_keys=True) + (fid or "ALL")
         tree_key = _hl.md5(_hash_data.encode()).hexdigest()[:12]
 
+        # Use saved positions from postMessage save-back if available
+        saved_positions = st.session_state.get("_tree_positions", {})
+        if saved_positions:
+            ts = dict(ts)
+            ts["positions"] = saved_positions
+
         if st.session_state.nodes_hash != tree_key:
             st.session_state.nodes_hash = tree_key
             tree_html = build_html_tree(nodes, filter_hazard_id=fid, tree_state=ts)
@@ -1748,8 +1809,28 @@ with tab_tree:
             tree_html = st.session_state.get("_cached_tree_html") or \
                         build_html_tree(nodes, filter_hazard_id=fid, tree_state=ts)
 
-        components.html(tree_html, height=720, scrolling=False)
+        components.html(tree_html, height=780, scrolling=False)
         st.session_state.tree_state["focus_id"] = None
+
+        # ── Position receiver (hidden) ────────────────────────────────
+        # Catches postMessage from the tree iframe and saves positions
+        # so they survive CALCULATE / file load rerenders
+        pos_receiver = """
+        <script>
+        window.addEventListener("message", function(e){
+            try{
+                const d = typeof e.data === "string" ? JSON.parse(e.data) : e.data;
+                if(d && d.type === "fta_pos"){
+                    // Store in sessionStorage so Streamlit can read on next rerun
+                    sessionStorage.setItem("fta_positions", JSON.stringify(d.data));
+                }
+            }catch(err){}
+        });
+        </script>
+        """
+        # Note: true round-trip requires a custom component; positions survive
+        # within the browser session via uP (JS memory) which is sufficient
+        # for normal use. Browser refresh loses positions — press ⊞ Reset to rebalance.
 
 # ── TAB 2: Hierarchy ─────────────────────────────────────────────────────
 with tab_hier:
@@ -1761,22 +1842,36 @@ with tab_hier:
         rows   = build_hierarchy_rows(nodes, filter_hazard_id=h_opts[h_sel])
         for row in rows:
             node = row["node"]; depth = row["depth"]; is_ref = row.get("ref", False)
-            color = LEVEL_COLORS.get(node["type"], "#888")
-            val   = fmt(node.get("calculatedValue"))
-            indent = depth * 26
-            ref_tag    = '<span style="background:#333;color:#888;font-size:7px;padding:1px 4px;border-radius:4px;margin-left:4px;">REF</span>' if is_ref else ""
-            shared_tag = '<span style="background:#f5c518;color:#111;font-size:7px;padding:1px 4px;border-radius:4px;margin-left:4px;">SHARED</span>' if len(node.get("parentIds") or []) > 1 else ""
-            gate_tag   = f'<span style="color:{"#4fc3f7" if node["gate"]=="OR" else "#ffb74d"};font-size:8px;margin-left:5px;">[{node["gate"]}]</span>'
+            color     = LEVEL_COLORS.get(node["type"], "#888")
+            val       = fmt(node.get("calculatedValue"))
+            node_id   = node.get("nodeId", "")
+            ft_lbl    = node.get("ftLabel", "")
+            indent    = depth * 24
+            is_pinned = node.get("fixedValue") is not None
+            is_shared = len(node.get("parentIds") or []) > 1
+
+            ref_tag    = '<span style="background:#2a2a2a;color:#777;font-size:7px;padding:1px 4px;border-radius:4px;margin-left:4px;">REF</span>' if is_ref else ""
+            shared_tag = '<span style="background:#f5c518;color:#111;font-size:7px;padding:1px 4px;border-radius:4px;margin-left:4px;font-weight:700;">SHARED</span>' if is_shared else ""
+            pin_tag    = f'<span style="background:#e9456022;color:#e94560;font-size:7px;padding:1px 4px;border-radius:4px;margin-left:4px;border:1px solid #e9456044;">📌 {fmt(node.get("fixedValue"))}</span>' if is_pinned else ""
+            gate_col   = "#4fc3f7" if node["gate"] == "OR" else "#ffb74d"
+            gate_tag   = f'<span style="color:{gate_col};font-size:8px;margin-left:5px;font-weight:700;">[{node["gate"]}]</span>'
+            nid_tag    = f'<code style="background:#1a1a2e;color:{color};font-size:8px;padding:1px 5px;border-radius:3px;margin-left:5px;">{node_id}</code>' if node_id else ""
+            ft_tag     = f'<code style="background:#1a1a2e;color:#7e57c2;font-size:8px;padding:1px 5px;border-radius:3px;margin-left:4px;">{ft_lbl}</code>' if ft_lbl else ""
+            val_color  = "#e94560" if is_pinned else color
+
             st.markdown(f"""
-            <div style="display:flex;align-items:center;padding:4px 8px;margin-left:{indent}px;
-                        margin-bottom:2px;background:#141414;border-left:3px solid {color};border-radius:0 5px 5px 0;">
+            <div style="display:flex;align-items:center;padding:5px 10px;margin-left:{indent}px;
+                        margin-bottom:2px;background:#141414;
+                        border-left:3px solid {color};border-radius:0 5px 5px 0;
+                        {'border:1px solid #e9456033;' if is_pinned else ''}">
               <div style="flex:1;min-width:0;">
-                <span style="color:#555;font-size:10px;">{"└─ " if depth>0 else ""}</span>
-                <span style="font-weight:{'700' if depth==0 else '400'};color:#ddd;font-size:11px;">{node['name']}</span>
-                <span style="font-size:8px;color:#666;margin-left:5px;">{node['type']}</span>
-                {gate_tag}{shared_tag}{ref_tag}
+                <span style="color:#444;font-size:9px;">{'└─ ' if depth>0 else ''}</span>
+                <span style="font-weight:{'700' if depth==0 else '500'};color:#ddd;font-size:11px;">{node['name']}</span>
+                <span style="font-size:8px;color:#555;margin-left:5px;">{node['type']}</span>
+                {nid_tag}{ft_tag}{gate_tag}{shared_tag}{pin_tag}{ref_tag}
               </div>
-              <div style="font-weight:700;font-size:12px;color:{color};font-family:monospace;flex-shrink:0;margin-left:10px;">{val}</div>
+              <div style="font-weight:700;font-size:12px;color:{val_color};
+                          font-family:monospace;flex-shrink:0;margin-left:12px;">{val}</div>
             </div>""", unsafe_allow_html=True)
 
 # ── TAB 3: Values ─────────────────────────────────────────────────────────
@@ -1817,19 +1912,46 @@ with tab_vals:
                 val_color = "#e94560" if is_pinned else color
                 val_str   = fmt(node.get("calculatedValue"))
                 val_display = f"{val_str} 📌" if is_pinned else val_str
-                pin_note  = f'<div style="font-size:8px;color:#e94560;">📌 FIXED = {fmt(node.get("fixedValue"))}</div>' if is_pinned else ''
+                node_id   = node.get("nodeId", node["id"])
+                ft_lbl    = node.get("ftLabel", "")
+                tgt_str   = fmt(node.get("targetValue")) if node.get("targetValue") else ""
+
+                badges = ""
+                if is_shared: badges += '<span style="background:#f5c518;color:#111;font-size:7px;padding:1px 4px;border-radius:3px;font-weight:700;margin-right:3px;">SHARED</span>'
+                if is_pinned: badges += f'<span style="background:#e9456022;color:#e94560;font-size:7px;padding:1px 4px;border-radius:3px;font-weight:700;border:1px solid #e9456044;">📌 FIXED={fmt(node.get("fixedValue"))}</span>'
+                if ft_lbl:    badges += f'<span style="background:#1a1a2e;color:#7e57c2;font-size:7px;padding:1px 4px;border-radius:3px;font-weight:700;margin-left:3px;border:1px solid #7e57c244;">{ft_lbl}</span>'
+
                 st.markdown(f"""
-                <div style="background:#141414;border:1px solid {'#e9456044' if is_pinned else '#222'};border-radius:5px;padding:7px 11px;margin-bottom:3px;
-                            display:grid;grid-template-columns:2fr 1fr 1fr 2fr 2fr;gap:8px;align-items:center;">
-                  <div>
-                    <div style="font-weight:700;font-size:11px;color:#ddd;">{node['name']}</div>
-                    {'<div style="font-size:8px;color:#f5c518;">◈ SHARED</div>' if is_shared else ''}
-                    {pin_note}
+                <div style="background:#141414;border:1px solid {'#e9456044' if is_pinned else '#1e1e1e'};
+                            border-radius:6px;padding:7px 12px;margin-bottom:3px;">
+                  <div style="display:grid;grid-template-columns:1.8fr 0.7fr 0.7fr 0.7fr 1.2fr 2fr;gap:8px;align-items:start;">
+                    <div>
+                      <div style="font-weight:700;font-size:11px;color:#ddd;margin-bottom:2px;">{node['name']}</div>
+                      <div style="font-size:8px;">{badges}</div>
+                    </div>
+                    <div>
+                      <div style="font-size:7px;color:#444;letter-spacing:1px;margin-bottom:1px;">NODE ID</div>
+                      <div style="font-size:10px;color:{color};font-weight:700;font-family:monospace;">{node_id}</div>
+                    </div>
+                    <div>
+                      <div style="font-size:7px;color:#444;letter-spacing:1px;margin-bottom:1px;">TYPE</div>
+                      <div style="font-size:10px;color:{color};font-weight:700;">{node['type']}</div>
+                    </div>
+                    <div>
+                      <div style="font-size:7px;color:#444;letter-spacing:1px;margin-bottom:1px;">GATE</div>
+                      <div style="font-size:10px;color:{gc};font-weight:700;">{node['gate']}</div>
+                    </div>
+                    <div>
+                      <div style="font-size:7px;color:#444;letter-spacing:1px;margin-bottom:1px;">CALC VALUE</div>
+                      <div style="font-size:11px;color:{val_color};font-weight:700;font-family:monospace;">{val_display}</div>
+                      {f'<div style="font-size:8px;color:#555;font-family:monospace;">target: {tgt_str}</div>' if tgt_str else ''}
+                    </div>
+                    <div>
+                      <div style="font-size:7px;color:#444;letter-spacing:1px;margin-bottom:1px;">PARENTS → CHILDREN</div>
+                      <div style="font-size:9px;color:#555;line-height:1.5;">↑ {pnames}</div>
+                      <div style="font-size:9px;color:#444;line-height:1.5;">↓ {cnames}</div>
+                    </div>
                   </div>
-                  <div style="font-size:9px;color:{color};font-weight:700;">{node['type']}</div>
-                  <div style="font-size:9px;color:{gc};font-weight:700;">{node['gate']}</div>
-                  <div style="font-size:10px;color:{val_color};font-weight:700;font-family:monospace;">{val_display}</div>
-                  <div style="font-size:9px;color:#555;">↑ {pnames}<br>↓ {cnames}</div>
                 </div>""", unsafe_allow_html=True)
 
         st.markdown("---")
@@ -1859,7 +1981,8 @@ with tab_search:
                 lq in n["type"].lower() or
                 lq in n["gate"].lower() or
                 lq in fmt(n.get("calculatedValue")).lower() or
-                lq in (n.get("id","")).lower()
+                lq in (n.get("nodeId","")).lower() or
+                lq in (n.get("ftLabel","")).lower()
             )]
             st.markdown(f"<div style='font-size:10px;color:#ff8c42;margin-bottom:8px;'>{len(matches)} result(s) for <b>\"{sq}\"</b></div>", unsafe_allow_html=True)
 
@@ -1870,6 +1993,8 @@ with tab_search:
                     color     = LEVEL_COLORS.get(node["type"], "#7e57c2")
                     gc        = "#4fc3f7" if node["gate"] == "OR" else "#ffb74d"
                     val       = fmt(node.get("calculatedValue"))
+                    node_id   = node.get("nodeId", node["id"])
+                    ft_lbl    = node.get("ftLabel","")
                     pnames    = " · ".join(by_id[p]["name"] for p in (node.get("parentIds") or []) if p in by_id) or "—"
                     cnames    = " · ".join(n["name"] for n in nodes if node["id"] in (n.get("parentIds") or [])) or "—"
                     is_shared = len(node.get("parentIds") or []) > 1
@@ -1888,22 +2013,39 @@ with tab_search:
                         pass
 
                     shape_style = "border-radius:50px;" if is_group else "border-radius:6px;"
-                    pin_border  = "border:2px solid #e94560;" if is_pinned else f"border:2px solid {color}55;"
+                    pin_border  = "border:2px solid #e94560;" if is_pinned else f"border:2px solid {color}44;"
+
+                    badges = f'<code style="background:#1a1a2e;color:{color};font-size:9px;padding:1px 5px;border-radius:3px;font-weight:700;">{node_id}</code>'
+                    if ft_lbl: badges += f' <code style="background:#1a1a2e;color:#7e57c2;font-size:9px;padding:1px 5px;border-radius:3px;">{ft_lbl}</code>'
+                    if is_shared: badges += ' <span style="background:#f5c518;color:#111;font-size:7px;padding:1px 4px;border-radius:3px;font-weight:700;">SHARED</span>'
+                    if is_pinned: badges += f' <span style="background:#e9456022;color:#e94560;font-size:7px;padding:1px 4px;border-radius:3px;border:1px solid #e9456044;">📌 FIXED={fmt(node.get("fixedValue"))}</span>'
+                    if is_group:  badges += ' <span style="background:#7e57c222;color:#7e57c2;font-size:7px;padding:1px 4px;border-radius:3px;">GROUP</span>'
+
                     st.markdown(f"""
                     <div style="background:#141414;{pin_border}{shape_style}
-                                padding:9px 14px;margin-bottom:5px;
-                                display:grid;grid-template-columns:2.5fr 0.8fr 0.8fr 1.5fr 2.5fr;gap:10px;align-items:center;">
-                      <div>
-                        <div style="font-weight:700;font-size:11px;color:#ddd;">{display_name}</div>
-                        <div style="font-size:8px;color:#555;margin-top:1px;">id: {node['id']}</div>
-                        {'<div style="font-size:8px;color:#f5c518;">◈ SHARED</div>' if is_shared else ''}
-                        {'<div style="font-size:8px;color:#7e57c2;">◉ GROUP (Combined Faults)</div>' if is_group else ''}
-                        {f'<div style="font-size:8px;color:#e94560;">📌 FIXED = {fmt(node.get("fixedValue"))}</div>' if is_pinned else ''}
+                                padding:9px 14px;margin-bottom:5px;">
+                      <div style="display:grid;grid-template-columns:2.5fr 0.7fr 0.7fr 1.5fr 2fr;gap:10px;align-items:start;">
+                        <div>
+                          <div style="font-weight:700;font-size:11px;color:#ddd;margin-bottom:3px;">{display_name}</div>
+                          <div>{badges}</div>
+                        </div>
+                        <div>
+                          <div style="font-size:7px;color:#444;letter-spacing:1px;">TYPE</div>
+                          <div style="font-size:10px;color:{color};font-weight:700;">{node['type']}</div>
+                        </div>
+                        <div>
+                          <div style="font-size:7px;color:#444;letter-spacing:1px;">GATE</div>
+                          <div style="font-size:10px;color:{gc};font-weight:700;">{node['gate']}</div>
+                        </div>
+                        <div>
+                          <div style="font-size:7px;color:#444;letter-spacing:1px;">VALUE</div>
+                          <div style="font-size:11px;color:{val_color};font-weight:700;font-family:monospace;">{val}{'📌' if is_pinned else ''}</div>
+                        </div>
+                        <div>
+                          <div style="font-size:8px;color:#444;">↑ {pnames}</div>
+                          <div style="font-size:8px;color:#333;margin-top:2px;">↓ {cnames}</div>
+                        </div>
                       </div>
-                      <div style="font-size:9px;color:{color};font-weight:700;">{node['type']}</div>
-                      <div style="font-size:9px;color:{gc};font-weight:700;">{node['gate']}</div>
-                      <div style="font-size:10px;color:{val_color};font-weight:700;font-family:monospace;">{val}{'📌' if is_pinned else ''}</div>
-                      <div style="font-size:9px;color:#555;">↑ {pnames}<br>↓ {cnames}</div>
                     </div>""", unsafe_allow_html=True)
         else:
             # Summary table when no search query
