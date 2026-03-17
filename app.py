@@ -1,7 +1,11 @@
 import streamlit as st
-import json, math, os, requests, uuid, io, re
+import json, math, os, requests, uuid, io, re, html as _html
 from datetime import datetime
 import streamlit.components.v1 as components
+
+def esc(s):
+    """HTML-escape a string so it's safe to embed in unsafe_allow_html blocks."""
+    return _html.escape(str(s) if s is not None else "")
 
 st.set_page_config(page_title="FTA Reverse Engineer", page_icon="⚠️",
                    layout="wide", initial_sidebar_state="expanded")
@@ -1561,7 +1565,7 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                     <div style="background:#141414;border:2px solid {color};border-radius:8px;
                                 padding:8px 12px;margin-bottom:8px;">
                       <div style="font-size:8px;color:#888;letter-spacing:2px;margin-bottom:2px;">EDITING</div>
-                      <div style="font-weight:700;color:{color};font-size:13px;">{en['name']}</div>
+                      <div style="font-weight:700;color:{color};font-size:13px;">{esc(en['name'])}</div>
                       <div style="display:flex;align-items:center;gap:10px;margin-top:3px;">
                         <div style="font-size:9px;color:#666;">
                           {en['type']} · {en['gate']} · {en.get('nodeId', en['id'])}
@@ -1789,31 +1793,73 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                     ):
                         # Each instance card
                         for inst in grp:
-                            ic = LEVEL_COLORS.get(inst["type"], "#888")
-                            iv = fmt(inst.get("calculatedValue"))
-                            ip = [by_id[p]["name"] for p in (inst.get("parentIds") or []) if p in by_id]
-                            ich= [c["name"] for c in nodes if inst["id"] in (c.get("parentIds") or [])]
-                            ift= inst.get("ftLabel","")
+                            ic  = LEVEL_COLORS.get(inst["type"], "#888")
+                            iv  = fmt(inst.get("calculatedValue"))
+                            ift = inst.get("ftLabel","")
+                            ip  = [by_id[p] for p in (inst.get("parentIds") or []) if p in by_id]
+                            ich = [c for c in nodes if inst["id"] in (c.get("parentIds") or [])]
+
+                            # Build full path: Hazard → SF → FF → this node
+                            def get_path(nid, depth=0):
+                                if depth > 8: return []
+                                nd = by_id.get(nid)
+                                if not nd: return []
+                                if nd["type"] == "HAZARD": return [nd]
+                                paths = []
+                                for pid in (nd.get("parentIds") or []):
+                                    for p in get_path(pid, depth+1):
+                                        paths.append(p)
+                                return paths + [nd] if paths else []
+
+                            # Get ancestor chain for first parent
+                            path_nodes = []
+                            if ip:
+                                path_nodes = get_path(ip[0]["id"])
+                            # Build breadcrumb string: Hazard > SF > FF > parent
+                            breadcrumb_parts = []
+                            for pn in path_nodes:
+                                col = LEVEL_COLORS.get(pn["type"], "#888")
+                                nid_short = pn.get("nodeId", pn["id"])
+                                breadcrumb_parts.append(
+                                    f'<span style="color:{col};font-weight:700;">{esc(nid_short)}</span>'
+                                )
+                            breadcrumb = ' <span style="color:#444">›</span> '.join(breadcrumb_parts)
+
+                            # Parent names safely escaped
+                            ip_names = [esc(p["name"]) for p in ip]
+                            ich_names = [esc(c["name"]) for c in ich]
+
+                            is_pinned = inst.get("fixedValue") is not None
+                            pin_str = f'<span style="color:#e94560;font-size:8px;margin-left:4px;">📌 FIXED={fmt(inst.get("fixedValue"))}</span>' if is_pinned else ''
 
                             st.markdown(f"""
-                            <div style="background:#141414;border:1.5px solid #f5c51844;
+                            <div style="background:#111;border:1.5px solid #f5c51855;
                                         border-left:3px solid {ic};
-                                        border-radius:0 6px 6px 0;padding:7px 10px;margin-bottom:5px;">
-                              <div style="display:flex;align-items:center;gap:6px;margin-bottom:2px;">
-                                <span style="font-weight:700;font-size:10px;color:#ddd;">{inst['name']}</span>
-                                {f'<code style="background:#1a1a2e;color:#7e57c2;font-size:7px;padding:1px 4px;border-radius:3px;">{ift}</code>' if ift else ''}
-                                <span style="font-size:11px;color:{ic};font-family:monospace;font-weight:700;margin-left:auto;">{iv}</span>
+                                        border-radius:0 7px 7px 0;padding:8px 11px;margin-bottom:4px;">
+
+                              <div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:4px;">
+                                <div style="flex:1;min-width:0;">
+                                  <div style="font-weight:700;font-size:11px;color:#ddd;line-height:1.3;
+                                              word-break:break-word;">{esc(inst['name'])}</div>
+                                  {f'<code style="background:#1e1530;color:#7e57c2;font-size:7px;padding:1px 5px;border-radius:3px;margin-top:2px;display:inline-block;">{esc(ift)}</code>' if ift else ''}
+                                </div>
+                                <div style="font-size:12px;color:{ic};font-family:monospace;
+                                            font-weight:700;flex-shrink:0;">{iv}{pin_str}</div>
                               </div>
-                              <div style="font-size:8px;color:#666;">
-                                {inst['type']} · {inst['gate']}
-                                {'&nbsp;📌 FIXED' if inst.get('fixedValue') is not None else ''}
+
+                              <div style="font-size:8px;color:#666;margin-bottom:3px;">
+                                {esc(inst['type'])} · {esc(inst['gate'])}
                               </div>
-                              <div style="font-size:8px;color:#555;margin-top:2px;">
-                                ↑ Parent: <b style="color:#ccc">{ip[0] if ip else "(none)"}</b>
-                                {(' · '.join(ip[1:])) if len(ip)>1 else ''}
+
+                              <div style="font-size:8px;color:#555;margin-bottom:2px;line-height:1.6;">
+                                📍 Path: {breadcrumb if breadcrumb else '<span style="color:#444">—</span>'}
                               </div>
-                              <div style="font-size:8px;color:#444;">
-                                ↓ {", ".join(ich) if ich else "(leaf — no children yet)"}
+
+                              <div style="font-size:8px;color:#666;margin-bottom:1px;">
+                                ↑ <span style="color:#aaa;">{" · ".join(ip_names) if ip_names else "(no parent)"}</span>
+                              </div>
+                              <div style="font-size:8px;color:#555;">
+                                ↓ {", ".join(ich_names) if ich_names else "<i style='color:#333'>leaf — no children yet</i>"}
                               </div>
                             </div>""", unsafe_allow_html=True)
 
@@ -1945,7 +1991,7 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                       <div style="display:flex;align-items:center;gap:6px;margin-bottom:2px;">
                         <code style="background:#0a1a2e;color:#4fc3f7;font-size:9px;
                                padding:1px 5px;border-radius:3px;">{nid_d}</code>
-                        <span style="font-weight:700;font-size:10px;color:#ddd;">{n['name']}</span>
+                        <span style="font-weight:700;font-size:10px;color:#ddd;">{esc(n['name'])}</span>
                         <span style="font-size:11px;color:{color};font-family:monospace;
                                font-weight:700;margin-left:auto;">{val}</span>
                       </div>
