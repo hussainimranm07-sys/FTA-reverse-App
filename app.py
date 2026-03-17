@@ -1799,69 +1799,61 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                             ip  = [by_id[p] for p in (inst.get("parentIds") or []) if p in by_id]
                             ich = [c for c in nodes if inst["id"] in (c.get("parentIds") or [])]
 
-                            # Build full path: Hazard → SF → FF → this node
-                            def get_path(nid, depth=0):
-                                if depth > 8: return []
-                                nd = by_id.get(nid)
+                            # Build path breadcrumb walking up from first parent
+                            # Uses nodeId if it looks like a real reference (not raw UUID)
+                            def is_real_nid(nid, iid):
+                                """Return True if nodeId is a meaningful reference, not a raw internal id."""
+                                return nid and nid != iid and not (len(nid) <= 8 and nid.isalnum() and nid.islower())
+
+                            def get_ancestors(start_id, depth=0):
+                                if depth > 10: return []
+                                nd = by_id.get(start_id)
                                 if not nd: return []
-                                if nd["type"] == "HAZARD": return [nd]
-                                paths = []
-                                for pid in (nd.get("parentIds") or []):
-                                    for p in get_path(pid, depth+1):
-                                        paths.append(p)
-                                return paths + [nd] if paths else []
+                                parents = (nd.get("parentIds") or [])
+                                if not parents or nd["type"] == "HAZARD":
+                                    return [nd]
+                                result = []
+                                for pid in parents[:1]:  # only follow first parent upward
+                                    result.extend(get_ancestors(pid, depth+1))
+                                result.append(nd)
+                                return result
 
-                            # Get ancestor chain for first parent
-                            path_nodes = []
+                            # Path: ancestors of direct parent, then parent itself
+                            path_parts = []
                             if ip:
-                                path_nodes = get_path(ip[0]["id"])
-                            # Build breadcrumb string: Hazard > SF > FF > parent
-                            breadcrumb_parts = []
-                            for pn in path_nodes:
-                                col = LEVEL_COLORS.get(pn["type"], "#888")
-                                nid_short = pn.get("nodeId", pn["id"])
-                                breadcrumb_parts.append(
-                                    f'<span style="color:{col};font-weight:700;">{esc(nid_short)}</span>'
-                                )
-                            breadcrumb = ' <span style="color:#444">›</span> '.join(breadcrumb_parts)
+                                ancestors = get_ancestors(ip[0]["id"])
+                                for an in ancestors:
+                                    col  = LEVEL_COLORS.get(an["type"], "#888")
+                                    nid_ = an.get("nodeId","")
+                                    label_ = nid_ if is_real_nid(nid_, an["id"]) else an["type"]
+                                    path_parts.append(f'<span style="color:{col};font-weight:700;font-size:8px;">{esc(label_)}</span>')
+                            path_html = ' <span style="color:#333;font-size:9px;">›</span> '.join(path_parts) if path_parts else '<span style="color:#333">—</span>'
 
-                            # Parent names safely escaped
-                            ip_names = [esc(p["name"]) for p in ip]
-                            ich_names = [esc(c["name"]) for c in ich]
+                            # Safely escaped strings
+                            inst_name  = esc(inst['name'])
+                            parent_str = esc(ip[0]['name']) if ip else "<i style='color:#444'>no parent</i>"
+                            child_str  = esc(", ".join(c["name"] for c in ich)) if ich else "<i style='color:#333'>leaf</i>"
+                            type_gate  = esc(f"{inst['type']} · {inst['gate']}")
+                            pin_tag    = f' <span style="color:#e94560;font-size:7px;">📌 FIXED</span>' if inst.get("fixedValue") is not None else ""
+                            ft_tag     = f'<code style="background:#1e1530;color:#7e57c2;font-size:7px;padding:1px 5px;border-radius:3px;">{esc(ift)}</code>&nbsp;' if ift else ""
 
-                            is_pinned = inst.get("fixedValue") is not None
-                            pin_str = f'<span style="color:#e94560;font-size:8px;margin-left:4px;">📌 FIXED={fmt(inst.get("fixedValue"))}</span>' if is_pinned else ''
-
-                            st.markdown(f"""
-                            <div style="background:#111;border:1.5px solid #f5c51855;
-                                        border-left:3px solid {ic};
-                                        border-radius:0 7px 7px 0;padding:8px 11px;margin-bottom:4px;">
-
-                              <div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:4px;">
-                                <div style="flex:1;min-width:0;">
-                                  <div style="font-weight:700;font-size:11px;color:#ddd;line-height:1.3;
-                                              word-break:break-word;">{esc(inst['name'])}</div>
-                                  {f'<code style="background:#1e1530;color:#7e57c2;font-size:7px;padding:1px 5px;border-radius:3px;margin-top:2px;display:inline-block;">{esc(ift)}</code>' if ift else ''}
-                                </div>
-                                <div style="font-size:12px;color:{ic};font-family:monospace;
-                                            font-weight:700;flex-shrink:0;">{iv}{pin_str}</div>
-                              </div>
-
-                              <div style="font-size:8px;color:#666;margin-bottom:3px;">
-                                {esc(inst['type'])} · {esc(inst['gate'])}
-                              </div>
-
-                              <div style="font-size:8px;color:#555;margin-bottom:2px;line-height:1.6;">
-                                📍 Path: {breadcrumb if breadcrumb else '<span style="color:#444">—</span>'}
-                              </div>
-
-                              <div style="font-size:8px;color:#666;margin-bottom:1px;">
-                                ↑ <span style="color:#aaa;">{" · ".join(ip_names) if ip_names else "(no parent)"}</span>
-                              </div>
-                              <div style="font-size:8px;color:#555;">
-                                ↓ {", ".join(ich_names) if ich_names else "<i style='color:#333'>leaf — no children yet</i>"}
-                              </div>
-                            </div>""", unsafe_allow_html=True)
+                            st.markdown(
+                                f'<div style="background:#111;border:1.5px solid #f5c51855;'
+                                f'border-left:3px solid {ic};border-radius:0 7px 7px 0;'
+                                f'padding:8px 11px;margin-bottom:4px;">'
+                                f'<div style="margin-bottom:3px;">'
+                                f'{ft_tag}'
+                                f'<span style="font-weight:700;font-size:11px;color:#ddd;">{inst_name}</span>'
+                                f'&nbsp;<span style="font-size:11px;color:{ic};font-family:monospace;font-weight:700;">{iv}</span>'
+                                f'{pin_tag}'
+                                f'</div>'
+                                f'<div style="font-size:8px;color:#666;margin-bottom:3px;">{type_gate}</div>'
+                                f'<div style="font-size:8px;color:#555;margin-bottom:2px;">📍 {path_html}</div>'
+                                f'<div style="font-size:8px;color:#666;">↑ {parent_str}</div>'
+                                f'<div style="font-size:8px;color:#555;">↓ {child_str}</div>'
+                                f'</div>',
+                                unsafe_allow_html=True
+                            )
 
                             # Per-instance actions
                             ba, bb, bc = st.columns(3)
