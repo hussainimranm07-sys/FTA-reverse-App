@@ -35,8 +35,21 @@ def list_gist_files(token, gid):
 def load_gist_file(token, gid, fname):
     g = get_gist(token, gid)
     if not g: return []
-    try: return json.loads(g.get("files",{}).get(fname,{}).get("content","[]"))
-    except: return []
+    try:
+        raw = json.loads(g.get("files",{}).get(fname,{}).get("content","[]"))
+    except:
+        return []
+    # Normalise nodes — ensure all expected fields exist for forward-compatibility
+    for n in raw:
+        n.setdefault("nodeId",    n.get("id",""))
+        n.setdefault("ftLabel",   "")
+        n.setdefault("fixedValue", None)
+        n.setdefault("targetValue", None)
+        n.setdefault("calculatedValue", None)
+        n.setdefault("parentIds", [])
+        n.setdefault("gate", "OR")
+        n.setdefault("type", "IF")
+    return raw
 
 def save_gist_file(token, gid, fname, data):
     try:
@@ -422,6 +435,15 @@ def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
     shared_ids = {n["id"] for n in show_nodes
                   if len([p for p in (n.get("parentIds") or []) if p in shown_ids]) > 1}
 
+    # Duplicate detection: nodes with same nodeId but different internal id
+    from collections import defaultdict as _dd
+    nid_groups = _dd(list)
+    for n in show_nodes:
+        nid = (n.get("nodeId") or "").strip()
+        if nid:
+            nid_groups[nid].append(n["id"])
+    duplicate_ids = {iid for group in nid_groups.values() if len(group) > 1 for iid in group}
+
     ts        = tree_state or {}
     init_pos  = ts.get("positions", {})
     focus_id  = ts.get("focus_id")
@@ -431,23 +453,25 @@ def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
     LEVEL_LABEL = {0: "HAZARD", 1: "SF", 2: "FF", 2.5: "GROUP", 3: "IF"}
 
     nodes_js = _json.dumps([{
-        "id":       n["id"],
-        "name":     n["name"],
-        "type":     n["type"],
-        "gate":     n["gate"],
-        "value":    fmt(n.get("calculatedValue")),
-        "nodeId":   n.get("nodeId", n["id"]),
-        "shared":   n["id"] in shared_ids,
-        "isPinned": n.get("fixedValue") is not None,
-        "fixedVal": fmt(n.get("fixedValue")) if n.get("fixedValue") is not None else None,
-        "isGroup":  n["type"] == "GROUP",
-        "color":    LEVEL_COLORS.get(n["type"], "#7e57c2"),
-        "tcolor":   LEVEL_TEXT.get(n["type"], "#fff"),
-        "row":      LEVEL_ROW.get(n["type"], 2),
-        "parents":  [p for p in (n.get("parentIds") or []) if p in shown_ids],
-        "pnames":   [by_id[p]["name"] for p in (n.get("parentIds") or []) if p in shown_ids],
-        "children": [c["id"] for c in show_nodes if n["id"] in (c.get("parentIds") or [])],
-        "cnames":   [c["name"] for c in show_nodes if n["id"] in (c.get("parentIds") or [])],
+        "id":          n["id"],
+        "name":        n["name"],
+        "type":        n["type"],
+        "gate":        n["gate"],
+        "value":       fmt(n.get("calculatedValue")),
+        "nodeId":      n.get("nodeId", n["id"]),
+        "ftLabel":     n.get("ftLabel", ""),
+        "shared":      n["id"] in shared_ids,
+        "isDuplicate": n["id"] in duplicate_ids,
+        "isPinned":    n.get("fixedValue") is not None,
+        "fixedVal":    fmt(n.get("fixedValue")) if n.get("fixedValue") is not None else None,
+        "isGroup":     n["type"] == "GROUP",
+        "color":       LEVEL_COLORS.get(n["type"], "#7e57c2"),
+        "tcolor":      LEVEL_TEXT.get(n["type"], "#fff"),
+        "row":         LEVEL_ROW.get(n["type"], 2),
+        "parents":     [p for p in (n.get("parentIds") or []) if p in shown_ids],
+        "pnames":      [by_id[p]["name"] for p in (n.get("parentIds") or []) if p in shown_ids],
+        "children":    [c["id"] for c in show_nodes if n["id"] in (c.get("parentIds") or [])],
+        "cnames":      [c["name"] for c in show_nodes if n["id"] in (c.get("parentIds") or [])],
     } for n in show_nodes])
 
     links_js = _json.dumps([
@@ -499,7 +523,7 @@ svg{position:absolute;inset:0;width:100%;height:100%;}
 #dp{position:absolute;bottom:0;left:0;right:0;background:rgba(8,8,8,.93);
   border-top:2px solid #222;padding:8px 16px 10px;display:none;z-index:20;
   backdrop-filter:blur(14px);}
-.dg{display:grid;grid-template-columns:repeat(5,1fr);gap:5px;margin:5px 0;}
+.dg{display:grid;grid-template-columns:repeat(6,1fr);gap:5px;margin:5px 0;}
 .dc{background:#111;border-radius:5px;padding:6px;text-align:center;}
 .dcl{font-size:7px;color:#555;letter-spacing:2px;margin-bottom:2px;font-weight:700;}
 .dcv{font-size:11px;font-weight:700;word-break:break-all;}
@@ -549,6 +573,7 @@ svg{position:absolute;inset:0;width:100%;height:100%;}
     <div class="dc"><div class="dcl">GATE</div><div class="dcv" id="d1"></div></div>
     <div class="dc"><div class="dcl">VALUE</div><div class="dcv" id="d2"></div></div>
     <div class="dc"><div class="dcl">NODE ID</div><div class="dcv" id="d3" style="font-size:9px"></div></div>
+    <div class="dc"><div class="dcl">FT LABEL</div><div class="dcv" id="d7" style="font-size:9px;color:#7e57c2"></div></div>
     <div class="dc"><div class="dcl">SHARED</div><div class="dcv" id="d4"></div></div>
   </div>
   <div class="dr">
@@ -663,11 +688,17 @@ function drawNodes(){
     .attr("x",d=>d.isGroup?-63:-NW/2).attr("y",d=>d.isGroup?-34:-NH/2)
     .attr("rx",d=>d.isGroup?63:9).attr("ry",d=>d.isGroup?34:9)
     .attr("fill",d=>d.color)
-    .attr("stroke",d=>forceSub===d.id&&forceOn?"#f5c518":d.isPinned?"#e94560":d.color)
-    .attr("stroke-width",d=>forceSub===d.id&&forceOn?3:d.isPinned?2.5:1.5)
-    .attr("stroke-dasharray",d=>d.isPinned?"6,3":null);
+    .attr("stroke",d=>{
+      if(d.isDuplicate) return "#e94560";
+      if(forceSub===d.id&&forceOn) return "#f5c518";
+      if(d.isPinned) return "#e94560";
+      return d.color;
+    })
+    .attr("stroke-width",d=>d.isDuplicate?2.5:forceSub===d.id&&forceOn?3:d.isPinned?2.5:1.5)
+    .attr("stroke-dasharray",d=>d.isDuplicate?"6,3":d.isPinned?"6,3":null)
+    .attr("opacity",d=>d.isDuplicate?1:1);
   all.select("text.nt").attr("y",d=>d.isGroup?-16:-NH/2+13).attr("fill",d=>d.tcolor)
-    .text(d=>d.isGroup?"COMBINED":d.type+(d.shared?" ◈":"")+(d.isPinned?" 📌":""));
+    .text(d=>d.isGroup?"COMBINED":d.type+(d.shared?" ◈":"")+(d.isPinned?" 📌":"")+(d.isDuplicate?" ⚠":""));
   all.select("foreignObject.nf")
     .attr("x",d=>d.isGroup?-57:-NW/2+7).attr("y",d=>d.isGroup?-22:-NH/2+17)
     .attr("width",d=>d.isGroup?114:NW-14).attr("height",d=>d.isGroup?28:40)
@@ -871,7 +902,16 @@ function selectNode(id){
 
 function clearHL(){
   selId=null;
-  ng.selectAll("g.nd").attr("opacity",1).select("rect.nb").attr("stroke",d=>forceSub===d.id&&forceOn?"#f5c518":d.isPinned?"#e94560":d.color).attr("stroke-width",d=>forceSub===d.id&&forceOn?3:d.isPinned?2.5:1.5).attr("filter",null);
+  ng.selectAll("g.nd").attr("opacity",1).select("rect.nb")
+    .attr("stroke",d=>{
+      if(d.isDuplicate) return "#e94560";
+      if(forceSub===d.id&&forceOn) return "#f5c518";
+      if(d.isPinned) return "#e94560";
+      return d.color;
+    })
+    .attr("stroke-width",d=>d.isDuplicate?2.5:forceSub===d.id&&forceOn?3:d.isPinned?2.5:1.5)
+    .attr("stroke-dasharray",d=>d.isDuplicate?"6,3":d.isPinned?"6,3":null)
+    .attr("filter",null);
   lg.selectAll("path.lk").attr("stroke",d=>d.shared?"#f5c51844":"#2d2d2d").attr("stroke-width",d=>d.shared?1.2:2).attr("opacity",d=>d.shared?.5:.92).attr("marker-end","url(#ma)");
 }
 
@@ -882,7 +922,9 @@ function showDP(id,n){
   const q=(id,v,c)=>{const e=document.getElementById(id);e.textContent=v;if(c)e.style.color=c;};
   q("d0",n.isGroup?"GROUP":n.type,n.color);q("d1",n.gate,GCM[n.gate]||"#aaa");
   q("d2",n.isPinned?n.value+" 📌":n.value,n.isPinned?"#e94560":n.color);
-  q("d3",n.nodeId||id,"#aaa");q("d4",n.shared?"YES":"NO",n.shared?"#f5c518":"#555");
+  q("d3",n.nodeId||id,"#aaa");
+  q("d7",n.ftLabel||"—","#7e57c2");
+  q("d4",n.shared?"YES":"NO",n.shared?"#f5c518":"#555");
   q("d5",(n.pnames||[]).join(" · ")||"(top event)");q("d6",(n.cnames||[]).join(" · ")||"(leaf)");
 }
 function closeDP(){document.getElementById("dp").style.display="none";clearHL();}
@@ -1142,7 +1184,7 @@ def render_sidebar():
 
     # NODE EDITOR
     st.markdown("### 🔧 NODE EDITOR")
-    tab_add, tab_edit = st.tabs(["➕ ADD", "✏️ EDIT"])
+    tab_add, tab_edit, tab_shared = st.tabs(["➕ ADD", "✏️ EDIT", "🔗 SHARED"])
 
     with tab_add:
         # Add Hazard
@@ -1678,6 +1720,198 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                                 st.session_state.tree_state["focus_id"] = None
                                 set_nodes(temp_nodes)
                                 st.rerun(scope="app")
+
+    # ── SHARED tab ────────────────────────────────────────────────────
+    with tab_shared:
+        nodes  = st.session_state.nodes
+        by_id  = {n["id"]: n for n in nodes}
+
+        if not nodes:
+            st.markdown("<div style='color:#555;font-size:11px;'>No nodes yet.</div>",
+                        unsafe_allow_html=True)
+        else:
+            # ── Section 1: Shared nodes (one node, multiple parents) ──
+            shared_nodes = [n for n in nodes
+                            if len(n.get("parentIds") or []) > 1]
+
+            # ── Section 2: Duplicate nodeId groups ───────────────────
+            from collections import defaultdict as _dd2
+            nid_map = _dd2(list)
+            for n in nodes:
+                nid = (n.get("nodeId") or "").strip()
+                if nid:
+                    nid_map[nid].append(n)
+            dup_groups = {nid: grp for nid, grp in nid_map.items() if len(grp) > 1}
+
+            # ── Summary badges ────────────────────────────────────────
+            cs, cd = st.columns(2)
+            with cs:
+                sc = "#f5c518" if shared_nodes else "#333"
+                st.markdown(f"""<div style="background:#141414;border:1.5px solid {sc};
+                    border-radius:6px;padding:8px;text-align:center;">
+                  <div style="font-size:8px;color:#555;letter-spacing:2px;">SHARED NODES</div>
+                  <div style="font-size:22px;font-weight:700;color:{sc};">{len(shared_nodes)}</div>
+                  <div style="font-size:8px;color:#555;">same node, multiple parents</div>
+                </div>""", unsafe_allow_html=True)
+            with cd:
+                dc = "#e94560" if dup_groups else "#333"
+                st.markdown(f"""<div style="background:#141414;border:1.5px solid {dc};
+                    border-radius:6px;padding:8px;text-align:center;">
+                  <div style="font-size:8px;color:#555;letter-spacing:2px;">DUPLICATE IDs</div>
+                  <div style="font-size:22px;font-weight:700;color:{dc};">{len(dup_groups)}</div>
+                  <div style="font-size:8px;color:#555;">same nodeId, different nodes</div>
+                </div>""", unsafe_allow_html=True)
+
+            # ── Shared nodes list ─────────────────────────────────────
+            if shared_nodes:
+                st.markdown("---")
+                st.markdown(
+                    "<div style='font-size:9px;color:#f5c518;letter-spacing:2px;"
+                    "margin-bottom:6px;'>◈ SHARED NODES</div>",
+                    unsafe_allow_html=True)
+                for n in shared_nodes:
+                    color  = LEVEL_COLORS.get(n["type"], "#888")
+                    val    = fmt(n.get("calculatedValue"))
+                    pnames = [by_id[p]["name"] for p in (n.get("parentIds") or []) if p in by_id]
+                    cnames = [c["name"] for c in nodes if n["id"] in (c.get("parentIds") or [])]
+                    nid    = n.get("nodeId", n["id"])
+                    st.markdown(f"""
+                    <div style="background:#141414;border:1.5px solid #f5c51844;
+                                border-radius:6px;padding:7px 10px;margin-bottom:4px;">
+                      <div style="display:flex;align-items:center;gap:6px;margin-bottom:3px;">
+                        <code style="background:#1a1a2e;color:{color};font-size:9px;
+                               padding:1px 5px;border-radius:3px;">{nid}</code>
+                        <span style="font-weight:700;font-size:10px;color:#ddd;">{n['name']}</span>
+                        <span style="font-size:8px;color:{color};margin-left:auto;">{n['type']}</span>
+                      </div>
+                      <div style="font-size:9px;color:#888;">
+                        Value: <span style="color:{color};font-family:monospace;">{val}</span>
+                        &nbsp;·&nbsp; {len(pnames)} parents
+                      </div>
+                      <div style="font-size:8px;color:#555;margin-top:2px;">
+                        ↑ {" · ".join(pnames) or "—"}<br>
+                        ↓ {" · ".join(cnames) or "(leaf)"}
+                      </div>
+                    </div>""", unsafe_allow_html=True)
+
+            # ── Duplicate nodeId groups ───────────────────────────────
+            if dup_groups:
+                st.markdown("---")
+                st.markdown(
+                    "<div style='font-size:9px;color:#e94560;letter-spacing:2px;"
+                    "margin-bottom:4px;'>⚠ DUPLICATE NODE IDs</div>",
+                    unsafe_allow_html=True)
+                st.markdown(
+                    "<div style='font-size:9px;color:#555;margin-bottom:8px;'>"
+                    "These nodes share the same reference ID. "
+                    "Use <b>🔗 Merge</b> to combine them into one shared node, "
+                    "or keep them as separate nodes in different fault trees.</div>",
+                    unsafe_allow_html=True)
+
+                for nid_label, grp in dup_groups.items():
+                    color = LEVEL_COLORS.get(grp[0]["type"], "#888")
+                    st.markdown(f"""
+                    <div style="background:#1a0a0a;border:2px solid #e9456066;
+                                border-radius:7px;padding:8px 10px;margin-bottom:8px;">
+                      <div style="font-size:9px;color:#e94560;font-weight:700;
+                                  letter-spacing:1px;margin-bottom:6px;">
+                        ⚠ &nbsp;{nid_label} &nbsp;·&nbsp; {len(grp)} nodes
+                      </div>""", unsafe_allow_html=True)
+
+                    for idx_g, dn in enumerate(grp):
+                        dn_color  = LEVEL_COLORS.get(dn["type"], "#888")
+                        dn_val    = fmt(dn.get("calculatedValue"))
+                        dn_pnames = [by_id[p]["name"] for p in (dn.get("parentIds") or []) if p in by_id]
+                        dn_cnames = [c["name"] for c in nodes if dn["id"] in (c.get("parentIds") or [])]
+                        st.markdown(f"""
+                        <div style="background:#141414;border:1px solid #e9456033;
+                                    border-radius:5px;padding:6px 9px;margin-bottom:4px;">
+                          <div style="font-weight:700;font-size:10px;color:#ddd;">{dn['name']}</div>
+                          <div style="font-size:8px;color:#666;margin-top:1px;">
+                            {dn['type']} · {dn['gate']} &nbsp;·&nbsp;
+                            Value: <span style="color:{dn_color};font-family:monospace;">{dn_val}</span>
+                          </div>
+                          <div style="font-size:8px;color:#555;margin-top:2px;">
+                            ↑ {" · ".join(dn_pnames) or "(no parents)"}
+                          </div>
+                          <div style="font-size:8px;color:#444;">
+                            ↓ {" · ".join(dn_cnames) or "(leaf)"}
+                          </div>
+                        </div>""", unsafe_allow_html=True)
+
+                    # Merge action — combine all into one shared node
+                    # Strategy: keep the node with the most children (most connected),
+                    # add all parents from others to it, delete the rest
+                    st.markdown(
+                        "<div style='font-size:8px;color:#aaa;margin:4px 0 4px;'>"
+                        "Merge keeps the most-connected node and links all parents to it. "
+                        "Children of deleted nodes are re-parented automatically.</div>",
+                        unsafe_allow_html=True)
+
+                    m1, m2 = st.columns(2)
+                    with m1:
+                        if st.button(f"🔗 Merge '{nid_label}'",
+                                     key=f"merge_{nid_label}",
+                                     use_container_width=True,
+                                     type="primary"):
+                            # Pick canonical: most children, then most parents
+                            def score(x):
+                                ch = sum(1 for c in nodes if x["id"] in (c.get("parentIds") or []))
+                                pa = len(x.get("parentIds") or [])
+                                return (ch, pa)
+                            canon = max(grp, key=score)
+                            others = [x for x in grp if x["id"] != canon["id"]]
+
+                            # Collect all parent ids from duplicates
+                            all_pids = list(canon.get("parentIds") or [])
+                            for o in others:
+                                for pid in (o.get("parentIds") or []):
+                                    if pid not in all_pids:
+                                        all_pids.append(pid)
+
+                            # Build updated node list
+                            other_ids = {o["id"] for o in others}
+                            updated = []
+                            for nd in nodes:
+                                if nd["id"] in other_ids:
+                                    continue  # drop duplicates
+                                nd = dict(nd)
+                                if nd["id"] == canon["id"]:
+                                    nd["parentIds"] = all_pids  # all parents on canonical
+                                # Re-parent any children that pointed to removed nodes
+                                if nd.get("parentIds"):
+                                    new_pids = []
+                                    for pid in nd["parentIds"]:
+                                        if pid in other_ids:
+                                            # Replace with canonical
+                                            if canon["id"] not in new_pids:
+                                                new_pids.append(canon["id"])
+                                        else:
+                                            new_pids.append(pid)
+                                    nd["parentIds"] = new_pids
+                                updated.append(nd)
+
+                            st.session_state.nodes_hash = ""
+                            st.session_state.nodes_since_calc += 1
+                            st.session_state.tree_state["focus_id"] = canon["id"]
+                            set_nodes(updated)
+                            st.success(
+                                f"Merged {len(others)+1} nodes into '{canon['name']}' "
+                                f"({len(all_pids)} parents linked). Press CALCULATE.")
+                            st.rerun()
+                    with m2:
+                        if st.button(f"✕ Keep separate",
+                                     key=f"keep_{nid_label}",
+                                     use_container_width=True,
+                                     help="Keep as distinct nodes — they will remain highlighted "
+                                          "with dotted red border in the tree"):
+                            st.info("Kept separate. They remain highlighted in the tree.")
+
+            if not shared_nodes and not dup_groups:
+                st.markdown(
+                    "<div style='text-align:center;color:#333;font-size:11px;margin-top:20px;'>"
+                    "✓ No shared or duplicate nodes found</div>",
+                    unsafe_allow_html=True)
 
 with st.sidebar:
     render_sidebar()
