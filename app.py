@@ -173,7 +173,17 @@ def recalculate(nodes):
         pid        = queue.popleft()
         parent     = by_id[pid]
         parent_val = parent.get("calculatedValue")
+
+        # If this parent has no value (floating root with no fixedValue),
+        # still mark its children as having this parent resolved so they
+        # can proceed via their other parents (MAX rule applies to remaining)
         if parent_val is None:
+            for cid in children_of.get(pid, []):
+                parents_resolved[cid] += 1
+                total_parents = in_degree.get(cid, 0)
+                if parents_resolved[cid] >= total_parents and cid not in resolved:
+                    resolved.add(cid)
+                    queue.append(cid)
             continue
 
         child_ids = children_of.get(pid, [])
@@ -559,6 +569,10 @@ def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
         "fixedVal":    fmt(n.get("fixedValue")) if n.get("fixedValue") is not None else None,
         "isGroup":     n["type"] == "GROUP",
         "isRoot":      n["type"] != "HAZARD" and not [p for p in (n.get("parentIds") or []) if p in shown_ids],
+        "needsPin":    (n["type"] != "HAZARD"
+                        and not [p for p in (n.get("parentIds") or []) if p in shown_ids]
+                        and n.get("fixedValue") is None
+                        and n.get("calculatedValue") is None),
         "color":       LEVEL_COLORS.get(n["type"], "#7e57c2"),
         "tcolor":      LEVEL_TEXT.get(n["type"], "#fff"),
         "row":         _depth_map.get(n["id"], LEVEL_ROW.get(n["type"], 2)),
@@ -802,7 +816,7 @@ function drawNodes(){
   ent.append("foreignObject").attr("class","nf").append("xhtml:div").attr("xmlns","http://www.w3.org/1999/xhtml").style("font-size","9.5px").style("font-weight","700").style("font-family","JetBrains Mono,monospace").style("text-align","center").style("word-break","break-word").style("line-height","1.25").style("overflow","hidden");
   ent.append("rect").attr("class","vb").attr("height",19).attr("rx",4).attr("fill","rgba(0,0,0,.3)");
   ent.append("text").attr("class","vt").attr("text-anchor","middle").attr("font-size",10).attr("font-weight",700).attr("font-family","JetBrains Mono,monospace");
-  ent.append("g").attr("class","gb"); ent.append("g").attr("class","cb");
+  ent.append("g").attr("class","gb"); ent.append("g").attr("class","wb"); ent.append("g").attr("class","cb");
 
   const all=ent.merge(s);
   all.select("rect.nb")
@@ -827,7 +841,9 @@ function drawNodes(){
     .attr("width",d=>d.isGroup?114:NW-14).attr("height",d=>d.isGroup?28:40)
     .select("div").style("color",d=>d.tcolor).text(d=>d.name);
   all.select("rect.vb").attr("x",d=>d.isGroup?-47:-NW/2+9).attr("y",d=>d.isGroup?11:NH/2-24).attr("width",d=>d.isGroup?94:NW-18);
-  all.select("text.vt").attr("y",d=>d.isGroup?25:NH/2-10).attr("fill",d=>d.isPinned?"#e94560":d.tcolor).text(d=>d.value+(d.isPinned?" 📌":""));
+  all.select("text.vt").attr("y",d=>d.isGroup?25:NH/2-10)
+    .attr("fill",d=>d.isPinned?"#e94560":d.needsPin?"#ff4d4d":d.tcolor)
+    .text(d=>d.needsPin?"⚠ PIN REQUIRED":d.value+(d.isPinned?" 📌":""));
 
   all.each(function(d){
     const hc=(d.children||[]).length>0;
@@ -836,6 +852,16 @@ function drawNodes(){
       // Gate badge at TOP — where child arrows feed in
       gb.append("rect").attr("x",-19).attr("y",-NH/2-18).attr("width",38).attr("height",15).attr("rx",4).attr("fill","#0d0d0d").attr("stroke",GC[d.gate]||"#aaa").attr("stroke-width",1.2);
       gb.append("text").attr("y",-NH/2-7).attr("text-anchor","middle").attr("fill",GC[d.gate]||"#aaa").attr("font-size",8).attr("font-weight",700).attr("font-family","JetBrains Mono,monospace").attr("letter-spacing",1).text(d.gate);
+    }
+    // needsPin warning badge — bottom centre
+    const wb=d3.select(this).select("g.wb"); wb.selectAll("*").remove();
+    if(d.needsPin){
+      wb.append("rect").attr("x",-44).attr("y",NH/2+5).attr("width",88).attr("height",14).attr("rx",4)
+        .attr("fill","#3a0000").attr("stroke","#ff4d4d").attr("stroke-width",1.2);
+      wb.append("text").attr("y",NH/2+15).attr("text-anchor","middle")
+        .attr("fill","#ff4d4d").attr("font-size",7.5).attr("font-weight",700)
+        .attr("font-family","JetBrains Mono,monospace").attr("letter-spacing",0.5)
+        .text("⚠ EDIT → PIN A VALUE");
     }
     const cb=d3.select(this).select("g.cb"); cb.selectAll("*").remove();
     if(hc){
@@ -1471,6 +1497,28 @@ def render_sidebar():
 
     st.markdown("---")
 
+    # ── Floating root nodes warning ───────────────────────────────────────
+    unpinned_roots = [n for n in nodes
+                      if n["type"] != "HAZARD"
+                      and not n.get("parentIds")
+                      and n.get("fixedValue") is None
+                      and n.get("calculatedValue") is None]
+    if unpinned_roots:
+        names = ", ".join(n.get("nodeId", n["id"]) for n in unpinned_roots[:3])
+        if len(unpinned_roots) > 3: names += f" +{len(unpinned_roots)-3} more"
+        st.markdown(f"""
+        <div style="background:#1a0000;border:2px solid #ff4d4d;border-radius:7px;
+                    padding:8px 12px;margin-bottom:8px;">
+          <div style="font-size:9px;color:#ff4d4d;font-weight:700;letter-spacing:1px;
+                      margin-bottom:4px;">⚠ FLOATING NODES NEED A VALUE</div>
+          <div style="font-size:9px;color:#cc8888;line-height:1.6;">
+            <b style="color:#ff6666;">{esc(names)}</b><br>
+            These root nodes have no parent and no pinned value.<br>
+            Their children <b>cannot receive calculated values</b>.<br>
+            → Go to <b>EDIT</b> tab → select the node → <b>📌 Pin to fixed value</b>
+          </div>
+        </div>""", unsafe_allow_html=True)
+
     # FILE MANAGER
     with st.expander("📁 FILE MANAGER", expanded=False):
         st.markdown(f"<div style='font-size:10px;color:#ff8c42;font-weight:700;margin-bottom:6px;'>▶ {st.session_state.active_file}</div>", unsafe_allow_html=True)
@@ -2019,10 +2067,16 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                                     n["nodeId"]     = new_node_id
                                     n["ftLabel"]    = new_ft_label
                                     n["fixedValue"] = new_fv
+                                    # Immediately reflect fixedValue in calculatedValue
+                                    # so the tree shows the value without needing CALCULATE
+                                    if new_fv is not None:
+                                        n["calculatedValue"] = new_fv
+                                    elif n.get("calculatedValue") == n.get("fixedValue"):
+                                        # Was pinned, now unpinned — clear calculated so
+                                        # it gets recomputed on next CALCULATE
+                                        n["calculatedValue"] = None
                                     if n["type"] != "HAZARD":
                                         n["type"]      = new_type
-                                        # Always write exactly what the user selected
-                                        # Empty list = intentional root node (no parent)
                                         n["parentIds"] = new_pids
                                     else:
                                         if new_tgt:
