@@ -2595,15 +2595,16 @@ with tab_tree:
                 "parents": sorted(n.get("parentIds") or []),
                 "fixed": str(n.get("fixedValue"))
             } for n in nodes], sort_keys=True) + (fid or "ALL")
-            # Include a hash of positions so cache rebuilds when layout changes
-            _pos_fingerprint = str(len(pending_pos)) + str(sorted(pending_pos.keys())[:5])
-            tree_key = _hl.md5((_hash_data + _pos_fingerprint).encode()).hexdigest()[:12]
 
             # Always inject latest pending positions into tree state
             pending_pos = st.session_state.get("_pending_positions", {})
             if pending_pos:
                 ts = dict(ts)
                 ts["positions"] = {**ts.get("positions", {}), **pending_pos}
+
+            # Include a position fingerprint so cache rebuilds when layout changes
+            _pos_fingerprint = str(len(pending_pos)) + str(sorted(pending_pos.keys())[:5])
+            tree_key = _hl.md5((_hash_data + _pos_fingerprint).encode()).hexdigest()[:12]
 
             if st.session_state.nodes_hash != tree_key:
                 st.session_state.nodes_hash = tree_key
