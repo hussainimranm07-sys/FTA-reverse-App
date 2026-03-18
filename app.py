@@ -461,6 +461,23 @@ def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
             visible.add(cur)
             for child in [n for n in nodes if cur in (n.get("parentIds") or [])]:
                 q.append(child["id"])
+        # Also include floating root nodes (no parentIds) that have children in this subtree
+        for n in nodes:
+            if n["type"] != "HAZARD" and not n.get("parentIds"):
+                # Check if any of its descendants are in visible
+                _fq = [c["id"] for c in nodes if n["id"] in (c.get("parentIds") or [])]
+                _seen = set()
+                _found = False
+                while _fq and not _found:
+                    _cid = _fq.pop()
+                    if _cid in _seen: continue
+                    _seen.add(_cid)
+                    if _cid in visible:
+                        _found = True
+                        break
+                    _fq += [c["id"] for c in nodes if _cid in (c.get("parentIds") or [])]
+                if _found:
+                    visible.add(n["id"])
         show_nodes = [n for n in nodes if n["id"] in visible]
     else:
         show_nodes = nodes
@@ -637,6 +654,20 @@ svg{position:absolute;inset:0;width:100%;height:100%;}
     <div class="ds"><div class="dsl">CHILDREN</div><div class="dsv" id="d6"></div></div>
   </div>
 </div>
+<div id="msp" style="display:none;position:absolute;bottom:0;left:0;right:0;
+  background:rgba(8,8,8,.95);border-top:2px solid #4fc3f7;padding:8px 16px 10px;
+  z-index:21;backdrop-filter:blur(14px);">
+  <button onclick="clearMultiSel()" style="position:absolute;top:8px;right:12px;
+    background:none;border:none;color:#555;font-size:17px;cursor:pointer;"
+    onmouseover="this.style.color='#fff'" onmouseout="this.style.color='#555'">&#10005;</button>
+  <div style="font-size:8px;color:#4fc3f7;letter-spacing:3px;margin-bottom:5px;font-weight:700;">
+    MULTI-SELECT — <span id="msc">0</span> NODES
+  </div>
+  <div id="mslist" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:7px;max-height:48px;overflow-y:auto;"></div>
+  <div style="font-size:8px;color:#555;margin-bottom:6px;">
+    Use actions in sidebar ▸ <b style="color:#4fc3f7;">SELECTION</b> panel
+  </div>
+</div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
 <script>
 const RNODES=__NODES__;
@@ -649,6 +680,7 @@ const GC={OR:"#4fc3f7",AND:"#ffb74d"};
 const NW=160,NH=88,HG=20,VG=185;
 let selId=null,forceOn=false,forceSub=null;
 let collapsed=new Set(),sM=[],sI=0;
+let multiSel=new Set();   // ← multi-select set
 const uP={};
 Object.entries(IPOS).forEach(([id,p])=>uP[id]={x:p.x,y:p.y});
 const NM={};
@@ -660,7 +692,7 @@ const zb=d3.zoom().scaleExtent([.03,6])
   .filter(e=>e.button===2||e.type==="wheel")
   .on("zoom",e=>{zg.attr("transform",e.transform);document.getElementById("zlbl").textContent=Math.round(e.transform.k*100)+"%";updateLanes();});
 svg.call(zb).on("contextmenu",e=>e.preventDefault());
-svg.on("click",()=>closeDP());
+svg.on("click",()=>{closeDP();if(multiSel.size>0)clearMultiSel();});
 function getT(){return d3.zoomTransform(svg.node());}
 function layY(r){return 80+r*VG;}
 let sN=[],sL=[];
@@ -726,7 +758,18 @@ function drawLinks(){
 function drawNodes(){
   const s=ng.selectAll("g.nd").data(sN,d=>d.id);
   const ent=s.enter().append("g").attr("class","nd").style("cursor","grab")
-    .on("click",(e,d)=>{e.stopPropagation();selectNode(d.id);})
+    .on("click",(e,d)=>{
+      e.stopPropagation();
+      if(e.ctrlKey||e.metaKey||e.shiftKey){
+        // Multi-select mode
+        closeDP();
+        toggleMultiSel(d.id,e);
+      } else {
+        // Single select — clear multi-sel first
+        if(multiSel.size>0){clearMultiSel();}
+        selectNode(d.id);
+      }
+    })
     .on("dblclick",(e,d)=>{e.stopPropagation();toggleCollapse(d.id);})
     .call(d3.drag().filter(e=>e.button===0)
       .on("start",(e,d)=>{e.sourceEvent.stopPropagation();if(forceOn&&!e.active)sim.alphaTarget(.05).restart();d.fx=d.x;d.fy=d.y;})
@@ -1012,6 +1055,74 @@ refresh();
 doColumnLayout(true);
 if(FOCUSID) setTimeout(()=>panTo(FOCUSID),700);
 
+// ── Multi-select ──────────────────────────────────────────────────────
+function toggleMultiSel(id, e){
+  if(multiSel.has(id)) multiSel.delete(id);
+  else multiSel.add(id);
+  updateMultiSelUI();
+  sendMultiSel();
+}
+
+function updateMultiSelUI(){
+  const msp=document.getElementById("msp");
+  const count=multiSel.size;
+  document.getElementById("msc").textContent=count;
+  // Render chip list
+  const list=document.getElementById("mslist");
+  list.innerHTML="";
+  multiSel.forEach(id=>{
+    const n=NM[id]; if(!n) return;
+    const chip=document.createElement("span");
+    chip.style.cssText=`background:#0a1a2e;border:1px solid ${n.color};color:${n.color};
+      font-size:9px;padding:1px 6px;border-radius:10px;font-family:monospace;
+      font-weight:700;cursor:pointer;white-space:nowrap;`;
+    chip.title="Click to deselect";
+    chip.textContent=(n.nodeId||n.id)+" "+n.name.slice(0,18)+(n.name.length>18?"…":"");
+    chip.onclick=()=>{multiSel.delete(id);updateMultiSelUI();sendMultiSel();};
+    list.appendChild(chip);
+  });
+  msp.style.display=count>0?"block":"none";
+  // Rehighlight all nodes
+  ng.selectAll("g.nd").each(function(d){
+    const isSel=multiSel.has(d.id);
+    const el=d3.select(this);
+    el.select("rect.nb")
+      .attr("stroke",isSel?"#e94560":d.isRoot?"#ffffff":d.isDuplicate?"#4fc3f7":d.isPinned?"#e94560":d.color)
+      .attr("stroke-width",isSel?3.5:d.isRoot?2:d.isDuplicate?2.5:d.isPinned?2.5:1.5)
+      .attr("stroke-dasharray",isSel?null:d.isRoot?"4,4":d.isDuplicate?"6,3":d.isPinned?"6,3":null)
+      .attr("filter",isSel?"drop-shadow(0 0 10px #e9456088)":null);
+    el.attr("opacity",count>0?(isSel?1:0.25):d.isRoot?0.75:1);
+  });
+}
+
+function clearMultiSel(){
+  multiSel.clear();
+  updateMultiSelUI();
+  sendMultiSel();
+  // Restore normal opacity
+  ng.selectAll("g.nd").each(function(d){
+    d3.select(this).attr("opacity",d.isRoot?0.75:1)
+      .select("rect.nb")
+      .attr("stroke",d.isRoot?"#ffffff":d.isDuplicate?"#4fc3f7":d.isPinned?"#e94560":d.color)
+      .attr("stroke-width",d.isRoot?2:d.isDuplicate?2.5:d.isPinned?2.5:1.5)
+      .attr("stroke-dasharray",d.isRoot?"4,4":d.isDuplicate?"6,3":d.isPinned?"6,3":null)
+      .attr("filter",null);
+  });
+}
+
+function sendMultiSel(){
+  try{
+    window.parent.postMessage(JSON.stringify({
+      type:"fta_multisel",
+      data: Array.from(multiSel).map(id=>{
+        const n=NM[id]||{};
+        return {id,name:n.name||id,nodeId:n.nodeId||id,type:n.type||"",
+                color:n.color||"#888",parents:n.parents||[],children:n.children||[]};
+      })
+    }),"*");
+  }catch(e){}
+}
+
 // ── Position save-back ────────────────────────────────────────────────
 // Sends current node positions to Python via postMessage so they survive
 // page rerenders (CALCULATE, file load, etc.)
@@ -1060,8 +1171,9 @@ DEFS = {"nodes":[],"save_status":"idle","save_msg":"","gist_loaded":False,
         "active_file":"my_tree.json","file_list":[],"selected_id":None,
         "tree_filter":"ALL",
         "nodes_since_calc": 0,
-        "pending_node_names": [],   # names of nodes added without calculating
+        "pending_node_names": [],
         "nodes_hash": "",
+        "multisel_ids": [],        # list of internal ids currently multi-selected
         "tree_state": {
             "scale": 1.0, "tx": 0, "ty": 0,
             "collapsed": [],
@@ -1176,6 +1288,138 @@ def render_sidebar():
     nodes  = st.session_state.nodes
     by_id  = {n["id"]: n for n in nodes}
     hazards = [n for n in nodes if n["type"] == "HAZARD"]
+
+    # ── SELECTION PANEL — shown when nodes are multi-selected ─────────────
+    sel_ids = st.session_state.get("multisel_ids", [])
+    sel_nodes = [by_id[i] for i in sel_ids if i in by_id]
+
+    if sel_nodes:
+        st.markdown(f"""
+        <div style="background:#080f1a;border:2px solid #4fc3f7;border-radius:8px;
+                    padding:8px 12px;margin-bottom:10px;">
+          <div style="font-size:9px;color:#4fc3f7;font-weight:700;letter-spacing:2px;
+                      margin-bottom:6px;">⬡ SELECTION — {len(sel_nodes)} NODES</div>
+          <div style="display:flex;flex-wrap:wrap;gap:3px;margin-bottom:8px;">
+            {''.join(f'<span style="background:#0a1a2e;border:1px solid {LEVEL_COLORS.get(n["type"],"#888")};color:{LEVEL_COLORS.get(n["type"],"#888")};font-size:8px;padding:1px 6px;border-radius:10px;font-family:monospace;font-weight:700;">{esc(n.get("nodeId",n["id"]))}</span>' for n in sel_nodes)}
+          </div>
+        </div>""", unsafe_allow_html=True)
+
+        if len(sel_nodes) >= 2:
+            st.markdown("<div style='font-size:9px;color:#aaa;margin-bottom:4px;font-weight:700;'>ACTIONS</div>",
+                        unsafe_allow_html=True)
+
+            # ── Determine existing relationships ──────────────────────
+            pairs = [(sel_nodes[i], sel_nodes[j])
+                     for i in range(len(sel_nodes))
+                     for j in range(i+1, len(sel_nodes))]
+
+            connected_pairs = [
+                (a, b) for a, b in pairs
+                if b["id"] in (a.get("parentIds") or []) or a["id"] in (b.get("parentIds") or [])
+            ]
+
+            # ── Action 1: Link as parent→child ─────────────────────────
+            with st.expander("🔗 Link (set parent → child)", expanded=True):
+                st.markdown("<div style='font-size:9px;color:#777;margin-bottom:4px;'>Pick which node is the PARENT and which is the CHILD:</div>",
+                            unsafe_allow_html=True)
+                node_labels = {f"{n.get('nodeId',n['id'])} — {n['name'][:28]}": n["id"] for n in sel_nodes}
+                parent_lbl = st.selectbox("Parent", list(node_labels.keys()), key="ms_parent")
+                child_lbl  = st.selectbox("Child",  [l for l in node_labels if l != parent_lbl],
+                                           key="ms_child")
+                parent_id  = node_labels[parent_lbl]
+                child_id   = node_labels[[l for l in node_labels if l != parent_lbl][0]] \
+                             if child_lbl not in node_labels else node_labels[child_lbl]
+                if st.button("🔗 Add parent→child link", use_container_width=True, type="primary",
+                             key="ms_link"):
+                    upd = []
+                    for n in nodes:
+                        n = dict(n)
+                        if n["id"] == child_id:
+                            pids = list(n.get("parentIds") or [])
+                            if parent_id not in pids:
+                                pids.append(parent_id)
+                            n["parentIds"] = pids
+                        upd.append(n)
+                    st.session_state.nodes_since_calc += 1
+                    st.session_state.multisel_ids = []
+                    set_nodes(upd)
+                    st.success(f"Linked: {parent_lbl} → {child_lbl}")
+                    st.rerun(scope="app")
+
+            # ── Action 2: Make same node (sync nodeId) ─────────────────
+            with st.expander("◈ Mark as same failure (sync Node ID)"):
+                st.markdown(
+                    "<div style='font-size:9px;color:#777;margin-bottom:4px;line-height:1.5;'>"
+                    "Makes all selected nodes carry the same Node ID — they become "
+                    "duplicate instances of the same failure. Pick which ID to use:</div>",
+                    unsafe_allow_html=True)
+                id_opts = [n.get("nodeId", n["id"]) for n in sel_nodes]
+                chosen_nid = st.selectbox("Node ID to use", id_opts, key="ms_nid")
+                if st.button("◈ Sync Node IDs", use_container_width=True, key="ms_sync"):
+                    upd = []
+                    for n in nodes:
+                        n = dict(n)
+                        if n["id"] in sel_ids:
+                            n["nodeId"] = chosen_nid
+                        upd.append(n)
+                    st.session_state.nodes_since_calc += 1
+                    st.session_state.multisel_ids = []
+                    set_nodes(upd)
+                    st.success(f"All selected nodes now share Node ID: {chosen_nid}")
+                    st.rerun(scope="app")
+
+            # ── Action 3: Break connection ──────────────────────────────
+            if connected_pairs:
+                with st.expander("✂️ Break connection"):
+                    st.markdown("<div style='font-size:9px;color:#777;margin-bottom:4px;'>Connected pairs found:</div>",
+                                unsafe_allow_html=True)
+                    for a, b in connected_pairs:
+                        # Determine direction
+                        if b["id"] in (a.get("parentIds") or []):
+                            child_n, parent_n = a, b
+                        else:
+                            child_n, parent_n = b, a
+                        label = f"{child_n.get('nodeId',child_n['id'])} ← {parent_n.get('nodeId',parent_n['id'])}"
+                        if st.button(f"✂️ Break: {label}", key=f"ms_brk_{child_n['id']}_{parent_n['id']}",
+                                     use_container_width=True):
+                            upd = []
+                            for n in nodes:
+                                n = dict(n)
+                                if n["id"] == child_n["id"]:
+                                    n["parentIds"] = [p for p in (n.get("parentIds") or [])
+                                                      if p != parent_n["id"]]
+                                upd.append(n)
+                            st.session_state.nodes_since_calc += 1
+                            st.session_state.multisel_ids = []
+                            set_nodes(upd)
+                            st.success(f"Broke connection: {label}")
+                            st.rerun(scope="app")
+
+        # Clear selection button
+        if st.button("✕ Clear selection", use_container_width=True, key="ms_clear"):
+            st.session_state.multisel_ids = []
+            try: st.query_params.pop("msel", None)
+            except: pass
+            st.rerun(scope="app")
+
+        st.markdown("---")
+
+    # ── Manual selection builder (always visible, compact) ────────────────
+    with st.expander("⬡ SELECT NODES (Ctrl+click in tree, or pick here)", expanded=False):
+        st.markdown("<div style='font-size:9px;color:#777;margin-bottom:4px;'>Pick nodes to add to the selection panel above:</div>",
+                    unsafe_allow_html=True)
+        all_opts = {f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name'][:30]}": n["id"]
+                    for n in nodes}
+        cur_labels = [lbl for lbl, nid in all_opts.items()
+                      if nid in st.session_state.get("multisel_ids", [])]
+        picked = st.multiselect("Nodes", list(all_opts.keys()),
+                                default=cur_labels, key="ms_manual_pick",
+                                label_visibility="collapsed")
+        if st.button("✓ Apply selection", use_container_width=True, key="ms_apply"):
+            st.session_state.multisel_ids = [all_opts[l] for l in picked]
+            st.rerun(scope="app")
+
+    st.markdown("---")
 
     # FILE MANAGER
     with st.expander("📁 FILE MANAGER", expanded=False):
@@ -1434,8 +1678,14 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                   </span>
                 </div>""", unsafe_allow_html=True)
 
+            # Parent options: standard parent types + any floating root nodes
+            _root_nodes = [n for n in nodes
+                           if n["type"] not in ("HAZARD",) + tuple(VALID_CHILD_TYPES)
+                           or (n["type"] in VALID_CHILD_TYPES and not n.get("parentIds"))]
             parent_opts = {f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name']}": n["id"]
-                           for n in nodes if n["type"] in VALID_PARENT_TYPES}
+                           for n in nodes
+                           if n["type"] in VALID_PARENT_TYPES
+                           or (n["type"] in VALID_CHILD_TYPES and not n.get("parentIds"))}
             sel_labels  = st.multiselect("Parent Node(s)", list(parent_opts.keys()), key="add_par")
             sel_pids    = [parent_opts[l] for l in sel_labels]
 
@@ -1649,7 +1899,10 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                         ti       = VALID_CHILD_TYPES.index(en["type"]) if en["type"] in VALID_CHILD_TYPES else 0
                         new_type = st.selectbox("Type", VALID_CHILD_TYPES, index=ti, key="en_type")
                         avail_p  = {f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name']}": n["id"]
-                                    for n in nodes if n["type"] in VALID_PARENT_TYPES and n["id"] != eid}
+                                    for n in nodes
+                                    if (n["type"] in VALID_PARENT_TYPES or
+                                        (n["type"] in VALID_CHILD_TYPES and not n.get("parentIds")))
+                                    and n["id"] != eid}
                         cur_pl   = [lbl for lbl, pid in avail_p.items()
                                     if pid in (en.get("parentIds") or [])]
                         new_pl   = st.multiselect("Parents", list(avail_p.keys()),
@@ -2053,7 +2306,9 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                         st.markdown('<div style="font-size:9px;color:#4fc3f7;font-weight:700;letter-spacing:1px;margin:8px 0 5px;">ADD PARENT CONNECTION</div>', unsafe_allow_html=True)
                         avp2 = {f"[{nd['type']}] {nd.get('nodeId',nd['id'])} — {nd['name']}": nd["id"]
                                 for nd in nodes
-                                if nd["type"] in VALID_PARENT_TYPES and nd["id"] not in pids and nd["id"] != n["id"]}
+                                if (nd["type"] in VALID_PARENT_TYPES or
+                                    (nd["type"] in VALID_CHILD_TYPES and not nd.get("parentIds")))
+                                and nd["id"] not in pids and nd["id"] != n["id"]}
                         new_p2 = st.selectbox("New parent", ["— select —"] + list(avp2.keys()),
                                               key=f"lnk_newp_{n['id']}")
                         if new_p2 != "— select —":
@@ -2194,7 +2449,14 @@ with tab_tree:
         st.markdown("<div style='text-align:center;color:#333;margin-top:60px;letter-spacing:2px;'>ADD A HAZARD TO START</div>", unsafe_allow_html=True)
     else:
         # Sticky hazard filter — default to first hazard, not full tree
-        filter_opts = {"Full Tree (all hazards)": "ALL"} | {
+        # Collect floating root nodes (non-HAZARD, no parents)
+        floating_roots = [n for n in nodes
+                          if n["type"] != "HAZARD" and not n.get("parentIds")]
+
+        filter_opts = {"Full Tree (all hazards)": "ALL"}
+        if floating_roots:
+            filter_opts["⬡ Floating Root Nodes"] = "FLOATING"
+        filter_opts |= {
             f"🎯 {h['name']}  ({fmt(h.get('targetValue'))})": h["id"] for h in hazards
         }
         opt_keys = list(filter_opts.keys())
@@ -2207,66 +2469,106 @@ with tab_tree:
         filter_label = st.selectbox("View", opt_keys, index=default_idx,
                                     key="tree_filter_sel", label_visibility="collapsed")
         filter_id = filter_opts[filter_label]
-        fid = None if filter_id == "ALL" else filter_id
+        if filter_id == "FLOATING":
+            fid = None
+            # Build a special floating-only node list
+            _float_ids = set()
+            _fq = [n["id"] for n in floating_roots]
+            while _fq:
+                _cur = _fq.pop()
+                if _cur in _float_ids: continue
+                _float_ids.add(_cur)
+                for _ch in [n for n in nodes if _cur in (n.get("parentIds") or [])]:
+                    _fq.append(_ch["id"])
+            _float_nodes = [n for n in nodes if n["id"] in _float_ids]
+            ts = st.session_state.tree_state
+            saved_positions = st.session_state.get("_tree_positions", {})
+            if saved_positions:
+                ts = dict(ts); ts["positions"] = saved_positions
+            tree_html = build_html_tree(_float_nodes, filter_hazard_id=None, tree_state=ts)
+            if tree_html:
+                components.html(tree_html, height=780, scrolling=False)
+            else:
+                st.markdown("<div style='color:#4caf7d;text-align:center;margin-top:60px;'>No floating nodes yet.</div>", unsafe_allow_html=True)
+        else:
+            fid = None if filter_id == "ALL" else filter_id
 
         # When user changes hazard in dropdown → focus on that hazard
         if filter_id != saved_filter:
             st.session_state.tree_filter = filter_id
-            st.session_state.tree_state["focus_id"] = fid  # None = full tree, else hazard id
+            st.session_state.tree_state["focus_id"] = fid if filter_id != "FLOATING" else None
 
-        ts = st.session_state.tree_state
-        st.markdown(
-            "<div style='font-size:9px;color:#333;margin-bottom:3px;'>"
-            "⚡ Force ON/OFF · Scroll=zoom · Right-drag=pan · Left-drag=move · "
-            "Click=inspect · Dbl-click=collapse"
-            "</div>", unsafe_allow_html=True)
+        if filter_id != "FLOATING":
+            ts = st.session_state.tree_state
+            st.markdown(
+                "<div style='font-size:9px;color:#333;margin-bottom:3px;'>"
+                "⚡ Force ON/OFF · Scroll=zoom · Right-drag=pan · Left-drag=move · "
+                "Click=inspect · Dbl-click=collapse"
+                "</div>", unsafe_allow_html=True)
 
-        # ── Hash-based cache: only rebuild iframe when node data changes ──
-        import hashlib as _hl, json as _js
-        _hash_data = _js.dumps([{
-            "id": n["id"], "name": n["name"], "type": n["type"],
-            "gate": n["gate"], "val": fmt(n.get("calculatedValue")),
-            "parents": sorted(n.get("parentIds") or []),
-            "fixed": str(n.get("fixedValue"))
-        } for n in nodes], sort_keys=True) + (fid or "ALL")
-        tree_key = _hl.md5(_hash_data.encode()).hexdigest()[:12]
+            # ── Hash-based cache: only rebuild iframe when node data changes ──
+            import hashlib as _hl, json as _js
+            _hash_data = _js.dumps([{
+                "id": n["id"], "name": n["name"], "type": n["type"],
+                "gate": n["gate"], "val": fmt(n.get("calculatedValue")),
+                "parents": sorted(n.get("parentIds") or []),
+                "fixed": str(n.get("fixedValue"))
+            } for n in nodes], sort_keys=True) + (fid or "ALL")
+            tree_key = _hl.md5(_hash_data.encode()).hexdigest()[:12]
 
-        # Use saved positions from postMessage save-back if available
-        saved_positions = st.session_state.get("_tree_positions", {})
-        if saved_positions:
-            ts = dict(ts)
-            ts["positions"] = saved_positions
+            # Use saved positions from postMessage save-back if available
+            saved_positions = st.session_state.get("_tree_positions", {})
+            if saved_positions:
+                ts = dict(ts)
+                ts["positions"] = saved_positions
 
-        if st.session_state.nodes_hash != tree_key:
-            st.session_state.nodes_hash = tree_key
-            tree_html = build_html_tree(nodes, filter_hazard_id=fid, tree_state=ts)
-            st.session_state["_cached_tree_html"] = tree_html
-        else:
-            tree_html = st.session_state.get("_cached_tree_html") or \
-                        build_html_tree(nodes, filter_hazard_id=fid, tree_state=ts)
+            if st.session_state.nodes_hash != tree_key:
+                st.session_state.nodes_hash = tree_key
+                tree_html = build_html_tree(nodes, filter_hazard_id=fid, tree_state=ts)
+                st.session_state["_cached_tree_html"] = tree_html
+            else:
+                tree_html = st.session_state.get("_cached_tree_html") or \
+                            build_html_tree(nodes, filter_hazard_id=fid, tree_state=ts)
 
-        components.html(tree_html, height=780, scrolling=False)
-        st.session_state.tree_state["focus_id"] = None
+            components.html(tree_html, height=780, scrolling=False)
+            st.session_state.tree_state["focus_id"] = None
 
-        # ── Position receiver (hidden) ────────────────────────────────
-        # Catches postMessage from the tree iframe and saves positions
-        # so they survive CALCULATE / file load rerenders
-        pos_receiver = """
+        # ── Message receiver (position + multi-select) ────────────────
+        # Multi-select: tree iframe sends selection via postMessage.
+        # We catch it with a JS bridge and store IDs in the URL hash,
+        # then read via st.query_params on next interaction.
+        components.html("""
         <script>
         window.addEventListener("message", function(e){
             try{
                 const d = typeof e.data === "string" ? JSON.parse(e.data) : e.data;
                 if(d && d.type === "fta_pos"){
-                    // Store in sessionStorage so Streamlit can read on next rerun
                     sessionStorage.setItem("fta_positions", JSON.stringify(d.data));
+                }
+                if(d && d.type === "fta_multisel"){
+                    const ids = d.data.map(n=>n.id).join(",");
+                    // Write to parent URL query param so Streamlit picks it up
+                    try{
+                        const url = new URL(window.parent.location.href);
+                        if(ids){ url.searchParams.set("msel", ids); }
+                        else   { url.searchParams.delete("msel"); }
+                        window.parent.history.replaceState(null,"",url.toString());
+                    }catch(ex){}
                 }
             }catch(err){}
         });
         </script>
-        """
-        # Note: true round-trip requires a custom component; positions survive
-        # within the browser session via uP (JS memory) which is sufficient
-        # for normal use. Browser refresh loses positions — press ⊞ Reset to rebalance.
+        """, height=0)
+
+        # Read multi-select from query params (set by JS bridge above)
+        try:
+            _qp_msel = st.query_params.get("msel","")
+            if _qp_msel:
+                _new_ids = [i for i in _qp_msel.split(",") if i in by_id]
+                if _new_ids != st.session_state.multisel_ids:
+                    st.session_state.multisel_ids = _new_ids
+        except Exception:
+            pass
 
 # ── TAB 2: Hierarchy ─────────────────────────────────────────────────────
 with tab_hier:
