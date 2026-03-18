@@ -698,7 +698,7 @@ const FOCUSID=__FOCUS__;
 const LLABELS=__LLABELS__;
 const LCOLORS=__LCOLORS__;
 const GC={OR:"#4fc3f7",AND:"#ffb74d"};
-const NW=160,NH=88,HG=20,VG=185;
+const NW=160,NH=88,HG=20,VG=140;
 let selId=null,forceOn=false,forceSub=null;
 let collapsed=new Set(),sM=[],sI=0;
 let multiSel=new Set();   // ← multi-select set
@@ -1057,8 +1057,39 @@ function panTo(id){
 }
 
 refresh();
-doColumnLayout(true);
-if(FOCUSID) setTimeout(()=>panTo(FOCUSID),700);
+// Only reset layout if no saved positions exist — otherwise restore from IPOS
+const hasSavedPos = Object.keys(IPOS).length > 0;
+if(hasSavedPos){
+  // Restore saved positions: mark all IPOS nodes as manual so layout respects them
+  Object.entries(IPOS).forEach(([id,p])=>{
+    if(p && p.x != null) uP[id]={x:p.x,y:p.y,manual:true};
+  });
+  computeRTLayout(false);
+  tick(); updateLanes();
+  setTimeout(doFit,80);
+} else {
+  doColumnLayout(true);
+}
+// Only pan to focus if no saved positions — if positions are saved,
+// user is already viewing where they want to be
+if(FOCUSID && !hasSavedPos) setTimeout(()=>panTo(FOCUSID),900);
+
+// Listen for position restore from localStorage (pushed by parent page on load)
+window.addEventListener("message", function(e){
+  try{
+    const d = typeof e.data === "string" ? JSON.parse(e.data) : e.data;
+    if(d && d.type === "fta_restore_pos"){
+      let changed = false;
+      Object.entries(d.data).forEach(([id,p])=>{
+        if(p && p.x != null && !uP[id]?.manual){
+          uP[id]={x:p.x,y:p.y,manual:p.manual||false};
+          changed = true;
+        }
+      });
+      if(changed){ computeRTLayout(false); tick(); updateLanes(); }
+    }
+  }catch(err){}
+});
 
 // ── Multi-select ──────────────────────────────────────────────────────
 function toggleMultiSel(id, e){
@@ -1128,21 +1159,20 @@ function sendMultiSel(){
   }catch(e){}
 }
 
-// ── Position save-back ────────────────────────────────────────────────
-// Sends current node positions to Python via postMessage so they survive
-// page rerenders (CALCULATE, file load, etc.)
+// ── Position save-back ────────────────────────────────────────────
 function savePositions(){
   const pos={};
-  sN.forEach(n=>{if(n.x!=null)pos[n.id]={x:Math.round(n.x),y:Math.round(n.y),manual:!!(uP[n.id]?.manual)};});
+  // Save ALL positions — manual and auto — so full layout is preserved
+  sN.forEach(n=>{
+    if(n.x!=null && n.y!=null)
+      pos[n.id]={x:Math.round(n.x),y:Math.round(n.y),manual:!!(uP[n.id]?.manual)};
+  });
   try{
     window.parent.postMessage(JSON.stringify({type:"fta_pos",data:pos}),"*");
   }catch(e){}
 }
-// Save after drag ends — already handled via uP, but also save on stop-force
-// and periodically every 30s in case of drift
-setInterval(savePositions, 30000);
-// Save when user stops interacting
-document.addEventListener("pointerup", ()=>setTimeout(savePositions,500));
+setInterval(savePositions, 15000);
+document.addEventListener("pointerup", ()=>setTimeout(savePositions,300));
 </script></body></html>"""
 
     # Substitute data placeholders
@@ -1765,7 +1795,7 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                         "calculatedValue": fv,
                         "parentIds":      sel_pids,
                     }
-                    st.session_state.tree_state["focus_id"] = sel_pids[0] if sel_pids else nid
+                    st.session_state.tree_state["focus_id"] = nid  # pan to the new node
                     st.session_state.nodes_since_calc += 1
                     pnn = st.session_state.get("pending_node_names", [])
                     pnn.append(f"{cid_clean} {display_name[:30]}")
@@ -2532,9 +2562,10 @@ with tab_tree:
                     _fq.append(_ch["id"])
             _float_nodes = [n for n in nodes if n["id"] in _float_ids]
             ts = st.session_state.tree_state
-            saved_positions = st.session_state.get("_tree_positions", {})
-            if saved_positions:
-                ts = dict(ts); ts["positions"] = saved_positions
+            pending_pos = st.session_state.get("_pending_positions", {})
+            if pending_pos:
+                ts = dict(ts)
+                ts["positions"] = {**ts.get("positions", {}), **pending_pos}
             tree_html = build_html_tree(_float_nodes, filter_hazard_id=None, tree_state=ts)
             if tree_html:
                 components.html(tree_html, height=780, scrolling=False)
@@ -2553,10 +2584,10 @@ with tab_tree:
             st.markdown(
                 "<div style='font-size:9px;color:#333;margin-bottom:3px;'>"
                 "⚡ Force ON/OFF · Scroll=zoom · Right-drag=pan · Left-drag=move · "
-                "Click=inspect · Dbl-click=collapse"
+                "Click=inspect · Ctrl+click=multi-select · Dbl-click=collapse"
                 "</div>", unsafe_allow_html=True)
 
-            # ── Hash-based cache: only rebuild iframe when node data changes ──
+            # ── Hash-based cache ──────────────────────────────────────────
             import hashlib as _hl, json as _js
             _hash_data = _js.dumps([{
                 "id": n["id"], "name": n["name"], "type": n["type"],
@@ -2564,13 +2595,15 @@ with tab_tree:
                 "parents": sorted(n.get("parentIds") or []),
                 "fixed": str(n.get("fixedValue"))
             } for n in nodes], sort_keys=True) + (fid or "ALL")
-            tree_key = _hl.md5(_hash_data.encode()).hexdigest()[:12]
+            # Include a hash of positions so cache rebuilds when layout changes
+            _pos_fingerprint = str(len(pending_pos)) + str(sorted(pending_pos.keys())[:5])
+            tree_key = _hl.md5((_hash_data + _pos_fingerprint).encode()).hexdigest()[:12]
 
-            # Use saved positions from postMessage save-back if available
-            saved_positions = st.session_state.get("_tree_positions", {})
-            if saved_positions:
+            # Always inject latest pending positions into tree state
+            pending_pos = st.session_state.get("_pending_positions", {})
+            if pending_pos:
                 ts = dict(ts)
-                ts["positions"] = saved_positions
+                ts["positions"] = {**ts.get("positions", {}), **pending_pos}
 
             if st.session_state.nodes_hash != tree_key:
                 st.session_state.nodes_hash = tree_key
@@ -2590,17 +2623,20 @@ with tab_tree:
             try{
                 const d = typeof e.data === "string" ? JSON.parse(e.data) : e.data;
                 if(d && d.type === "fta_pos"){
-                    sessionStorage.setItem("fta_positions", JSON.stringify(d.data));
-                    // Also write compact form to URL so Python can read on next rerun
+                    // Store in localStorage (persists across page reloads in same browser)
+                    try{ localStorage.setItem("fta_pos_v2", JSON.stringify(d.data)); }catch(ex){}
+                    // Also write compact form to parent URL for Python to read
                     try{
                         const url = new URL(window.parent.location.href);
-                        // Encode positions as compact CSV: id:x:y,id:x:y,...
                         const posStr = Object.entries(d.data)
-                            .filter(([,p])=>p.manual)  // only user-moved nodes
-                            .map(([id,p])=>id+':'+p.x+':'+p.y)
+                            .map(([id,p])=>id+':'+p.x+':'+p.y+':'+(p.manual?1:0))
                             .join(',');
-                        if(posStr){ url.searchParams.set("fpos", posStr); }
-                        else      { url.searchParams.delete("fpos"); }
+                        if(posStr.length < 4000){
+                            url.searchParams.set("fpos", posStr);
+                        } else {
+                            // Too long for URL — just store in localStorage
+                            url.searchParams.delete("fpos");
+                        }
                         window.parent.history.replaceState(null,"",url.toString());
                     }catch(ex){}
                 }
@@ -2615,22 +2651,43 @@ with tab_tree:
                 }
             }catch(err){}
         });
+        // On load, restore positions from localStorage into the tree iframe
+        window.addEventListener("load", function(){
+            try{
+                const saved = localStorage.getItem("fta_pos_v2");
+                if(saved){
+                    const frames = document.querySelectorAll("iframe");
+                    frames.forEach(f=>{
+                        try{ f.contentWindow.postMessage(
+                            JSON.stringify({type:"fta_restore_pos", data:JSON.parse(saved)}), "*");
+                        }catch(ex){}
+                    });
+                }
+            }catch(err){}
+        });
         </script>
         """, height=0)
 
-        # Read positions from query params and store in session_state
+        # Read positions from query params
         try:
             _qp_pos = st.query_params.get("fpos","")
             if _qp_pos:
                 _pending = {}
                 for _entry in _qp_pos.split(","):
                     _parts = _entry.split(":")
-                    if len(_parts) == 3:
-                        _nid, _x, _y = _parts
-                        try: _pending[_nid] = {"x": float(_x), "y": float(_y), "manual": True}
+                    if len(_parts) >= 3:
+                        try:
+                            _nid = _parts[0]
+                            _x, _y = float(_parts[1]), float(_parts[2])
+                            _manual = len(_parts) > 3 and _parts[3] == "1"
+                            _pending[_nid] = {"x": _x, "y": _y, "manual": _manual}
                         except: pass
                 if _pending:
-                    st.session_state["_pending_positions"] = _pending
+                    # Merge with existing — don't overwrite positions for nodes
+                    # that already have saved positions
+                    existing = st.session_state.get("_pending_positions", {})
+                    existing.update(_pending)
+                    st.session_state["_pending_positions"] = existing
         except Exception:
             pass
 
