@@ -1690,6 +1690,32 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                     and n not in id_matches  # don't double-show
                 ]
 
+            # ── Parent selector (MUST come before match cards so sel_pids is defined) ──
+            # Parent options: standard parent types + any floating root nodes
+            _root_nodes = [n for n in nodes
+                           if n["type"] not in ("HAZARD",) + tuple(VALID_CHILD_TYPES)
+                           or (n["type"] in VALID_CHILD_TYPES and not n.get("parentIds"))]
+            parent_opts = {f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name']}": n["id"]
+                           for n in nodes
+                           if n["type"] in VALID_PARENT_TYPES
+                           or (n["type"] in VALID_CHILD_TYPES and not n.get("parentIds"))}
+            sel_labels  = st.multiselect("Parent Node(s)", list(parent_opts.keys()), key="add_par")
+            sel_pids    = [parent_opts[l] for l in sel_labels]
+
+            if not sel_pids and cid_clean:
+                st.markdown("""
+                <div style="background:#0d1a0d;border:1.5px solid #4caf7d44;border-radius:6px;
+                            padding:6px 10px;margin:2px 0 4px 0;">
+                  <span style="font-size:9px;color:#4caf7d;font-weight:700;">ℹ ROOT NODE MODE</span>
+                  <div style="font-size:9px;color:#777;margin-top:2px;line-height:1.5;">
+                    No parent selected — node will be created as a <b style="color:#4caf7d;">root node</b>
+                    (no parent, floats independently).<br>
+                    Use this when a node like FF-32 exists in a second hazard without a parent chain above it.<br>
+                    You can connect it later via the <b>EDIT</b> tab or by using
+                    <b>◈ Place under selected parent(s)</b> when adding another node with the same ID.
+                  </div>
+                </div>""", unsafe_allow_html=True)
+
             # ── Render search results ─────────────────────────────────
             def render_match_card(matches, match_type):
                 for ex in matches:
@@ -1738,8 +1764,7 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                                  key=f"place_{ex['id']}",
                                  use_container_width=True,
                                  type="primary"):
-                        cur_sel = sel_pids if sel_pids else []
-                        if not cur_sel:
+                        if not sel_pids:
                             st.error("Select at least one parent above first")
                         else:
                             updated = []
@@ -1747,7 +1772,7 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                                 if n["id"] == ex["id"]:
                                     n = dict(n)
                                     ep = list(n.get("parentIds") or [])
-                                    ep += [p for p in cur_sel if p not in ep]
+                                    ep += [p for p in sel_pids if p not in ep]
                                     n["parentIds"] = ep
                                 updated.append(n)
                             st.session_state.tree_state["focus_id"] = ex["id"]
@@ -1774,31 +1799,6 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                   <span style="font-size:9px;color:#4caf7d;font-weight:700;">
                     ✓ {cid_clean} is available
                   </span>
-                </div>""", unsafe_allow_html=True)
-
-            # Parent options: standard parent types + any floating root nodes
-            _root_nodes = [n for n in nodes
-                           if n["type"] not in ("HAZARD",) + tuple(VALID_CHILD_TYPES)
-                           or (n["type"] in VALID_CHILD_TYPES and not n.get("parentIds"))]
-            parent_opts = {f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name']}": n["id"]
-                           for n in nodes
-                           if n["type"] in VALID_PARENT_TYPES
-                           or (n["type"] in VALID_CHILD_TYPES and not n.get("parentIds"))}
-            sel_labels  = st.multiselect("Parent Node(s)", list(parent_opts.keys()), key="add_par")
-            sel_pids    = [parent_opts[l] for l in sel_labels]
-
-            if not sel_pids and cid_clean:
-                st.markdown("""
-                <div style="background:#0d1a0d;border:1.5px solid #4caf7d44;border-radius:6px;
-                            padding:6px 10px;margin:2px 0 4px 0;">
-                  <span style="font-size:9px;color:#4caf7d;font-weight:700;">ℹ ROOT NODE MODE</span>
-                  <div style="font-size:9px;color:#777;margin-top:2px;line-height:1.5;">
-                    No parent selected — node will be created as a <b style="color:#4caf7d;">root node</b>
-                    (no parent, floats independently).<br>
-                    Use this when a node like FF-32 exists in a second hazard without a parent chain above it.<br>
-                    You can connect it later via the <b>EDIT</b> tab or by using
-                    <b>◈ Place under selected parent(s)</b> when adding another node with the same ID.
-                  </div>
                 </div>""", unsafe_allow_html=True)
             node_type   = st.selectbox("Type", VALID_CHILD_TYPES, key="add_type",
                                        help="GROUP = Combined Faults oval (placed between FF and IF layers)")
