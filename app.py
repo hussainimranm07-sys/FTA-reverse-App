@@ -147,6 +147,11 @@ def recalculate(nodes):
         if n["type"] == "HAZARD" or n.get("fixedValue") is not None:
             resolved.add(n["id"])
             queue.append(n["id"])
+        elif not [p for p in (n.get("parentIds") or []) if p in by_id]:
+            # Parentless non-HAZARD root node — seed it so its children can propagate
+            # Value stays None (will show "-") unless fixedValue is set
+            resolved.add(n["id"])
+            queue.append(n["id"])
 
     while queue:
         pid        = queue.popleft()
@@ -482,8 +487,9 @@ def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
     LEVEL_COLOR = {0: "#ff4d4d", 1: "#ff8c42", 2: "#f5c518", 2.5: "#7e57c2", 3: "#4caf7d"}
     LEVEL_LABEL = {0: "HAZARD", 1: "SF", 2: "FF", 2.5: "GROUP", 3: "IF"}
 
-    # ── Compute per-node depth so same-type parent/child never share a row ──
-    # Start from HAZARD=0, propagate depth = max(parent_depth)+1 downward
+    # ── Per-node depth so same-type parent/child never share a row ──────────
+    # Root nodes (no visible parents) get depth 0.
+    # Non-HAZARD nodes with no parents are also treated as depth-0 roots.
     _depth_map = {}
     def _get_depth(nid, _seen=None):
         if nid in _depth_map: return _depth_map[nid]
@@ -514,6 +520,7 @@ def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
         "isPinned":    n.get("fixedValue") is not None,
         "fixedVal":    fmt(n.get("fixedValue")) if n.get("fixedValue") is not None else None,
         "isGroup":     n["type"] == "GROUP",
+        "isRoot":      n["type"] != "HAZARD" and not [p for p in (n.get("parentIds") or []) if p in shown_ids],
         "color":       LEVEL_COLORS.get(n["type"], "#7e57c2"),
         "tcolor":      LEVEL_TEXT.get(n["type"], "#fff"),
         "row":         _depth_map.get(n["id"], LEVEL_ROW.get(n["type"], 2)),
@@ -607,10 +614,8 @@ svg{position:absolute;inset:0;width:100%;height:100%;}
   <div id="lanes"></div>
   <svg id="sv">
     <defs>
-      <marker id="ma"  markerWidth="8" markerHeight="8" refX="1" refY="4" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 Z" fill="#333"/></marker>
-      <marker id="mah" markerWidth="8" markerHeight="8" refX="1" refY="4" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 Z" fill="#4fc3f7"/></marker>
-      <marker id="mast" markerWidth="8" markerHeight="8" refX="1" refY="4" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 Z" fill="#333"/></marker>
-      <marker id="masth" markerWidth="8" markerHeight="8" refX="1" refY="4" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 Z" fill="#4fc3f7"/></marker>
+      <marker id="ma"  markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 Z" fill="#444"/></marker>
+      <marker id="mah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 Z" fill="#4fc3f7"/></marker>
     </defs>
     <g id="zg"><g id="lg"></g><g id="ng"></g></g>
   </svg>
@@ -712,7 +717,8 @@ function drawLinks(){
    .attr("stroke-width",d=>d.shared?1.2:2)
    .attr("stroke-dasharray",d=>d.andGate?"8,4":d.shared?"4,6":null)
    .attr("opacity",d=>d.shared?.5:.92)
-   .attr("marker-end","none").attr("marker-start","url(#mast)");
+   .attr("marker-end","none")
+   .attr("marker-start","url(#ma)");
   s.exit().remove();
 }
 
@@ -739,18 +745,19 @@ function drawNodes(){
     .attr("width",d=>d.isGroup?126:NW).attr("height",d=>d.isGroup?68:NH)
     .attr("x",d=>d.isGroup?-63:-NW/2).attr("y",d=>d.isGroup?-34:-NH/2)
     .attr("rx",d=>d.isGroup?63:9).attr("ry",d=>d.isGroup?34:9)
-    .attr("fill",d=>d.color)
+    .attr("fill",d=>d.isRoot?d.color+"99":d.color)
     .attr("stroke",d=>{
+      if(d.isRoot)      return "#ffffff";
       if(d.isDuplicate) return "#4fc3f7";
       if(forceSub===d.id&&forceOn) return "#f5c518";
-      if(d.isPinned) return "#e94560";
+      if(d.isPinned)    return "#e94560";
       return d.color;
     })
-    .attr("stroke-width",d=>d.isDuplicate?2.5:forceSub===d.id&&forceOn?3:d.isPinned?2.5:1.5)
-    .attr("stroke-dasharray",d=>d.isDuplicate?"6,3":d.isPinned?"6,3":null)
-    .attr("opacity",d=>d.isDuplicate?1:1);
+    .attr("stroke-width",d=>d.isRoot?2:d.isDuplicate?2.5:forceSub===d.id&&forceOn?3:d.isPinned?2.5:1.5)
+    .attr("stroke-dasharray",d=>d.isRoot?"4,4":d.isDuplicate?"6,3":d.isPinned?"6,3":null)
+    .attr("opacity",d=>d.isRoot?0.75:1);
   all.select("text.nt").attr("y",d=>d.isGroup?-16:-NH/2+13).attr("fill",d=>d.tcolor)
-    .text(d=>d.isGroup?"COMBINED":d.type+(d.shared?" ◈":"")+(d.isPinned?" 📌":"")+(d.isDuplicate?" ◈ DUP":""));
+    .text(d=>d.isGroup?"COMBINED":d.type+(d.isRoot?" ⬡":"")+(d.shared?" ◈":"")+(d.isPinned?" 📌":"")+(d.isDuplicate?" ◈":""));
   all.select("foreignObject.nf")
     .attr("x",d=>d.isGroup?-57:-NW/2+7).attr("y",d=>d.isGroup?-22:-NH/2+17)
     .attr("width",d=>d.isGroup?114:NW-14).attr("height",d=>d.isGroup?28:40)
@@ -762,13 +769,13 @@ function drawNodes(){
     const hc=(d.children||[]).length>0;
     const gb=d3.select(this).select("g.gb"); gb.selectAll("*").remove();
     if(hc){
-      // Gate badge at TOP of node — where child arrows arrive
+      // Gate badge at TOP — where child arrows feed in
       gb.append("rect").attr("x",-19).attr("y",-NH/2-18).attr("width",38).attr("height",15).attr("rx",4).attr("fill","#0d0d0d").attr("stroke",GC[d.gate]||"#aaa").attr("stroke-width",1.2);
       gb.append("text").attr("y",-NH/2-7).attr("text-anchor","middle").attr("fill",GC[d.gate]||"#aaa").attr("font-size",8).attr("font-weight",700).attr("font-family","JetBrains Mono,monospace").attr("letter-spacing",1).text(d.gate);
     }
     const cb=d3.select(this).select("g.cb"); cb.selectAll("*").remove();
     if(hc){
-      // Collapse button at bottom-right of node
+      // Collapse button at bottom-right
       const cx=d.isGroup?53:NW/2-10,cy=NH/2-10;
       cb.append("circle").attr("cx",cx).attr("cy",cy).attr("r",9).attr("fill","#1c1c1c").attr("stroke","#3a3a3a").attr("stroke-width",1.2).style("cursor","pointer").on("click",(e,dd)=>{e.stopPropagation();toggleCollapse(dd.id);});
       cb.append("text").attr("x",cx).attr("y",cy+5).attr("text-anchor","middle").attr("fill","#888").attr("font-size",12).attr("font-weight",700).attr("font-family","monospace").attr("pointer-events","none").text(collapsed.has(d.id)?"+":"−");
@@ -780,10 +787,9 @@ function drawNodes(){
 function tick(){
   lg.selectAll("path.lk").attr("d",d=>{
     if(!d.source||!d.target)return"";
-    // source = child (lower in tree), target = parent (higher in tree)
-    // Draw from child's top edge up to parent's bottom edge, arrowhead at parent
-    const sx=d.source.x||0,sy=(d.source.y||0)-NH/2-4;   // child top
-    const tx=d.target.x||0,ty=(d.target.y||0)+NH/2+4;   // parent bottom
+    // source=child (lower), target=parent (higher). Arrow tip at parent bottom.
+    const sx=d.source.x||0, sy=(d.source.y||0)-NH/2-4;  // child top edge
+    const tx=d.target.x||0, ty=(d.target.y||0)+NH/2+4;  // parent bottom edge
     const my=(sy+ty)/2;
     return `M${sx},${sy} C${sx},${my} ${tx},${my} ${tx},${ty}`;
   });
@@ -950,7 +956,7 @@ function selectNode(id){
   });
   lg.selectAll("path.lk").each(function(d){
     const on=d.source.id===id||d.target.id===id;
-    d3.select(this).attr("stroke",on?(d.shared?"#f5c518":"#4fc3f7"):"#1a1a1a").attr("stroke-width",on?2.8:1).attr("opacity",on?1:.07).attr("marker-start",on?"url(#masth)":"url(#mast)").attr("marker-end","none");
+    d3.select(this).attr("stroke",on?(d.shared?"#f5c518":"#4fc3f7"):"#1a1a1a").attr("stroke-width",on?2.8:1).attr("opacity",on?1:.07).attr("marker-start",on?"url(#mah)":"url(#ma)").attr("marker-end","none");
   });
   if(n.type==="SF"&&!forceOn) document.getElementById("bfrc").title="Click to release \\\'"+n.name+"\\' subtree to physics";
   showDP(id,n);
@@ -958,17 +964,16 @@ function selectNode(id){
 
 function clearHL(){
   selId=null;
-  ng.selectAll("g.nd").attr("opacity",1).select("rect.nb")
-    .attr("stroke",d=>{
-      if(d.isDuplicate) return "#4fc3f7";
-      if(forceSub===d.id&&forceOn) return "#f5c518";
-      if(d.isPinned) return "#e94560";
-      return d.color;
-    })
-    .attr("stroke-width",d=>d.isDuplicate?2.5:forceSub===d.id&&forceOn?3:d.isPinned?2.5:1.5)
-    .attr("stroke-dasharray",d=>d.isDuplicate?"6,3":d.isPinned?"6,3":null)
-    .attr("filter",null);
-  lg.selectAll("path.lk").attr("stroke",d=>d.shared?"#f5c51844":"#2d2d2d").attr("stroke-width",d=>d.shared?1.2:2).attr("opacity",d=>d.shared?.5:.92).attr("marker-start","url(#mast)").attr("marker-end","none");
+  ng.selectAll("g.nd").each(function(d){
+    const el=d3.select(this);
+    el.attr("opacity",d.isRoot?0.75:1);
+    el.select("rect.nb")
+      .attr("stroke",d.isRoot?"#ffffff":d.isDuplicate?"#4fc3f7":forceSub===d.id&&forceOn?"#f5c518":d.isPinned?"#e94560":d.color)
+      .attr("stroke-width",d.isRoot?2:d.isDuplicate?2.5:forceSub===d.id&&forceOn?3:d.isPinned?2.5:1.5)
+      .attr("stroke-dasharray",d.isRoot?"4,4":d.isDuplicate?"6,3":d.isPinned?"6,3":null)
+      .attr("filter",null);
+  });
+  lg.selectAll("path.lk").attr("stroke",d=>d.shared?"#f5c51844":"#2d2d2d").attr("stroke-width",d=>d.shared?1.2:2).attr("opacity",d=>d.shared?.5:.92).attr("marker-start","url(#ma)").attr("marker-end","none");
 }
 
 const GCM={OR:"#4fc3f7",AND:"#ffb74d"};
@@ -1345,14 +1350,12 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
 
             # ── Render search results ─────────────────────────────────
             def render_match_card(matches, match_type):
-                """Render a match card. match_type = 'id' or 'name'"""
                 for ex in matches:
                     ex_color  = LEVEL_COLORS.get(ex["type"], "#888")
                     ex_pids   = ex.get("parentIds") or []
                     ex_pnames = " · ".join(by_id[p]["name"] for p in ex_pids if p in by_id) or "—"
                     ex_val    = fmt(ex.get("calculatedValue"))
                     ex_nid    = ex.get("nodeId", ex["id"])
-                    # Find which hazard(s) this node belongs to
                     def find_hazards_of(node_id, depth=0):
                         if depth > 8: return []
                         n = by_id.get(node_id)
@@ -1361,24 +1364,19 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                         result = []
                         for pid in (n.get("parentIds") or []):
                             result.extend(find_hazards_of(pid, depth+1))
-                        return list(dict.fromkeys(result))  # dedupe
-                    ex_fts = find_hazards_of(ex["id"])
+                        return list(dict.fromkeys(result))
+                    ex_fts    = find_hazards_of(ex["id"])
                     ex_ft_str = " · ".join(ex_fts) if ex_fts else "—"
 
-                    is_id_match = match_type == "id"
-                    border_col  = "#4fc3f7"   # blue — same node, new parent
-                    bg_col      = "#080f1a"
-                    label       = "⚠ NODE ALREADY EXISTS"
-
                     st.markdown(f"""
-                    <div style="background:{bg_col};border:1.5px solid {border_col};
-                                border-radius:7px;padding:9px 12px;margin:3px 0 5px 0;">
-                      <div style="font-size:8px;color:{border_col};font-weight:700;
-                                  letter-spacing:1px;margin-bottom:4px;">{label}</div>
+                    <div style="background:#080f1a;border:1.5px solid #4fc3f7;
+                                border-radius:7px;padding:9px 12px;margin:3px 0 4px 0;">
+                      <div style="font-size:8px;color:#4fc3f7;font-weight:700;
+                                  letter-spacing:1px;margin-bottom:4px;">⚠ NODE ALREADY EXISTS</div>
                       <div style="display:flex;align-items:center;gap:8px;margin-bottom:3px;">
-                        <code style="background:#0a1a2e;color:{border_col};padding:1px 6px;
+                        <code style="background:#0a1a2e;color:#4fc3f7;padding:1px 6px;
                                border-radius:3px;font-size:10px;font-weight:700;">{ex_nid}</code>
-                        <span style="font-size:10px;color:{ex_color};font-weight:700;">{ex['name']}</span>
+                        <span style="font-size:10px;color:{ex_color};font-weight:700;">{esc(ex['name'])}</span>
                         <span style="font-size:9px;color:#555;">[{ex['type']} · {ex['gate']}]</span>
                       </div>
                       <div style="font-size:9px;color:#777;line-height:1.7;">
@@ -1388,15 +1386,14 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                         <b style="color:#555;">Current parents:</b> {ex_pnames}
                       </div>
                       <div style="font-size:9px;color:#4fc3f7;margin-top:5px;line-height:1.5;">
-                        ℹ This is the same failure — same node, new location.<br>
-                        Click below to place it under your selected parent(s) as well.<br>
-                        It will appear in <b style="color:#4fc3f7;">blue</b> in the tree (duplicate marker).
+                        ℹ Same failure — same node, new location.<br>
+                        Select parent(s) above, then click below to place it there too.<br>
+                        It will appear with a <b style="color:#4fc3f7;">blue ◈</b> border in the tree.
                       </div>
                     </div>""", unsafe_allow_html=True)
 
-                    # Single clear action
                     if st.button(f"◈ Place under selected parent(s)",
-                                 key=f"dup_here_{ex['id']}",
+                                 key=f"place_{ex['id']}",
                                  use_container_width=True,
                                  type="primary"):
                         cur_sel = sel_pids if sel_pids else []
@@ -1414,10 +1411,10 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                             st.session_state.tree_state["focus_id"] = ex["id"]
                             st.session_state.nodes_since_calc += 1
                             set_nodes(updated)
-                            st.success(f"✓ '{ex['name']}' now also lives under the new parent(s). Shown in blue in the tree.")
+                            st.success(f"✓ '{ex['name']}' now also appears under the new parent(s). Shown in blue in the tree.")
                             st.rerun()
 
-            # Show name matches first (informational), then ID matches
+            # Show name matches first, then ID matches
             if name_matches:
                 render_match_card(name_matches, "name")
             if id_matches:
@@ -1441,6 +1438,20 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                            for n in nodes if n["type"] in VALID_PARENT_TYPES}
             sel_labels  = st.multiselect("Parent Node(s)", list(parent_opts.keys()), key="add_par")
             sel_pids    = [parent_opts[l] for l in sel_labels]
+
+            if not sel_pids and cid_clean:
+                st.markdown("""
+                <div style="background:#0d1a0d;border:1.5px solid #4caf7d44;border-radius:6px;
+                            padding:6px 10px;margin:2px 0 4px 0;">
+                  <span style="font-size:9px;color:#4caf7d;font-weight:700;">ℹ ROOT NODE MODE</span>
+                  <div style="font-size:9px;color:#777;margin-top:2px;line-height:1.5;">
+                    No parent selected — node will be created as a <b style="color:#4caf7d;">root node</b>
+                    (no parent, floats independently).<br>
+                    Use this when a node like FF-32 exists in a second hazard without a parent chain above it.<br>
+                    You can connect it later via the <b>EDIT</b> tab or by using
+                    <b>◈ Place under selected parent(s)</b> when adding another node with the same ID.
+                  </div>
+                </div>""", unsafe_allow_html=True)
             node_type   = st.selectbox("Type", VALID_CHILD_TYPES, key="add_type",
                                        help="GROUP = Combined Faults oval (placed between FF and IF layers)")
             gate        = st.radio("Gate", ["OR","AND"], horizontal=True, key="add_gate")
@@ -1453,7 +1464,7 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                                                 key="add_fixed_val",
                                                 help="Node always carries this exact failure rate.")
 
-            # ── ADD NODE — always present, never blocked ──────────────
+            # ── ADD NODE ──────────────────────────────────────────────
             add_btn = st.button("✅ ADD NODE", use_container_width=True, type="primary",
                                 disabled=not cid_clean)
 
@@ -1462,8 +1473,6 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                     st.error("★ Node ID is required — please enter a reference ID (e.g. IF-196)")
                 elif not node_name.strip():
                     st.error("Enter a node name")
-                elif not sel_pids:
-                    st.error("Select at least one parent")
                 else:
                     fv = None
                     if use_fixed and fixed_val_input:
@@ -1513,6 +1522,11 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                             "⚠ Shared children will keep their other parents.</div>",
                             unsafe_allow_html=True)
                     if st.button("🗑 DELETE NODE", use_container_width=True):
+                        # Track which nodes were already root nodes BEFORE deletion
+                        pre_existing_roots = {
+                            n["id"] for n in nodes
+                            if n["type"] != "HAZARD" and not n.get("parentIds")
+                        }
                         temp_nodes = [dict(n) for n in nodes if n["id"] != del_id]
                         for n in temp_nodes:
                             if del_id in (n.get("parentIds") or []):
@@ -1520,8 +1534,12 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                         changed = True
                         while changed:
                             changed = False
-                            orphan_ids = {n["id"] for n in temp_nodes
-                                          if n["type"] != "HAZARD" and not n.get("parentIds")}
+                            orphan_ids = {
+                                n["id"] for n in temp_nodes
+                                if n["type"] != "HAZARD"
+                                and not n.get("parentIds")
+                                and n["id"] not in pre_existing_roots  # keep intentional roots
+                            }
                             if orphan_ids:
                                 temp_nodes = [n for n in temp_nodes if n["id"] not in orphan_ids]
                                 for n in temp_nodes:
