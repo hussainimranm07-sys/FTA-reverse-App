@@ -1826,10 +1826,9 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                 # ── Detect node switch — clear stale widget state ──────
                 prev_eid = st.session_state.get("_edit_prev_eid")
                 if prev_eid != eid:
-                    # Node changed — purge old widget values so fields
-                    # show the newly selected node's data, not the old one
-                    for k in ["en_name","en_nid_prefix","en_nid_num","en_ft","en_gate","en_type","en_par",
-                               "en_tgt","en_use_fix","en_fv"]:
+                    for k in ["en_name","en_nid_prefix","en_nid_num","en_ft","en_gate",
+                               "en_type","en_par","en_tgt","en_use_fix","en_fv",
+                               "en_name_input","en_gate_radio"]:
                         st.session_state.pop(k, None)
                     st.session_state["_edit_prev_eid"] = eid
 
@@ -1847,14 +1846,15 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                       <div style="font-weight:700;color:{color};font-size:13px;">{esc(en['name'])}</div>
                       <div style="display:flex;align-items:center;gap:10px;margin-top:3px;">
                         <div style="font-size:9px;color:#666;">
-                          {en['type']} · {en['gate']} · {en.get('nodeId', en['id'])}
+                          {esc(en['type'])} · {esc(en['gate'])} · {esc(en.get('nodeId', en['id']))}
                           {'&nbsp;<span style="background:#f5c518;color:#111;font-size:7px;padding:1px 4px;border-radius:3px;font-weight:700;">SHARED</span>' if is_shared else ''}
+                          {'&nbsp;<span style="background:#ffffff22;color:#fff;font-size:7px;padding:1px 4px;border-radius:3px;font-weight:700;">⬡ ROOT</span>' if not (en.get("parentIds") or []) and en["type"] != "HAZARD" else ''}
                         </div>
                         <div style="font-size:11px;color:{color};font-family:monospace;font-weight:700;margin-left:auto;">
                           {fmt(en.get('calculatedValue'))}{'📌' if en.get('fixedValue') is not None else ''}
                         </div>
                       </div>
-                      <div style="font-size:9px;color:#555;margin-top:2px;">Parents: {ex_pnames}</div>
+                      <div style="font-size:9px;color:#555;margin-top:2px;">Parents: {esc(ex_pnames)}</div>
                     </div>""", unsafe_allow_html=True)
 
                     # ── Edit fields ───────────────────────────────────────
@@ -1904,7 +1904,9 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                                         (n["type"] in VALID_CHILD_TYPES and not n.get("parentIds")))
                                     and n["id"] != eid}
                         cur_pl   = [lbl for lbl, pid in avail_p.items()
-                                    if pid in (en.get("parentIds") or [])]
+                                    if pid in (en.get("parentIds") or []) and lbl in avail_p]
+                        # Safety: ensure default values are subset of options
+                        cur_pl   = [l for l in cur_pl if l in avail_p]
                         new_pl   = st.multiselect("Parents", list(avail_p.keys()),
                                                    default=cur_pl, key="en_par",
                                                    help="Add/remove parents — links this node as shared.")
@@ -1935,6 +1937,21 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                             unsafe_allow_html=True)
 
                     # ── Buttons ──────────────────────────────────────────
+                    # Show what APPLY will do to parents
+                    old_pids = list(en.get("parentIds") or [])
+                    added   = [p for p in new_pids if p not in old_pids]
+                    removed = [p for p in old_pids if p not in new_pids]
+                    if added or removed:
+                        add_names = " · ".join(by_id[p]["name"] for p in added   if p in by_id)
+                        rem_names = " · ".join(by_id[p]["name"] for p in removed if p in by_id)
+                        diff_html = ""
+                        if added:   diff_html += f'<span style="color:#4caf7d;">+ {esc(add_names)}</span> '
+                        if removed: diff_html += f'<span style="color:#e94560;">− {esc(rem_names)}</span>'
+                        st.markdown(
+                            f"<div style='font-size:9px;background:#111;border-radius:5px;"
+                            f"padding:4px 8px;margin-bottom:4px;'>Parent change: {diff_html}</div>",
+                            unsafe_allow_html=True)
+
                     c1, c2 = st.columns(2)
                     with c1:
                         if st.button("💾 APPLY", use_container_width=True, type="primary"):
@@ -1954,7 +1971,9 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                                     n["fixedValue"] = new_fv
                                     if n["type"] != "HAZARD":
                                         n["type"]      = new_type
-                                        n["parentIds"] = new_pids if new_pids else n.get("parentIds", [])
+                                        # Always write exactly what the user selected
+                                        # Empty list = intentional root node (no parent)
+                                        n["parentIds"] = new_pids
                                     else:
                                         if new_tgt:
                                             try:
@@ -1967,7 +1986,7 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                             # Clear stale widget state and force tree rebuild
                             for k in ["en_name","en_nid_prefix","en_nid_num","en_ft","en_gate",
                                       "en_type","en_par","en_tgt","en_use_fix","en_fv",
-                                      "_edit_prev_eid"]:
+                                      "_edit_prev_eid","en_name_input","en_gate_radio"]:
                                 st.session_state.pop(k, None)
 
                             st.session_state.nodes_hash       = ""   # force tree redraw
@@ -1979,17 +1998,24 @@ GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
                     with c2:
                         if en["type"] != "HAZARD":
                             if st.button("🗑 DELETE", use_container_width=True):
+                                pre_existing_roots = {
+                                    n["id"] for n in nodes
+                                    if n["type"] != "HAZARD" and not n.get("parentIds")
+                                }
                                 temp_nodes = [dict(n) for n in nodes if n["id"] != eid]
                                 for n in temp_nodes:
                                     if eid in (n.get("parentIds") or []):
                                         n["parentIds"] = [p for p in n["parentIds"] if p != eid]
-                                # Cascade delete orphans
+                                # Cascade delete only newly-orphaned nodes, not intentional roots
                                 changed = True
                                 while changed:
                                     changed = False
-                                    orphan_ids = {n["id"] for n in temp_nodes
-                                                  if n["type"] != "HAZARD"
-                                                  and not n.get("parentIds")}
+                                    orphan_ids = {
+                                        n["id"] for n in temp_nodes
+                                        if n["type"] != "HAZARD"
+                                        and not n.get("parentIds")
+                                        and n["id"] not in pre_existing_roots
+                                    }
                                     if orphan_ids:
                                         temp_nodes = [n for n in temp_nodes if n["id"] not in orphan_ids]
                                         for n in temp_nodes:
@@ -2604,7 +2630,7 @@ with tab_hier:
                         {'border:1px solid #e9456033;' if is_pinned else ''}">
               <div style="flex:1;min-width:0;">
                 <span style="color:#444;font-size:9px;">{'└─ ' if depth>0 else ''}</span>
-                <span style="font-weight:{'700' if depth==0 else '500'};color:#ddd;font-size:11px;">{node['name']}</span>
+                <span style="font-weight:{'700' if depth==0 else '500'};color:#ddd;font-size:11px;">{esc(node['name'])}</span>
                 <span style="font-size:8px;color:#555;margin-left:5px;">{node['type']}</span>
                 {nid_tag}{ft_tag}{gate_tag}{shared_tag}{pin_tag}{ref_tag}
               </div>
@@ -2664,20 +2690,20 @@ with tab_vals:
                             border-radius:6px;padding:7px 12px;margin-bottom:3px;">
                   <div style="display:grid;grid-template-columns:1.8fr 0.7fr 0.7fr 0.7fr 1.2fr 2fr;gap:8px;align-items:start;">
                     <div>
-                      <div style="font-weight:700;font-size:11px;color:#ddd;margin-bottom:2px;">{node['name']}</div>
+                      <div style="font-weight:700;font-size:11px;color:#ddd;margin-bottom:2px;">{esc(node['name'])}</div>
                       <div style="font-size:8px;">{badges}</div>
                     </div>
                     <div>
                       <div style="font-size:7px;color:#444;letter-spacing:1px;margin-bottom:1px;">NODE ID</div>
-                      <div style="font-size:10px;color:{color};font-weight:700;font-family:monospace;">{node_id}</div>
+                      <div style="font-size:10px;color:{color};font-weight:700;font-family:monospace;">{esc(node_id)}</div>
                     </div>
                     <div>
                       <div style="font-size:7px;color:#444;letter-spacing:1px;margin-bottom:1px;">TYPE</div>
-                      <div style="font-size:10px;color:{color};font-weight:700;">{node['type']}</div>
+                      <div style="font-size:10px;color:{color};font-weight:700;">{esc(node['type'])}</div>
                     </div>
                     <div>
                       <div style="font-size:7px;color:#444;letter-spacing:1px;margin-bottom:1px;">GATE</div>
-                      <div style="font-size:10px;color:{gc};font-weight:700;">{node['gate']}</div>
+                      <div style="font-size:10px;color:{gc};font-weight:700;">{esc(node['gate'])}</div>
                     </div>
                     <div>
                       <div style="font-size:7px;color:#444;letter-spacing:1px;margin-bottom:1px;">CALC VALUE</div>
@@ -2803,7 +2829,7 @@ with tab_search:
                                 padding:5px 10px;margin-bottom:3px;
                                 display:grid;grid-template-columns:2.5fr 0.7fr 0.7fr 1.5fr 2fr;gap:8px;align-items:center;">
                       <div style="font-size:10px;color:#ddd;font-weight:{'700' if node['type']=='HAZARD' else '400'};">
-                        {node['name']}{'<span style="background:#f5c518;color:#111;font-size:7px;padding:0 3px;border-radius:3px;margin-left:5px;">SHR</span>' if is_shared else ''}
+                        {esc(node['name'])}{'<span style="background:#f5c518;color:#111;font-size:7px;padding:0 3px;border-radius:3px;margin-left:5px;">SHR</span>' if is_shared else ''}
                       </div>
                       <div style="font-size:9px;color:{color};">{node['type']}</div>
                       <div style="font-size:9px;color:{gc};">{node['gate']}</div>
