@@ -43,7 +43,7 @@ def load_gist_file(token, gid, fname):
         raw = json.loads(g.get("files",{}).get(fname,{}).get("content","[]"))
     except:
         return []
-    # Normalise nodes — ensure all expected fields exist for forward-compatibility
+    # Normalise nodes
     for n in raw:
         n.setdefault("nodeId",    n.get("id",""))
         n.setdefault("ftLabel",   "")
@@ -53,6 +53,7 @@ def load_gist_file(token, gid, fname):
         n.setdefault("parentIds", [])
         n.setdefault("gate", "OR")
         n.setdefault("type", "IF")
+        n.setdefault("_pos", None)
     return raw
 
 def save_gist_file(token, gid, fname, data):
@@ -61,6 +62,21 @@ def save_gist_file(token, gid, fname, data):
                            json={"files":{fname:{"content":json.dumps(data,indent=2)}}}, timeout=10)
         return r.status_code == 200
     except: return False
+
+def inject_positions(nodes, positions):
+    """Write saved canvas positions into node data so they survive reload."""
+    if not positions: return nodes
+    updated = []
+    for n in nodes:
+        n = dict(n)
+        if n["id"] in positions:
+            n["_pos"] = positions[n["id"]]
+        updated.append(n)
+    return updated
+
+def extract_positions(nodes):
+    """Pull _pos fields out of node data into a positions dict."""
+    return {n["id"]: n["_pos"] for n in nodes if n.get("_pos")}
 
 def del_gist_file(token, gid, fname):
     try:
@@ -497,8 +513,13 @@ def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
     duplicate_ids = {iid for group in nid_groups.values() if len(group) > 1 for iid in group}
 
     ts        = tree_state or {}
-    init_pos  = ts.get("positions", {})
+    init_pos  = dict(ts.get("positions", {}))
     focus_id  = ts.get("focus_id")
+
+    # Merge persisted _pos from node data (survives page refresh / file reload)
+    for n in show_nodes:
+        if n.get("_pos") and n["id"] not in init_pos:
+            init_pos[n["id"]] = n["_pos"]
 
     LEVEL_ROW   = {"HAZARD": 0, "SF": 1, "FF": 2, "GROUP": 2.5, "IF": 3}
     LEVEL_COLOR = {0: "#ff4d4d", 1: "#ff8c42", 2: "#f5c518", 2.5: "#7e57c2", 3: "#4caf7d"}
@@ -839,19 +860,12 @@ function tick(){
   ng.selectAll("g.nd").attr("transform",d=>`translate(${d.x||0},${d.y||0})`);
 }
 function computeRTLayout(reset){
-  // Reingold-Tilford tree layout.
-  // Key rules:
-  // 1. Every leaf gets exactly SLOT px of horizontal space
-  // 2. Every parent is centered over the span of its children
-  // 3. Total canvas width = totalLeaves * SLOT (grows beyond viewport — use Fit to see all)
-  // 4. Shared nodes: x = average of all parent positions (already placed)
-  // 5. Manual drag overrides are respected until ⊞ Reset Layout is pressed
-
   const vis    = getVis();
   const visSet = new Set(vis.map(n=>n.id));
-  const SLOT   = NW + HG;   // px per leaf slot
+  const cw     = wrap.getBoundingClientRect();
+  const VW     = (cw.width||1200);
 
-  // ── 1. Build child map from visible nodes ──────────────────────────
+  // ── 1. Build child map ─────────────────────────────────────────────
   const childMap = {};
   vis.forEach(n=>{ childMap[n.id] = []; });
   vis.forEach(n=>{
@@ -860,7 +874,7 @@ function computeRTLayout(reset){
     });
   });
 
-  // ── 2. Count leaves in each subtree ────────────────────────────────
+  // ── 2. Count leaves ────────────────────────────────────────────────
   const lc = {};
   function cLeaves(id){
     if(lc[id] !== undefined) return lc[id];
@@ -870,40 +884,31 @@ function computeRTLayout(reset){
   }
   vis.forEach(n=>cLeaves(n.id));
 
-  // ── 3. Assign x positions ──────────────────────────────────────────
-  // posMap[id] = center x of node
-  const posMap = {};
-  const MARGIN = 80;
+  // ── 3. Compute adaptive slot width ────────────────────────────────
+  const roots = vis.filter(n=>(n.parents||[]).every(p=>!visSet.has(p)));
+  const totalLeaves = roots.reduce((s,r)=>s+cLeaves(r.id), 0) || 1;
+  const MARGIN = 60;
+  // Fit within viewport when possible; never smaller than NW+8 (no overlap)
+  const MIN_SLOT = NW + 8;
+  const idealSlot = Math.floor((VW - MARGIN*2) / totalLeaves);
+  const SLOT = Math.max(MIN_SLOT, Math.min(idealSlot, NW + HG));
+  const totalWidth = Math.max(totalLeaves * SLOT + MARGIN*2, VW);
 
+  // ── 4. Assign x positions ─────────────────────────────────────────
+  const posMap = {};
   function assignX(id, left, width){
     const ch = childMap[id]||[];
-    if(!ch.length){
-      // Leaf: center in its exact slot
-      posMap[id] = left + width/2;
-      return;
-    }
-    // Distribute slice evenly proportional to each child's leaf count
+    if(!ch.length){ posMap[id] = left + width/2; return; }
     const tot = lc[id] || 1;
     let cur = left;
     ch.forEach(cid=>{
-      // Each child's slice = (its leaves / parent total leaves) * parent width
-      // Minimum = exactly SLOT so nodes never overlap
       const childW = Math.max(SLOT, (lc[cid]/tot) * width);
       assignX(cid, cur, childW);
       cur += childW;
     });
-    // Parent x = midpoint between leftmost and rightmost child
     const xs = ch.map(c=>posMap[c]);
     posMap[id] = (Math.min(...xs) + Math.max(...xs)) / 2;
   }
-
-  // Find roots (nodes with no visible parent)
-  const roots = vis.filter(n=>(n.parents||[]).every(p=>!visSet.has(p)));
-
-  // Total canvas width driven by leaf count — not by screen width
-  // This means the tree can be wider than the screen; user zooms/pans to navigate
-  const totalLeaves = roots.reduce((s,r)=>s+cLeaves(r.id), 0) || 1;
-  const totalWidth  = Math.max(totalLeaves * SLOT + MARGIN*2, 1200);
 
   let cur = MARGIN;
   roots.forEach(r=>{
@@ -1173,7 +1178,8 @@ DEFS = {"nodes":[],"save_status":"idle","save_msg":"","gist_loaded":False,
         "nodes_since_calc": 0,
         "pending_node_names": [],
         "nodes_hash": "",
-        "multisel_ids": [],        # list of internal ids currently multi-selected
+        "multisel_ids": [],
+        "_pending_positions": {},
         "tree_state": {
             "scale": 1.0, "tx": 0, "ty": 0,
             "collapsed": [],
@@ -1198,12 +1204,22 @@ if configured and not st.session_state.gist_loaded:
         st.session_state.file_list = list_gist_files(GITHUB_TOKEN, GIST_ID)
         af = st.session_state.active_file
         if af in st.session_state.file_list:
-            st.session_state.nodes = load_gist_file(GITHUB_TOKEN, GIST_ID, af)
+            _loaded = load_gist_file(GITHUB_TOKEN, GIST_ID, af)
         elif st.session_state.file_list:
             named = [f for f in st.session_state.file_list if is_named(f)]
             if named:
                 st.session_state.active_file = named[0]
-                st.session_state.nodes = load_gist_file(GITHUB_TOKEN, GIST_ID, named[0])
+                _loaded = load_gist_file(GITHUB_TOKEN, GIST_ID, named[0])
+            else:
+                _loaded = []
+        else:
+            _loaded = []
+        st.session_state.nodes = _loaded
+        # Restore saved positions from node _pos fields
+        _restored_pos = extract_positions(_loaded)
+        if _restored_pos:
+            st.session_state["_pending_positions"] = _restored_pos
+            st.session_state.tree_state["positions"] = _restored_pos
         st.session_state.gist_loaded = True
         st.session_state.save_status = "loaded"
         st.session_state.save_msg = f"Loaded '{st.session_state.active_file}'"
@@ -1223,13 +1239,17 @@ def save_current(nodes=None, filename=None, status_label=None):
     return False
 
 def set_nodes(n, recalc=False):
-    """Save nodes. By default does NOT recalculate — call with recalc=True or
-    use CALCULATE button. This prevents unwanted tree thrashing while building."""
+    """Save nodes. Injects any pending canvas positions into _pos fields so
+    layout survives page refresh. Call with recalc=True to run calculation."""
     if recalc:
         n = recalculate(n)
         st.session_state.nodes_since_calc = 0
         st.session_state.pending_node_names = []
         st.session_state.nodes_hash = ""
+    # Inject latest canvas positions into node data
+    pending_pos = st.session_state.get("_pending_positions", {})
+    if pending_pos:
+        n = inject_positions(n, pending_pos)
     st.session_state.nodes = n
     save_current(n)
 
@@ -2430,6 +2450,10 @@ with a1:
                  help="Run top-down reverse distribution across the full tree"):
         if nodes:
             new_nodes = recalculate(nodes)
+            # Preserve layout positions through recalc
+            pending_pos = st.session_state.get("_pending_positions", {})
+            if pending_pos:
+                new_nodes = inject_positions(new_nodes, pending_pos)
             snap = f"snapshot_{now_str()}.json"
             save_current(new_nodes, filename=snap, status_label=f"Calculated + snap: {snap}")
             save_current(new_nodes)
@@ -2560,9 +2584,6 @@ with tab_tree:
             st.session_state.tree_state["focus_id"] = None
 
         # ── Message receiver (position + multi-select) ────────────────
-        # Multi-select: tree iframe sends selection via postMessage.
-        # We catch it with a JS bridge and store IDs in the URL hash,
-        # then read via st.query_params on next interaction.
         components.html("""
         <script>
         window.addEventListener("message", function(e){
@@ -2570,10 +2591,21 @@ with tab_tree:
                 const d = typeof e.data === "string" ? JSON.parse(e.data) : e.data;
                 if(d && d.type === "fta_pos"){
                     sessionStorage.setItem("fta_positions", JSON.stringify(d.data));
+                    // Also write compact form to URL so Python can read on next rerun
+                    try{
+                        const url = new URL(window.parent.location.href);
+                        // Encode positions as compact CSV: id:x:y,id:x:y,...
+                        const posStr = Object.entries(d.data)
+                            .filter(([,p])=>p.manual)  // only user-moved nodes
+                            .map(([id,p])=>id+':'+p.x+':'+p.y)
+                            .join(',');
+                        if(posStr){ url.searchParams.set("fpos", posStr); }
+                        else      { url.searchParams.delete("fpos"); }
+                        window.parent.history.replaceState(null,"",url.toString());
+                    }catch(ex){}
                 }
                 if(d && d.type === "fta_multisel"){
                     const ids = d.data.map(n=>n.id).join(",");
-                    // Write to parent URL query param so Streamlit picks it up
                     try{
                         const url = new URL(window.parent.location.href);
                         if(ids){ url.searchParams.set("msel", ids); }
@@ -2586,7 +2618,23 @@ with tab_tree:
         </script>
         """, height=0)
 
-        # Read multi-select from query params (set by JS bridge above)
+        # Read positions from query params and store in session_state
+        try:
+            _qp_pos = st.query_params.get("fpos","")
+            if _qp_pos:
+                _pending = {}
+                for _entry in _qp_pos.split(","):
+                    _parts = _entry.split(":")
+                    if len(_parts) == 3:
+                        _nid, _x, _y = _parts
+                        try: _pending[_nid] = {"x": float(_x), "y": float(_y), "manual": True}
+                        except: pass
+                if _pending:
+                    st.session_state["_pending_positions"] = _pending
+        except Exception:
+            pass
+
+        # Read multi-select from query params
         try:
             _qp_msel = st.query_params.get("msel","")
             if _qp_msel:
