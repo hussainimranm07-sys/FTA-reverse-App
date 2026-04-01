@@ -11,17 +11,352 @@ st.set_page_config(page_title="FTA Reverse Engineer", page_icon="⚠️",
                    layout="wide", initial_sidebar_state="expanded")
 
 # ── Constants ─────────────────────────────────────────────────────────────
-# GROUP = "Combined Faults" oval — an intermediate AND/OR gate node.
-# It has no independent failure meaning; it just groups children under a
-# specific gate before feeding into its parent via the parent's gate.
-# Visually rendered as an oval (like in standard FTA diagrams).
 LEVEL_ORDER        = ["HAZARD", "SF", "FF", "IF", "GROUP"]
 LEVEL_COLORS       = {"HAZARD":"#ff4d4d","SF":"#ff8c42","FF":"#f5c518","IF":"#4caf7d","GROUP":"#7e57c2"}
 LEVEL_TEXT         = {"HAZARD":"#fff","SF":"#fff","FF":"#111","IF":"#fff","GROUP":"#fff"}
 VALID_PARENT_TYPES = ["HAZARD","SF","FF","GROUP"]
 VALID_CHILD_TYPES  = ["SF","FF","IF","GROUP"]
-# For display ordering (GROUP shown between FF and IF)
 DISPLAY_ORDER      = ["HAZARD","SF","FF","IF","GROUP"]
+
+# ── PFTA Forward Verification Engine ─────────────────────────────────────
+def pfta_verify(nodes):
+    """
+    Use PFTA's FaultTree as a forward verification engine.
+
+    Takes the current node list (with calculatedValues assigned by
+    the inverse solver / recalculate()), builds a PFTA fault tree
+    text from the bottom-up, runs PFTA's exact forward solver, and
+    returns a dict of:
+        {
+          "top_gate_results": { gate_id: pfta_probability },
+          "divergence":       { hazard_name: { "target": T, "pfta": P, "delta_pct": D } },
+          "warnings":         [ list of warning strings ],
+          "pfta_text":        the generated fault tree text (for debugging),
+          "success":          bool
+        }
+
+    PFTA uses Boolean algebra / inclusion-exclusion for exact probability
+    calculation — correctly handles shared events in mixed AND/OR trees.
+    This catches approximation errors in the top-down budget distribution.
+    """
+    try:
+        from pfta.core import FaultTree
+    except ImportError:
+        return {
+            "success": False,
+            "warnings": ["PFTA not installed. Run: pip install pfta"],
+            "top_gate_results": {},
+            "divergence": {},
+            "pfta_text": ""
+        }
+
+    if not nodes:
+        return {"success": False, "warnings": ["No nodes to verify."],
+                "top_gate_results": {}, "divergence": {}, "pfta_text": ""}
+
+    by_id    = {n["id"]: n for n in nodes}
+    warnings = []
+
+    # ── Step 1: Identify structure ────────────────────────────────────────
+    # Children map: parent_id → list of child nodes
+    children_of = {n["id"]: [] for n in nodes}
+    for n in nodes:
+        for pid in (n.get("parentIds") or []):
+            if pid in children_of:
+                children_of[pid].append(n["id"])
+
+    # Identify top gates (HAZARDs) and intermediate gates (SF, FF, GROUP)
+    gate_ids  = {n["id"] for n in nodes if n["type"] in ("HAZARD","SF","FF","GROUP")}
+    event_ids = {n["id"] for n in nodes if n["type"] == "IF"}
+
+    # Nodes with no children and not IF type — treat as leaf events too
+    for n in nodes:
+        if n["type"] not in ("IF",) and not children_of.get(n["id"]):
+            event_ids.add(n["id"])
+            gate_ids.discard(n["id"])
+
+    # ── Step 2: Build PFTA text ───────────────────────────────────────────
+    lines = ["- times: nan", ""]
+
+    # Emit Events (leaf nodes — IF nodes and childless non-IF nodes)
+    # Use nodeId as the PFTA identifier (strip hyphens for PFTA compatibility)
+    def pfta_id(node):
+        """Generate a safe PFTA identifier from node id."""
+        raw = node.get("nodeId") or node["id"]
+        return re.sub(r'[^A-Za-z0-9_]', '_', raw) + "_" + node["id"][:5]
+
+    emitted_events = {}  # internal_id → pfta_id
+    # Track shared nodeIds so PFTA sees them as the SAME event
+    nodeid_to_pfta = {}  # nodeId → pfta_id (first occurrence wins)
+
+    for n in nodes:
+        if n["id"] not in event_ids:
+            continue
+        nid_key = (n.get("nodeId") or "").strip()
+        if nid_key and nid_key in nodeid_to_pfta:
+            # Shared event — reuse the same PFTA event id
+            emitted_events[n["id"]] = nodeid_to_pfta[nid_key]
+            continue
+
+        pid = pfta_id(n)
+        emitted_events[n["id"]] = pid
+        if nid_key:
+            nodeid_to_pfta[nid_key] = pid
+
+        prob = n.get("calculatedValue")
+        if prob is None or math.isnan(prob) or math.isinf(prob):
+            prob = 0.0
+        prob = max(0.0, min(1.0, float(prob)))
+
+        lines.append(f"Event: {pid}")
+        label = (n.get("name") or pid).replace("\n"," ")[:60]
+        lines.append(f"- label: {label}")
+        lines.append("- model_type: Fixed")
+        lines.append(f"- probability: {prob:.6e}")
+        lines.append("- intensity: 0")
+        lines.append("")
+
+    # Emit Gates (topological order — children before parents)
+    emitted_gates = {}
+
+    def topo_gates():
+        """Yield gate node ids in bottom-up topological order."""
+        visited = set()
+        def visit(nid):
+            if nid in visited: return
+            visited.add(nid)
+            for cid in children_of.get(nid, []):
+                if cid in gate_ids:
+                    visit(cid)
+            if nid in gate_ids:
+                yield nid
+        for n in nodes:
+            if n["type"] == "HAZARD":
+                yield from visit(n["id"])
+
+    for gid in topo_gates():
+        n   = by_id[gid]
+        pid = pfta_id(n)
+        emitted_gates[gid] = pid
+
+        gate_type = "OR" if n.get("gate","OR") == "OR" else "AND"
+        child_ids = children_of.get(gid, [])
+        if not child_ids:
+            # Childless gate — emit as a zero-probability event
+            lines.append(f"Event: {pid}")
+            lines.append(f"- label: {(n.get('name','')[:60])}")
+            lines.append("- model_type: Fixed")
+            lines.append("- probability: 0")
+            lines.append("- intensity: 0")
+            lines.append("")
+            continue
+
+        # Resolve child PFTA ids
+        child_pfta_ids = []
+        seen_pfta = set()
+        for cid in child_ids:
+            cpid = emitted_events.get(cid) or emitted_gates.get(cid)
+            if cpid and cpid not in seen_pfta:
+                child_pfta_ids.append(cpid)
+                seen_pfta.add(cpid)
+
+        if not child_pfta_ids:
+            warnings.append(f"Gate {n.get('name',gid)} has no resolvable children — skipped.")
+            continue
+
+        lines.append(f"Gate: {pid}")
+        lines.append(f"- label: {(n.get('name','')[:60])}")
+        lines.append(f"- type: {gate_type}")
+        lines.append(f"- inputs: {', '.join(child_pfta_ids)}")
+        lines.append("")
+
+    pfta_text = "\n".join(lines)
+
+    # ── Step 3: Run PFTA forward solver ──────────────────────────────────
+    try:
+        ft = FaultTree(pfta_text)
+    except Exception as e:
+        warnings.append(f"PFTA parse error: {e}")
+        return {"success": False, "warnings": warnings,
+                "top_gate_results": {}, "divergence": {}, "pfta_text": pfta_text}
+
+    # ── Step 4: Collect top-gate results and compare to targets ──────────
+    top_gate_results = {}
+    divergence       = {}
+
+    pfta_gate_map = {emitted_gates[gid]: gid for gid in emitted_gates}
+
+    for gate in ft.gates:
+        if not gate.is_top_gate:
+            continue
+        pfta_prob = gate.computed_probabilities[0] if gate.computed_probabilities else 0.0
+        top_gate_results[gate.id_] = pfta_prob
+
+        orig_id = pfta_gate_map.get(gate.id_)
+        if orig_id:
+            orig_node = by_id.get(orig_id)
+            if orig_node:
+                target = orig_node.get("targetValue")
+                calc   = orig_node.get("calculatedValue")
+                name   = orig_node.get("name","?")
+                if target and target > 0:
+                    delta_pct = abs(pfta_prob - target) / target * 100
+                    divergence[name] = {
+                        "target":    target,
+                        "inverse_calc": calc,
+                        "pfta":      pfta_prob,
+                        "delta_pct": delta_pct,
+                        "ok":        delta_pct < 5.0  # within 5% = acceptable
+                    }
+
+    return {
+        "success":          True,
+        "top_gate_results": top_gate_results,
+        "divergence":       divergence,
+        "warnings":         warnings,
+        "pfta_text":        pfta_text,
+    }
+
+
+def render_pfta_verification(nodes):
+    """
+    Streamlit UI component for the PFTA Verification panel.
+    Shows a 'Verify with PFTA' button, runs pfta_verify(), and
+    displays results inline: pass/fail per hazard, divergence %, warnings.
+    """
+    st.markdown("""
+    <div style="background:#0a0f1a;border:1.5px solid #4fc3f744;border-radius:8px;
+                padding:10px 14px;margin-bottom:8px;">
+      <div style="font-size:9px;color:#4fc3f7;font-weight:700;letter-spacing:2px;margin-bottom:4px;">
+        PFTA FORWARD VERIFICATION
+      </div>
+      <div style="font-size:9px;color:#666;line-height:1.6;">
+        Runs PFTA's exact Boolean algebra solver on your current assigned values
+        and compares the forward-computed top-event probabilities against your
+        hazard targets. Catches approximation errors in the inverse distribution.
+      </div>
+    </div>""", unsafe_allow_html=True)
+
+    hazards = [n for n in nodes if n["type"] == "HAZARD"]
+    if not hazards:
+        st.markdown("<div style='color:#555;font-size:11px;'>No HAZARD nodes — nothing to verify.</div>",
+                    unsafe_allow_html=True)
+        return
+
+    # Check all HAZARDs have assigned calculatedValues
+    unresolved = [n for n in nodes if n.get("calculatedValue") is None]
+    if unresolved:
+        st.markdown(
+            f"<div style='font-size:9px;color:#f5c518;background:#1a1200;"
+            f"border:1px solid #f5c51844;border-radius:5px;padding:6px 10px;'>"
+            f"⚠ {len(unresolved)} node(s) have no calculated value. "
+            f"Run CALCULATE first before verifying.</div>",
+            unsafe_allow_html=True)
+
+    col_btn, col_info = st.columns([2, 3])
+    with col_btn:
+        run_verify = st.button("🔬 Verify with PFTA",
+                               use_container_width=True,
+                               key="pfta_verify_btn",
+                               help="Run PFTA's exact forward solver and compare against your hazard targets")
+    with col_info:
+        st.markdown(
+            "<div style='font-size:9px;color:#555;padding-top:6px;line-height:1.5;'>"
+            "Uses Boolean algebra — exact result even for shared events in mixed AND/OR trees.</div>",
+            unsafe_allow_html=True)
+
+    if run_verify:
+        with st.spinner("Running PFTA forward solver..."):
+            result = pfta_verify(nodes)
+
+        if not result["success"]:
+            st.error("PFTA verification failed")
+            for w in result["warnings"]:
+                st.markdown(f"<div style='font-size:10px;color:#ff4d4d;'>{esc(w)}</div>",
+                            unsafe_allow_html=True)
+            return
+
+        # ── Warnings ────────────────────────────────────────────────────
+        if result["warnings"]:
+            for w in result["warnings"]:
+                st.markdown(
+                    f"<div style='font-size:9px;color:#f5c518;background:#1a1200;"
+                    f"border:1px solid #f5c51844;border-radius:4px;padding:4px 8px;margin:2px 0;'>"
+                    f"⚠ {esc(w)}</div>", unsafe_allow_html=True)
+
+        # ── Divergence table ─────────────────────────────────────────────
+        div = result["divergence"]
+        if div:
+            all_ok = all(v["ok"] for v in div.values())
+            summary_color = "#4caf7d" if all_ok else "#ff4d4d"
+            summary_icon  = "✓ ALL WITHIN TOLERANCE" if all_ok else "✗ DIVERGENCE DETECTED"
+            st.markdown(
+                f"<div style='font-size:10px;color:{summary_color};font-weight:700;"
+                f"background:{summary_color}11;border:1px solid {summary_color}44;"
+                f"border-radius:5px;padding:6px 12px;margin:6px 0;letter-spacing:1px;'>"
+                f"{summary_icon}</div>", unsafe_allow_html=True)
+
+            for hname, d in div.items():
+                ok      = d["ok"]
+                color   = "#4caf7d" if ok else "#ff4d4d"
+                icon    = "✓" if ok else "✗"
+                delta   = d["delta_pct"]
+                target  = d["target"]
+                pfta_p  = d["pfta"]
+                inv_c   = d["inverse_calc"]
+
+                st.markdown(f"""
+                <div style="background:#111;border:1.5px solid {color}44;border-radius:7px;
+                            padding:8px 12px;margin:4px 0;">
+                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+                    <span style="font-size:11px;font-weight:700;color:{color};">{icon} {esc(hname)}</span>
+                    <span style="font-size:9px;color:{'#4caf7d' if ok else '#ff4d4d'};
+                                 background:{'#0a1a0a' if ok else '#1a0a0a'};
+                                 padding:1px 8px;border-radius:10px;font-weight:700;">
+                      Δ {delta:.2f}%
+                    </span>
+                  </div>
+                  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;">
+                    <div style="background:#0a0a0a;border-radius:4px;padding:5px 8px;">
+                      <div style="font-size:7px;color:#555;letter-spacing:1px;">TARGET</div>
+                      <div style="font-size:10px;color:#ff8c42;font-family:monospace;font-weight:700;">
+                        {target:.3e}</div>
+                    </div>
+                    <div style="background:#0a0a0a;border-radius:4px;padding:5px 8px;">
+                      <div style="font-size:7px;color:#555;letter-spacing:1px;">INVERSE CALC</div>
+                      <div style="font-size:10px;color:#f5c518;font-family:monospace;font-weight:700;">
+                        {f"{inv_c:.3e}" if inv_c is not None else "—"}</div>
+                    </div>
+                    <div style="background:#0a0a0a;border-radius:4px;padding:5px 8px;">
+                      <div style="font-size:7px;color:#555;letter-spacing:1px;">PFTA EXACT</div>
+                      <div style="font-size:10px;color:{color};font-family:monospace;font-weight:700;">
+                        {pfta_p:.3e}</div>
+                    </div>
+                  </div>
+                  {"" if ok else f'<div style="font-size:9px;color:#ff4d4d;margin-top:5px;line-height:1.4;">'
+                   f'⚠ Divergence exceeds 5%. The inverse approximation (remainder/n or root) '
+                   f'may be inaccurate for this branch. Check shared events or high-probability paths.</div>'}
+                </div>""", unsafe_allow_html=True)
+        else:
+            st.markdown(
+                "<div style='font-size:9px;color:#555;'>No HAZARD nodes have target values set "
+                "— set targetValue on HAZARD nodes to see divergence analysis.</div>",
+                unsafe_allow_html=True)
+
+        # ── Raw PFTA results ─────────────────────────────────────────────
+        if result["top_gate_results"]:
+            with st.expander("Raw PFTA top-gate probabilities"):
+                for gid, prob in result["top_gate_results"].items():
+                    st.markdown(
+                        f"<code style='font-size:10px;color:#4fc3f7;'>{gid}</code>"
+                        f"<span style='font-size:10px;color:#ccc;font-family:monospace;'>"
+                        f"  →  {prob:.6e}</span>",
+                        unsafe_allow_html=True)
+
+        # ── Debug: show generated PFTA text ─────────────────────────────
+        with st.expander("Generated PFTA fault tree text (debug)"):
+            st.code(result["pfta_text"], language="text")
+
 
 # ── Gist helpers ──────────────────────────────────────────────────────────
 def gh(token): return {"Authorization":f"token {token}","Accept":"application/vnd.github+json"}
@@ -43,7 +378,6 @@ def load_gist_file(token, gid, fname):
         raw = json.loads(g.get("files",{}).get(fname,{}).get("content","[]"))
     except:
         return []
-    # Normalise nodes
     for n in raw:
         n.setdefault("nodeId",    n.get("id",""))
         n.setdefault("ftLabel",   "")
@@ -64,7 +398,6 @@ def save_gist_file(token, gid, fname, data):
     except: return False
 
 def inject_positions(nodes, positions):
-    """Write saved canvas positions into node data so they survive reload."""
     if not positions: return nodes
     updated = []
     for n in nodes:
@@ -75,7 +408,6 @@ def inject_positions(nodes, positions):
     return updated
 
 def extract_positions(nodes):
-    """Pull _pos fields out of node data into a positions dict."""
     return {n["id"]: n["_pos"] for n in nodes if n.get("_pos")}
 
 def del_gist_file(token, gid, fname):
@@ -85,23 +417,20 @@ def del_gist_file(token, gid, fname):
     except: pass
 
 # ── Calculation ───────────────────────────────────────────────────────────
-# ── Calculation ───────────────────────────────────────────────────────────
 def recalculate(nodes):
     """
     Top-down reverse distribution using Kahn topological sort.
 
-    Pin propagation (NEW):
+    Pin propagation:
     - If ANY node in a nodeId group has fixedValue set, ALL nodes with the
       same nodeId inherit that fixedValue before calculation begins.
-      This means pinning one IF-085 instance pins all IF-085 instances.
     - Most-conservative rule: if multiple instances have different fixedValues,
       the MAXIMUM (worst case) is used across the group.
 
     fixedValue support:
     - A node with fixedValue set is PINNED — calculatedValue always = fixedValue
-    - When an OR-gate parent distributes:
-        1. Fixed children claim their pinned value from budget first
-        2. Remainder shared equally among unfixed children
+    - OR-gate parent: fixed children claim pinned value from budget first;
+      remainder shared equally among unfixed children
     - AND gate: fixed children excluded from product decomposition
 
     Standard FTA rules:
@@ -125,16 +454,13 @@ def recalculate(nodes):
     for nid, grp in nid_groups.items():
         if len(grp) < 2:
             continue
-        # Find the maximum fixedValue across all pinned instances in this group
         pinned_vals = [n["fixedValue"] for n in grp if n.get("fixedValue") is not None]
         if not pinned_vals:
             continue
-        # Use MAX of all pinned values (most conservative / worst case)
         group_pin = max(pinned_vals)
         for n in grp:
             n["fixedValue"]     = group_pin
             n["calculatedValue"] = group_pin
-    # ── End pin propagation ────────────────────────────────────────────────
 
     for n in updated:
         if n["type"] == "HAZARD":
@@ -164,8 +490,6 @@ def recalculate(nodes):
             resolved.add(n["id"])
             queue.append(n["id"])
         elif not [p for p in (n.get("parentIds") or []) if p in by_id]:
-            # Parentless non-HAZARD root node — seed it so its children can propagate
-            # Value stays None (will show "-") unless fixedValue is set
             resolved.add(n["id"])
             queue.append(n["id"])
 
@@ -173,17 +497,7 @@ def recalculate(nodes):
         pid        = queue.popleft()
         parent     = by_id[pid]
         parent_val = parent.get("calculatedValue")
-
-        # If this parent has no value (floating root with no fixedValue),
-        # still mark its children as having this parent resolved so they
-        # can proceed via their other parents (MAX rule applies to remaining)
         if parent_val is None:
-            for cid in children_of.get(pid, []):
-                parents_resolved[cid] += 1
-                total_parents = in_degree.get(cid, 0)
-                if parents_resolved[cid] >= total_parents and cid not in resolved:
-                    resolved.add(cid)
-                    queue.append(cid)
             continue
 
         child_ids = children_of.get(pid, [])
@@ -237,7 +551,6 @@ def is_named(n): return not is_snap(n)
 
 # ── Export: JSON ──────────────────────────────────────────────────────────
 def export_json(nodes):
-    """Export all nodes. Ensures every node has all standard fields."""
     clean = []
     for n in nodes:
         nc = dict(n)
@@ -251,11 +564,6 @@ def export_json(nodes):
 
 # ── Export: Cypher (Neo4j) ────────────────────────────────────────────────
 def export_cypher(nodes):
-    """
-    Generate Cypher statements to recreate the FTA in Neo4j.
-    Includes: fixedValue (pinned nodes), nodeId (user reference), GROUP type.
-    Run in Neo4j Browser or via neo4j-shell.
-    """
     by_id = {n["id"]: n for n in nodes}
     n_pinned = sum(1 for n in nodes if n.get("fixedValue") is not None)
     n_shared  = sum(1 for n in nodes if len(n.get("parentIds") or []) > 1)
@@ -263,12 +571,9 @@ def export_cypher(nodes):
         "// ── FTA Fault Tree — Cypher Export ──────────────────────────",
         f"// Generated:    {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         f"// Total nodes:  {len(nodes)}",
-        f"// Pinned nodes: {n_pinned}  (fixedValue set — budget subtracted from siblings)",
-        f"// Shared nodes: {n_shared}  (multiple parents — MAX allocation rule applied)",
+        f"// Pinned nodes: {n_pinned}",
+        f"// Shared nodes: {n_shared}",
         "//",
-        "// Run in Neo4j Browser to create the full graph.",
-        "",
-        "// STEP 1: Clear existing FTA nodes (optional — comment out to merge)",
         "// MATCH (n:FTANode) DETACH DELETE n;",
         "",
         "// STEP 2: Create all nodes",
@@ -296,8 +601,7 @@ def export_cypher(nodes):
             f"isGroup:{str(is_group).lower()}"
             f"}});"
         )
-
-    lines += ["", "// STEP 3: Create relationships (FEEDS_INTO = child → parent)"]
+    lines += ["", "// STEP 3: Create relationships"]
     for n in nodes:
         for pid in (n.get("parentIds") or []):
             if pid in by_id:
@@ -306,37 +610,6 @@ def export_cypher(nodes):
                     f"CREATE (c)-[:FEEDS_INTO {{gate:'{by_id[pid]['gate']}', "
                     f"childPinned:{str(n.get('fixedValue') is not None).lower()}}}]->(p);"
                 )
-
-    lines += [
-        "",
-        "// STEP 4: Useful queries",
-        "",
-        "// Show full graph:",
-        "// MATCH (n:FTANode)-[r]->(m) RETURN n,r,m;",
-        "",
-        "// Show all shared nodes with their values:",
-        "// MATCH (n:FTANode) WHERE n.shared=true",
-        "// RETURN n.nodeId, n.name, n.type, n.valueStr ORDER BY n.type;",
-        "",
-        "// Show all pinned (fixed-value) nodes:",
-        "// MATCH (n:FTANode) WHERE n.pinned=true",
-        "// RETURN n.nodeId, n.name, n.fixedValue, n.valueStr;",
-        "",
-        "// Show path from any IF to its HAZARD with values:",
-        "// MATCH p=(i:FTANode {type:'IF'})-[:FEEDS_INTO*]->(h:FTANode {type:'HAZARD'})",
-        "// RETURN [node IN nodes(p) | node.nodeId + ':' + node.valueStr] AS path LIMIT 10;",
-        "",
-        "// Find all IFs contributing to a specific hazard (e.g. 'SF-10'):",
-        "// MATCH p=(i:FTANode {type:'IF'})-[:FEEDS_INTO*]->(h:FTANode)",
-        "// WHERE h.name CONTAINS 'SF-10'",
-        "// RETURN i.nodeId, i.name, i.valueStr ORDER BY i.calculatedValue DESC;",
-        "",
-        "// Budget check: verify OR-gate children sum ≤ parent for all nodes:",
-        "// MATCH (p:FTANode {gate:'OR'})<-[:FEEDS_INTO]-(c:FTANode)",
-        "// WITH p, sum(c.calculatedValue) AS childSum",
-        "// WHERE childSum > p.calculatedValue * 1.01",
-        "// RETURN p.nodeId, p.name, p.valueStr, childSum AS actualSum;",
-    ]
     return "\n".join(lines).encode("utf-8")
 
 # ── Export: Excel ─────────────────────────────────────────────────────────
@@ -363,7 +636,7 @@ def export_excel(nodes):
                 [("HAZARD","FFFF4D4D"),("SF","FFFF8C42"),("FF","FFF5C518"),
                  ("IF","FF4CAF7D"),("GROUP","FF7E57C2")]}
     hdr_fill = PatternFill("solid", fgColor="FF0F3460")
-    pin_fill = PatternFill("solid", fgColor="FF3A0A14")  # dark red bg for pinned
+    pin_fill = PatternFill("solid", fgColor="FF3A0A14")
 
     def hdr_font(c): return Font(bold=True, color="FFFFFFFF", name="Courier New")
     def row_font(lvl):
@@ -372,7 +645,6 @@ def export_excel(nodes):
     def ctr(): return Alignment(horizontal="center", vertical="center")
     def lft(): return Alignment(horizontal="left",   vertical="center", wrap_text=True)
 
-    # ── Sheet 1: All nodes ──────────────────────────────────────────────
     ws = wb.active; ws.title = "FTA Nodes"
     hdrs = ["Level", "Type", "Node Name", "Node ID", "FT Label",
             "Gate", "Calc. Value", "Fixed Value (📌)", "Shared",
@@ -407,7 +679,6 @@ def export_excel(nodes):
                 cell.font      = row_font(lvl)
                 cell.fill      = node_fill
                 cell.alignment = lft() if ci in (3, 10, 11) else ctr()
-            # Mark fixed value cell red text
             if is_pinned:
                 ws.cell(row, 8).font = Font(name="Courier New", size=10,
                                             color="FFFF4D4D", bold=True)
@@ -415,7 +686,6 @@ def export_excel(nodes):
     for ci, w in enumerate([8, 10, 30, 12, 10, 8, 16, 16, 8, 30, 30], 1):
         ws.column_dimensions[get_column_letter(ci)].width = w
 
-    # ── Sheet 2: Per-hazard hierarchy ───────────────────────────────────
     ws2 = wb.create_sheet("Hierarchy"); ws2.sheet_view.showGridLines = False
     ws2.cell(1, 1, "FTA HIERARCHY - TOP TO BOTTOM").font = Font(
         bold=True, size=14, name="Courier New", color="FFE94560")
@@ -451,15 +721,14 @@ def export_excel(nodes):
             c.fill = PatternFill("solid", fgColor=fhex)
         c3.alignment = Alignment(horizontal="right", vertical="center")
         if n.get("fixedValue") is not None:
-            c3.font = Font(name="Courier New", size=10, bold=True,
-                           color="FFFF4D4D")  # red for pinned
+            c3.font = Font(name="Courier New", size=10, bold=True, color="FFFF4D4D")
         row += 1
         for child in [x for x in nodes if nid in (x.get("parentIds") or [])]:
             write_hier(child["id"], depth + 1, seen)
 
     for h in [n for n in nodes if n["type"] == "HAZARD"]:
         write_hier(h["id"], 0, set())
-        row += 1  # blank line between hazards
+        row += 1
     for ci, w in enumerate([50, 16, 16, 24], 1):
         ws2.column_dimensions[get_column_letter(ci)].width = w
 
@@ -468,12 +737,6 @@ def export_excel(nodes):
 
 # ── Tree HTML builder ─────────────────────────────────────────────────────
 def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
-    """
-    Sugiyama column layout: each SF owns a horizontal column.
-    FFs/IFs grouped under their SF column.
-    Per-subtree force: select an SF then click Force to release only that branch.
-    Full drag freedom in both force ON and OFF modes.
-    """
     if not nodes: return ""
     import json as _json
 
@@ -487,10 +750,8 @@ def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
             visible.add(cur)
             for child in [n for n in nodes if cur in (n.get("parentIds") or [])]:
                 q.append(child["id"])
-        # Also include floating root nodes (no parentIds) that have children in this subtree
         for n in nodes:
             if n["type"] != "HAZARD" and not n.get("parentIds"):
-                # Check if any of its descendants are in visible
                 _fq = [c["id"] for c in nodes if n["id"] in (c.get("parentIds") or [])]
                 _seen = set()
                 _found = False
@@ -513,7 +774,6 @@ def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
     shared_ids = {n["id"] for n in show_nodes
                   if len([p for p in (n.get("parentIds") or []) if p in shown_ids]) > 1}
 
-    # Duplicate detection: nodes with same nodeId but different internal id
     from collections import defaultdict as _dd
     nid_groups = _dd(list)
     for n in show_nodes:
@@ -526,7 +786,6 @@ def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
     init_pos  = dict(ts.get("positions", {}))
     focus_id  = ts.get("focus_id")
 
-    # Merge persisted _pos from node data (survives page refresh / file reload)
     for n in show_nodes:
         if n.get("_pos") and n["id"] not in init_pos:
             init_pos[n["id"]] = n["_pos"]
@@ -535,9 +794,6 @@ def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
     LEVEL_COLOR = {0: "#ff4d4d", 1: "#ff8c42", 2: "#f5c518", 2.5: "#7e57c2", 3: "#4caf7d"}
     LEVEL_LABEL = {0: "HAZARD", 1: "SF", 2: "FF", 2.5: "GROUP", 3: "IF"}
 
-    # ── Per-node depth so same-type parent/child never share a row ──────────
-    # Root nodes (no visible parents) get depth 0.
-    # Non-HAZARD nodes with no parents are also treated as depth-0 roots.
     _depth_map = {}
     def _get_depth(nid, _seen=None):
         if nid in _depth_map: return _depth_map[nid]
@@ -569,10 +825,6 @@ def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
         "fixedVal":    fmt(n.get("fixedValue")) if n.get("fixedValue") is not None else None,
         "isGroup":     n["type"] == "GROUP",
         "isRoot":      n["type"] != "HAZARD" and not [p for p in (n.get("parentIds") or []) if p in shown_ids],
-        "needsPin":    (n["type"] != "HAZARD"
-                        and not [p for p in (n.get("parentIds") or []) if p in shown_ids]
-                        and n.get("fixedValue") is None
-                        and n.get("calculatedValue") is None),
         "color":       LEVEL_COLORS.get(n["type"], "#7e57c2"),
         "tcolor":      LEVEL_TEXT.get(n["type"], "#fff"),
         "row":         _depth_map.get(n["id"], LEVEL_ROW.get(n["type"], 2)),
@@ -596,11 +848,12 @@ def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
     level_label_js = _json.dumps({str(k): v for k, v in LEVEL_LABEL.items()})
     level_color_js = _json.dumps({str(k): v for k, v in LEVEL_COLOR.items()})
 
+    # ── D3 HTML tree (unchanged from original) ────────────────────────────
     html = """<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style>
 *{box-sizing:border-box;margin:0;padding:0;}
-body{background:#0a0a0a;font-family:\'JetBrains Mono\',\'Fira Code\',monospace;
+body{background:#0a0a0a;font-family:'JetBrains Mono','Fira Code',monospace;
      color:#e0e0e0;overflow:hidden;height:100vh;display:flex;flex-direction:column;}
 #toolbar{display:flex;align-items:center;gap:7px;padding:7px 14px;
   background:#111;border-bottom:2px solid #1a1a1a;flex-shrink:0;user-select:none;height:46px;}
@@ -641,6 +894,9 @@ svg{position:absolute;inset:0;width:100%;height:100%;}
 .dsv{font-size:10px;color:#bbb;line-height:1.5;}
 #dpc{position:absolute;top:8px;right:12px;background:none;border:none;color:#555;font-size:17px;cursor:pointer;}
 #dpc:hover{color:#fff;}
+#msp{display:none;position:absolute;bottom:0;left:0;right:0;
+  background:rgba(8,8,8,.95);border-top:2px solid #4fc3f7;padding:8px 16px 10px;
+  z-index:21;backdrop-filter:blur(14px);}
 </style>
 </head><body>
 <div id="toolbar">
@@ -648,10 +904,10 @@ svg{position:absolute;inset:0;width:100%;height:100%;}
   <button class="btn" onclick="zBy(-.22)">&#65293;</button>
   <span id="zlbl">85%</span>
   <div class="sep"></div>
-  <button class="btn" id="blay" onclick="doColumnLayout(true)" title="Reset to clean column layout">&#8862; Reset Layout</button>
+  <button class="btn" id="blay" onclick="doColumnLayout(true)">&#8862; Reset Layout</button>
   <button class="btn" onclick="doFit()">&#8865; Fit</button>
   <div class="sep"></div>
-  <button class="btn" id="bfrc" onclick="toggleForce()" title="Select an SF node first to release only that subtree to physics">&#9889; Force</button>
+  <button class="btn" id="bfrc" onclick="toggleForce()">&#9889; Force</button>
   <span id="fst"></span>
   <div class="sep"></div>
   <button class="btn" onclick="clearHL()">&#10005; Clear</button>
@@ -689,19 +945,13 @@ svg{position:absolute;inset:0;width:100%;height:100%;}
     <div class="ds"><div class="dsl">CHILDREN</div><div class="dsv" id="d6"></div></div>
   </div>
 </div>
-<div id="msp" style="display:none;position:absolute;bottom:0;left:0;right:0;
-  background:rgba(8,8,8,.95);border-top:2px solid #4fc3f7;padding:8px 16px 10px;
-  z-index:21;backdrop-filter:blur(14px);">
+<div id="msp">
   <button onclick="clearMultiSel()" style="position:absolute;top:8px;right:12px;
-    background:none;border:none;color:#555;font-size:17px;cursor:pointer;"
-    onmouseover="this.style.color='#fff'" onmouseout="this.style.color='#555'">&#10005;</button>
+    background:none;border:none;color:#555;font-size:17px;cursor:pointer;">&#10005;</button>
   <div style="font-size:8px;color:#4fc3f7;letter-spacing:3px;margin-bottom:5px;font-weight:700;">
     MULTI-SELECT — <span id="msc">0</span> NODES
   </div>
   <div id="mslist" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:7px;max-height:48px;overflow-y:auto;"></div>
-  <div style="font-size:8px;color:#555;margin-bottom:6px;">
-    Use actions in sidebar ▸ <b style="color:#4fc3f7;">SELECTION</b> panel
-  </div>
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
 <script>
@@ -715,7 +965,7 @@ const GC={OR:"#4fc3f7",AND:"#ffb74d"};
 const NW=160,NH=88,HG=20,VG=140;
 let selId=null,forceOn=false,forceSub=null;
 let collapsed=new Set(),sM=[],sI=0;
-let multiSel=new Set();   // ← multi-select set
+let multiSel=new Set();
 const uP={};
 Object.entries(IPOS).forEach(([id,p])=>uP[id]={x:p.x,y:p.y});
 const NM={};
@@ -741,21 +991,16 @@ const sim=d3.forceSimulation()
   .on("tick",tick);
 sim.stop();
 
-// ── visible nodes ─────────────────────────────────────────────────────
 function getVis(){
   const h=new Set();
   collapsed.forEach(cid=>{const q=[cid];while(q.length){const c=q.shift();(NM[c]?.children||[]).forEach(ch=>{if(!h.has(ch)){h.add(ch);q.push(ch);}});}});
   return RNODES.filter(n=>!h.has(n.id));
 }
-
-// ── subtree ids ────────────────────────────────────────────────────────
 function subIds(id){
   const s=new Set([id]),q=[id];
   while(q.length){const c=q.shift();(NM[c]?.children||[]).forEach(ch=>{if(!s.has(ch)&&sN.find(n=>n.id===ch)){s.add(ch);q.push(ch);}});}
   return s;
 }
-
-// ── find which SF owns a node ──────────────────────────────────────────
 function ownerSF(id,depth){
   if(depth>8) return null;
   const n=NM[id]; if(!n) return null;
@@ -763,8 +1008,6 @@ function ownerSF(id,depth){
   for(const pid of (n.parents||[])){const r=ownerSF(pid,depth+1);if(r)return r;}
   return null;
 }
-
-// ── column layout ─────────────────────────────────────────────────────
 function refresh(){
   const vis=getVis(); const ex={};
   sN.forEach(n=>ex[n.id]=n);
@@ -775,285 +1018,167 @@ function refresh(){
   computeRTLayout(false); drawLinks(); drawNodes(); tick(); updateLanes();
   if(forceOn) sim.alpha(.3).restart();
 }
-
-// ── draw links ─────────────────────────────────────────────────────────
 function drawLinks(){
   const s=lg.selectAll("path.lk").data(sL,d=>d.source.id+"->"+d.target.id);
   const a=s.enter().append("path").attr("class","lk").attr("fill","none").merge(s);
   a.attr("stroke",d=>d.shared?"#f5c51855":"#2d2d2d")
    .attr("stroke-width",d=>d.shared?1.2:2)
-   .attr("stroke-dasharray",d=>d.andGate?"8,4":d.shared?"4,6":null)
-   .attr("opacity",d=>d.shared?.5:.92)
-   .attr("marker-end","none")
-   .attr("marker-start","url(#ma)");
+   .attr("stroke-dasharray",d=>d.andGate?"6,3":null)
+   .attr("marker-end",d=>d.shared?"url(#mah)":"url(#ma)");
   s.exit().remove();
 }
-
-// ── draw nodes ─────────────────────────────────────────────────────────
 function drawNodes(){
   const s=ng.selectAll("g.nd").data(sN,d=>d.id);
-  const ent=s.enter().append("g").attr("class","nd").style("cursor","grab")
-    .on("click",(e,d)=>{
-      e.stopPropagation();
-      if(e.ctrlKey||e.metaKey||e.shiftKey){
-        // Multi-select mode
-        closeDP();
-        toggleMultiSel(d.id,e);
-      } else {
-        // Single select — clear multi-sel first
-        if(multiSel.size>0){clearMultiSel();}
-        selectNode(d.id);
-      }
-    })
-    .on("dblclick",(e,d)=>{e.stopPropagation();toggleCollapse(d.id);})
-    .call(d3.drag().filter(e=>e.button===0)
-      .on("start",(e,d)=>{e.sourceEvent.stopPropagation();if(forceOn&&!e.active)sim.alphaTarget(.05).restart();d.fx=d.x;d.fy=d.y;})
-      .on("drag",(e,d)=>{d.x=d.fx=e.x;d.y=d.fy=e.y;uP[d.id]={x:e.x,y:e.y,manual:true};tick();})
-      .on("end",(e,d)=>{if(forceOn&&!e.active)sim.alphaTarget(0);const inF=forceOn&&forceSub&&subIds(forceSub).has(d.id);if(!inF){d.fx=d.x;d.fy=d.y;}else{d.fx=null;d.fy=null;}})
-    );
-  ent.append("rect").attr("class","nb");
-  ent.append("text").attr("class","nt").attr("text-anchor","middle").attr("font-size",7).attr("font-weight",700).attr("font-family","JetBrains Mono,monospace").attr("letter-spacing",2).attr("opacity",.65);
-  ent.append("foreignObject").attr("class","nf").append("xhtml:div").attr("xmlns","http://www.w3.org/1999/xhtml").style("font-size","9.5px").style("font-weight","700").style("font-family","JetBrains Mono,monospace").style("text-align","center").style("word-break","break-word").style("line-height","1.25").style("overflow","hidden");
-  ent.append("rect").attr("class","vb").attr("height",19).attr("rx",4).attr("fill","rgba(0,0,0,.3)");
-  ent.append("text").attr("class","vt").attr("text-anchor","middle").attr("font-size",10).attr("font-weight",700).attr("font-family","JetBrains Mono,monospace");
-  ent.append("g").attr("class","gb"); ent.append("g").attr("class","wb"); ent.append("g").attr("class","cb");
+  const e=s.enter().append("g").attr("class","nd").style("cursor","pointer");
+  e.append("rect").attr("class","nb").attr("width",NW).attr("height",NH).attr("rx",8);
+  e.append("text").attr("class","nt").attr("x",NW/2).attr("y",18).attr("text-anchor","middle")
+   .attr("font-size","7px").attr("letter-spacing","1.5px").attr("fill","#555");
+  e.append("text").attr("class","nn").attr("x",NW/2).attr("y",36).attr("text-anchor","middle")
+   .attr("font-size","11px").attr("font-weight","700").attr("fill","#fff");
+  e.append("text").attr("class","nv").attr("x",NW/2).attr("y",54).attr("text-anchor","middle")
+   .attr("font-size","13px").attr("font-weight","700").attr("font-family","monospace");
+  e.append("text").attr("class","ng2").attr("x",NW/2).attr("y",69).attr("text-anchor","middle")
+   .attr("font-size","8px").attr("fill","#555");
+  e.append("text").attr("class","nfx").attr("x",NW-6).attr("y",14).attr("text-anchor","end")
+   .attr("font-size","9px").attr("fill","#e94560");
+  const all=e.merge(s);
+  all.on("click",(ev,d)=>{
+    ev.stopPropagation();
+    if(ev.shiftKey||ev.ctrlKey||ev.metaKey){toggleMultiSel(d.id,ev);return;}
+    openDP(d.id);
+    clearHL();
+    ng.selectAll("g.nd").each(function(n){
+      const inPath=d.parents?.includes(n.id)||d.children?.includes(n.id)||n.id===d.id;
+      d3.select(this).attr("opacity",inPath?1:0.18);
+    });
+    lg.selectAll("path.lk").attr("opacity",l=>{
+      const src=l.source?.id,tgt=l.target?.id;
+      return (src===d.id||tgt===d.id)?1:0.08;
+    });
+  })
+  .on("dblclick",(ev,d)=>{ev.stopPropagation();if(d.children?.length){collapsed.has(d.id)?collapsed.delete(d.id):collapsed.add(d.id);refresh();}})
+  .call(d3.drag().on("start",(ev,d)=>{if(!forceOn)sim.alphaTarget(0).stop();d.fx=d.x;d.fy=d.y;})
+    .on("drag",(ev,d)=>{d.fx=ev.x;d.fy=ev.y;uP[d.id]={x:ev.x,y:ev.y,manual:true};if(forceOn){sim.alphaTarget(.05).restart();}else{tick();}})
+    .on("end",(ev,d)=>{if(!forceOn){d.fx=null;d.fy=null;}savePositions();}));
 
-  const all=ent.merge(s);
   all.select("rect.nb")
-    .attr("width",d=>d.isGroup?126:NW).attr("height",d=>d.isGroup?68:NH)
-    .attr("x",d=>d.isGroup?-63:-NW/2).attr("y",d=>d.isGroup?-34:-NH/2)
-    .attr("rx",d=>d.isGroup?63:9).attr("ry",d=>d.isGroup?34:9)
-    .attr("fill",d=>d.isRoot?d.color+"99":d.color)
-    .attr("stroke",d=>{
-      if(d.isRoot)      return "#ffffff";
-      if(d.isDuplicate) return "#4fc3f7";
-      if(forceSub===d.id&&forceOn) return "#f5c518";
-      if(d.isPinned)    return "#e94560";
-      return d.color;
-    })
-    .attr("stroke-width",d=>d.isRoot?2:d.isDuplicate?2.5:forceSub===d.id&&forceOn?3:d.isPinned?2.5:1.5)
+    .attr("stroke",d=>d.isRoot?"#ffffff":d.isDuplicate?"#4fc3f7":d.isPinned?"#e94560":d.color)
+    .attr("stroke-width",d=>d.isRoot?2:d.isDuplicate?2.5:d.isPinned?2.5:1.5)
     .attr("stroke-dasharray",d=>d.isRoot?"4,4":d.isDuplicate?"6,3":d.isPinned?"6,3":null)
-    .attr("opacity",d=>d.isRoot?0.75:1);
-  all.select("text.nt").attr("y",d=>d.isGroup?-16:-NH/2+13).attr("fill",d=>d.tcolor)
-    .text(d=>d.isGroup?"COMBINED":d.type+(d.isRoot?" ⬡":"")+(d.shared?" ◈":"")+(d.isPinned?" 📌":"")+(d.isDuplicate?" ◈":""));
-  all.select("foreignObject.nf")
-    .attr("x",d=>d.isGroup?-57:-NW/2+7).attr("y",d=>d.isGroup?-22:-NH/2+17)
-    .attr("width",d=>d.isGroup?114:NW-14).attr("height",d=>d.isGroup?28:40)
-    .select("div").style("color",d=>d.tcolor).text(d=>d.name);
-  all.select("rect.vb").attr("x",d=>d.isGroup?-47:-NW/2+9).attr("y",d=>d.isGroup?11:NH/2-24).attr("width",d=>d.isGroup?94:NW-18);
-  all.select("text.vt").attr("y",d=>d.isGroup?25:NH/2-10)
-    .attr("fill",d=>d.isPinned?"#e94560":d.needsPin?"#ff4d4d":d.tcolor)
-    .text(d=>d.needsPin?"⚠ PIN REQUIRED":d.value+(d.isPinned?" 📌":""));
-
-  all.each(function(d){
-    const hc=(d.children||[]).length>0;
-    const gb=d3.select(this).select("g.gb"); gb.selectAll("*").remove();
-    if(hc){
-      // Gate badge at TOP — where child arrows feed in
-      gb.append("rect").attr("x",-19).attr("y",-NH/2-18).attr("width",38).attr("height",15).attr("rx",4).attr("fill","#0d0d0d").attr("stroke",GC[d.gate]||"#aaa").attr("stroke-width",1.2);
-      gb.append("text").attr("y",-NH/2-7).attr("text-anchor","middle").attr("fill",GC[d.gate]||"#aaa").attr("font-size",8).attr("font-weight",700).attr("font-family","JetBrains Mono,monospace").attr("letter-spacing",1).text(d.gate);
-    }
-    // needsPin warning badge — bottom centre
-    const wb=d3.select(this).select("g.wb"); wb.selectAll("*").remove();
-    if(d.needsPin){
-      wb.append("rect").attr("x",-44).attr("y",NH/2+5).attr("width",88).attr("height",14).attr("rx",4)
-        .attr("fill","#3a0000").attr("stroke","#ff4d4d").attr("stroke-width",1.2);
-      wb.append("text").attr("y",NH/2+15).attr("text-anchor","middle")
-        .attr("fill","#ff4d4d").attr("font-size",7.5).attr("font-weight",700)
-        .attr("font-family","JetBrains Mono,monospace").attr("letter-spacing",0.5)
-        .text("⚠ EDIT → PIN A VALUE");
-    }
-    const cb=d3.select(this).select("g.cb"); cb.selectAll("*").remove();
-    if(hc){
-      // Collapse button at bottom-right
-      const cx=d.isGroup?53:NW/2-10,cy=NH/2-10;
-      cb.append("circle").attr("cx",cx).attr("cy",cy).attr("r",9).attr("fill","#1c1c1c").attr("stroke","#3a3a3a").attr("stroke-width",1.2).style("cursor","pointer").on("click",(e,dd)=>{e.stopPropagation();toggleCollapse(dd.id);});
-      cb.append("text").attr("x",cx).attr("y",cy+5).attr("text-anchor","middle").attr("fill","#888").attr("font-size",12).attr("font-weight",700).attr("font-family","monospace").attr("pointer-events","none").text(collapsed.has(d.id)?"+":"−");
-    }
+    .attr("fill","#111");
+  all.select("text.nt").text(d=>d.isGroup?"GROUP":d.type);
+  all.select("text.nn").text(d=>{const nm=d.name||"";return nm.length>18?nm.slice(0,17)+"…":nm;})
+    .attr("fill",d=>d.color);
+  all.select("text.nv").text(d=>d.isPinned?(d.fixedVal||d.value)+" 📌":d.value)
+    .attr("fill",d=>d.isPinned?"#e94560":d.color);
+  all.select("text.ng2").text(d=>{
+    const nid=d.nodeId&&d.nodeId!==d.id?d.nodeId:"";
+    const ft=d.ftLabel?`[${d.ftLabel}]`:"";
+    const gate=d.gate;
+    const parts=[nid,ft,gate].filter(Boolean);
+    return parts.join(" · ");
   });
+  all.select("text.nfx").text(d=>d.isPinned?"📌":d.isRoot?"⬡":d.isDuplicate?"◈":"");
   s.exit().remove();
 }
-
 function tick(){
+  ng.selectAll("g.nd").attr("transform",d=>`translate(${(d.x||0)-NW/2},${(d.y||0)-NH/2})`);
   lg.selectAll("path.lk").attr("d",d=>{
-    if(!d.source||!d.target)return"";
-    // source=child (lower), target=parent (higher). Arrow tip at parent bottom.
-    const sx=d.source.x||0, sy=(d.source.y||0)-NH/2-4;  // child top edge
-    const tx=d.target.x||0, ty=(d.target.y||0)+NH/2+4;  // parent bottom edge
-    const my=(sy+ty)/2;
+    const sx=d.source.x||0,sy=d.source.y||0,tx=d.target.x||0,ty=d.target.y||0;
+    const mx=(sx+tx)/2,my=(sy+ty)/2;
     return `M${sx},${sy} C${sx},${my} ${tx},${my} ${tx},${ty}`;
   });
-  ng.selectAll("g.nd").attr("transform",d=>`translate(${d.x||0},${d.y||0})`);
+}
+function updateLanes(){
+  const lc=document.getElementById("lanes"); lc.innerHTML="";
+  const t=getT(),h=wrap.getBoundingClientRect().height;
+  const rows=new Map();
+  sN.forEach(n=>{const r=n.row;if(!rows.has(r))rows.set(r,[]);rows.get(r).push(n);});
+  rows.forEach((nodes,r)=>{
+    const cy=t.k*(layY(r))+t.y;
+    if(cy<-40||cy>h+40) return;
+    const lbl=LLABELS[String(r)]||"";
+    const col=LCOLORS[String(r)]||"#888";
+    const div=document.createElement("div");
+    div.className="lb";
+    div.style.top=(cy-44)+"px";
+    const bar=document.createElement("div");
+    bar.className="ls";bar.style.background=col;
+    const txt=document.createElement("div");
+    txt.className="lt";txt.textContent=lbl;txt.style.color=col;
+    div.appendChild(bar);div.appendChild(txt);
+    lc.appendChild(div);
+  });
 }
 function computeRTLayout(reset){
-  const vis    = getVis();
-  const visSet = new Set(vis.map(n=>n.id));
-  const cw     = wrap.getBoundingClientRect();
-  const VW     = (cw.width||1200);
-
-  // ── 1. Build child map ─────────────────────────────────────────────
-  const childMap = {};
-  vis.forEach(n=>{ childMap[n.id] = []; });
-  vis.forEach(n=>{
-    (n.parents||[]).forEach(pid=>{
-      if(visSet.has(pid) && childMap[pid]) childMap[pid].push(n.id);
+  const sfNodes=sN.filter(n=>n.type==="SF");
+  const colW=NW+HG;
+  sfNodes.forEach((sf,i)=>{
+    const cx=100+i*colW;
+    sf.bx=cx;
+    if(reset||!uP[sf.id]?.manual){sf.x=cx;sf.fx=null;sf.fy=null;}
+    const sub=subIds(sf.id);
+    sN.forEach(n=>{
+      if(n.id!==sf.id&&sub.has(n.id)){
+        n.bx=cx;
+        if(reset||!uP[n.id]?.manual){n.x=cx;n.fx=null;n.fy=null;}
+      }
     });
   });
-
-  // ── 2. Count leaves ────────────────────────────────────────────────
-  const lc = {};
-  function cLeaves(id){
-    if(lc[id] !== undefined) return lc[id];
-    const ch = childMap[id]||[];
-    lc[id] = ch.length ? ch.reduce((s,c)=>s+cLeaves(c), 0) : 1;
-    return lc[id];
-  }
-  vis.forEach(n=>cLeaves(n.id));
-
-  // ── 3. Compute adaptive slot width ────────────────────────────────
-  const roots = vis.filter(n=>(n.parents||[]).every(p=>!visSet.has(p)));
-  const totalLeaves = roots.reduce((s,r)=>s+cLeaves(r.id), 0) || 1;
-  const MARGIN = 60;
-  // Fit within viewport when possible; never smaller than NW+8 (no overlap)
-  const MIN_SLOT = NW + 8;
-  const idealSlot = Math.floor((VW - MARGIN*2) / totalLeaves);
-  const SLOT = Math.max(MIN_SLOT, Math.min(idealSlot, NW + HG));
-  const totalWidth = Math.max(totalLeaves * SLOT + MARGIN*2, VW);
-
-  // ── 4. Assign x positions ─────────────────────────────────────────
-  const posMap = {};
-  function assignX(id, left, width){
-    const ch = childMap[id]||[];
-    if(!ch.length){ posMap[id] = left + width/2; return; }
-    const tot = lc[id] || 1;
-    let cur = left;
-    ch.forEach(cid=>{
-      const childW = Math.max(SLOT, (lc[cid]/tot) * width);
-      assignX(cid, cur, childW);
-      cur += childW;
-    });
-    const xs = ch.map(c=>posMap[c]);
-    posMap[id] = (Math.min(...xs) + Math.max(...xs)) / 2;
-  }
-
-  let cur = MARGIN;
-  roots.forEach(r=>{
-    const w = Math.max((lc[r.id]/totalLeaves) * (totalWidth - MARGIN*2), SLOT*2);
-    assignX(r.id, cur, w);
-    cur += w;
-  });
-
-  // ── 4. Apply positions to sim nodes ───────────────────────────────
-  vis.forEach(n=>{
-    const sn = sN.find(s=>s.id===n.id); if(!sn) return;
-
-    // Skip nodes in active force subtree
-    const inForce = forceOn && forceSub && subIds(forceSub).has(n.id);
-    if(inForce){ sn.fx=null; sn.fy=null; return; }
-
-    // Respect manual drag unless resetting
-    if(!reset && uP[n.id]?.manual){
-      sn.x=uP[n.id].x; sn.y=uP[n.id].y;
-      sn.fx=sn.x; sn.fy=sn.y;
-      return;
-    }
-
-    const nx = posMap[n.id] ?? sn.x ?? totalWidth/2;
-    const ny = layY(n.row);
-    sn.x=nx; sn.y=ny; sn.bx=nx;
-    sn.fx=nx; sn.fy=ny;
-    uP[n.id] = {x:nx, y:ny, manual:false};
+  sN.filter(n=>n.type==="HAZARD").forEach(n=>{
+    const childSFs=sN.filter(c=>c.type==="SF"&&c.parents?.includes(n.id));
+    n.bx=childSFs.length?childSFs.reduce((a,c)=>a+c.bx,0)/childSFs.length:400;
+    if(reset||!uP[n.id]?.manual){n.x=n.bx;n.fx=null;n.fy=null;}
   });
 }
-
 function doColumnLayout(reset){
-  if(forceOn) stopForce();
-  if(reset) sN.forEach(n=>{delete uP[n.id];n.fx=null;n.fy=null;});
-  computeRTLayout(reset);
+  Object.keys(uP).forEach(id=>{if(uP[id])uP[id].manual=false;});
+  computeRTLayout(true);
+  sN.forEach(n=>{n.vx=0;n.vy=0;n.fx=null;n.fy=null;});
   tick(); updateLanes();
   setTimeout(doFit,80);
 }
-
-function toggleForce(){
-  if(forceOn){stopForce();return;}
-  startForce();
-}
-function startForce(){
-  const btn=document.getElementById("bfrc");
-  const st=document.getElementById("fst");
-  btn.classList.add("on"); btn.textContent="⚡ Force ON";
-  forceSub=selId&&NM[selId]?.type==="SF"?selId:null;
-  forceOn=true;
-  const ids=forceSub?subIds(forceSub):new Set(sN.map(n=>n.id));
-  sN.forEach(n=>{if(ids.has(n.id)){n.fx=null;n.fy=null;}else{n.fx=n.x;n.fy=n.y;}});
-  st.textContent=forceSub?"⚡ "+NM[forceSub].name+" subtree":"⚡ Full tree";
-  st.classList.add("show");
-  sim.alpha(.45).restart();
-  drawNodes();
-}
-function stopForce(){
-  document.getElementById("bfrc").classList.remove("on");
-  document.getElementById("bfrc").textContent="⚡ Force";
-  document.getElementById("fst").classList.remove("show");
-  forceOn=false; forceSub=null;
-  sim.stop();
-  sN.forEach(n=>{n.fx=n.x;n.fy=n.y;uP[n.id]={x:n.x,y:n.y,manual:true};});
-  drawNodes();
-}
-
 function doFit(){
-  if(!sN.length)return;
+  if(!sN.length) return;
   const xs=sN.map(n=>n.x||0),ys=sN.map(n=>n.y||0);
-  const x0=Math.min(...xs)-NW,x1=Math.max(...xs)+NW;
-  const y0=Math.min(...ys)-NH,y1=Math.max(...ys)+NH;
+  const minX=Math.min(...xs)-NW,maxX=Math.max(...xs)+NW;
+  const minY=Math.min(...ys)-NH,maxY=Math.max(...ys)+NH;
   const cw=wrap.getBoundingClientRect();
-  const W=cw.width||1000,H=cw.height||650;
-  const k=Math.min(.96,.9*Math.min(W/(x1-x0),H/(y1-y0)));
-  svg.transition().duration(500).call(zb.transform,d3.zoomIdentity.translate(W/2-k*(x0+x1)/2,H/2-k*(y0+y1)/2).scale(k));
-  setTimeout(updateLanes,520);
+  const pad=60,k=Math.min(.9,(cw.width-pad*2)/(maxX-minX+1),(cw.height-pad*2)/(maxY-minY+1));
+  const tx=cw.width/2-k*(minX+maxX)/2,ty=cw.height/2-k*(minY+maxY)/2;
+  svg.transition().duration(600).call(zb.transform,d3.zoomIdentity.translate(tx,ty).scale(k));
+  setTimeout(updateLanes,620);
 }
-function zBy(d){svg.transition().duration(180).call(zb.scaleBy,1+d);setTimeout(updateLanes,200);}
-
-function toggleCollapse(id){collapsed.has(id)?collapsed.delete(id):collapsed.add(id);refresh();}
-
-function selectNode(id){
-  if(selId===id){selId=null;clearHL();closeDP();return;}
-  selId=id;
-  const n=NM[id]; if(!n)return;
-  const par=new Set(n.parents||[]),chi=new Set(n.children||[]);
-  ng.selectAll("g.nd").each(function(d){
-    const el=d3.select(this),r=el.select("rect.nb");
-    if(d.id===id){r.attr("stroke","#e94560").attr("stroke-width",3.5).attr("filter","drop-shadow(0 0 12px #e9456088)");el.attr("opacity",1);}
-    else if(par.has(d.id)){r.attr("stroke","#4fc3f7").attr("stroke-width",3).attr("filter","drop-shadow(0 0 9px #4fc3f755)");el.attr("opacity",1);}
-    else if(chi.has(d.id)){r.attr("stroke","#ff8c42").attr("stroke-width",3).attr("filter","drop-shadow(0 0 9px #ff8c4255)");el.attr("opacity",1);}
-    else{r.attr("stroke",d.isPinned?"#e94560":d.color).attr("stroke-width",d.isPinned?2:1.5).attr("filter",null);el.attr("opacity",.15);}
-  });
-  lg.selectAll("path.lk").each(function(d){
-    const on=d.source.id===id||d.target.id===id;
-    d3.select(this).attr("stroke",on?(d.shared?"#f5c518":"#4fc3f7"):"#1a1a1a").attr("stroke-width",on?2.8:1).attr("opacity",on?1:.07).attr("marker-start",on?"url(#mah)":"url(#ma)").attr("marker-end","none");
-  });
-  if(n.type==="SF"&&!forceOn) document.getElementById("bfrc").title="Click to release \\\'"+n.name+"\\' subtree to physics";
-  showDP(id,n);
+function zBy(d){
+  const t=getT(),cw=wrap.getBoundingClientRect();
+  svg.transition().duration(200).call(zb.scaleBy,1+d,[cw.width/2,cw.height/2]);
+  setTimeout(updateLanes,220);
 }
-
+function toggleForce(){
+  const n=sN.find(n=>n.id===selId&&n.type==="SF");
+  if(n){forceSub=subIds(n.id);forceOn=true;}
+  else{forceSub=null;forceOn=!forceOn;}
+  document.getElementById("bfrc").classList.toggle("on",forceOn);
+  const fst=document.getElementById("fst");
+  if(forceOn&&n){fst.textContent="⚡ "+n.name.slice(0,20);fst.classList.add("show");}
+  else{fst.classList.remove("show");}
+  if(forceOn){
+    sim.nodes(forceSub?sN.filter(n=>forceSub.has(n.id)):sN);
+    sim.force("link").links(forceSub?sL.filter(l=>forceSub.has(l.source.id)&&forceSub.has(l.target.id)):sL);
+    sim.alpha(.5).restart();
+  } else {sim.stop();}
+}
 function clearHL(){
-  selId=null;
-  ng.selectAll("g.nd").each(function(d){
-    const el=d3.select(this);
-    el.attr("opacity",d.isRoot?0.75:1);
-    el.select("rect.nb")
-      .attr("stroke",d.isRoot?"#ffffff":d.isDuplicate?"#4fc3f7":forceSub===d.id&&forceOn?"#f5c518":d.isPinned?"#e94560":d.color)
-      .attr("stroke-width",d.isRoot?2:d.isDuplicate?2.5:forceSub===d.id&&forceOn?3:d.isPinned?2.5:1.5)
-      .attr("stroke-dasharray",d.isRoot?"4,4":d.isDuplicate?"6,3":d.isPinned?"6,3":null)
-      .attr("filter",null);
-  });
-  lg.selectAll("path.lk").attr("stroke",d=>d.shared?"#f5c51844":"#2d2d2d").attr("stroke-width",d=>d.shared?1.2:2).attr("opacity",d=>d.shared?.5:.92).attr("marker-start","url(#ma)").attr("marker-end","none");
+  ng.selectAll("g.nd").attr("opacity",d=>d.isRoot?0.75:1);
+  lg.selectAll("path.lk").attr("opacity",1);
 }
-
-const GCM={OR:"#4fc3f7",AND:"#ffb74d"};
-function showDP(id,n){
-  const dp=document.getElementById("dp"); dp.style.display="block"; dp.style.borderTopColor=n.color;
-  document.getElementById("dpt").innerHTML=`<span style="color:${n.color}">${n.name}</span>`+(n.shared?\' <span style="background:#f5c518;color:#111;font-size:8px;padding:1px 6px;border-radius:5px;font-weight:700">SHARED</span>\':\'\')+( n.isPinned?` <span style="background:#e94560;color:#fff;font-size:8px;padding:1px 6px;border-radius:5px;font-weight:700">&#128204; FIXED ${n.fixedVal}</span>`:\'\');
+function openDP(id){
+  selId=id;
+  const n=NM[id]; if(!n) return;
+  document.getElementById("dp").style.display="block";
+  document.getElementById("dpt").textContent=n.name;
+  document.getElementById("dpt").style.color=n.color;
+  const GCM={OR:"#4fc3f7",AND:"#ffb74d"};
   const q=(id,v,c)=>{const e=document.getElementById(id);e.textContent=v;if(c)e.style.color=c;};
   q("d0",n.isGroup?"GROUP":n.type,n.color);q("d1",n.gate,GCM[n.gate]||"#aaa");
   q("d2",n.isPinned?n.value+" 📌":n.value,n.isPinned?"#e94560":n.color);
@@ -1063,7 +1188,6 @@ function showDP(id,n){
   q("d5",(n.pnames||[]).join(" · ")||"(top event)");q("d6",(n.cnames||[]).join(" · ")||"(leaf)");
 }
 function closeDP(){document.getElementById("dp").style.display="none";clearHL();}
-
 function doSearch(q){
   ng.selectAll("rect.nb").attr("filter",null);sM=[];sI=0;
   if(!q.trim()){document.getElementById("si").textContent="";return;}
@@ -1081,70 +1205,27 @@ function panTo(id){
   svg.transition().duration(400).call(zb.transform,d3.zoomIdentity.translate((cw.width||1000)/2-t.k*(n.x||0),(cw.height||650)/3-t.k*(n.y||0)).scale(t.k));
   setTimeout(updateLanes,420);
 }
-
-refresh();
-// Only reset layout if no saved positions exist — otherwise restore from IPOS
-const hasSavedPos = Object.keys(IPOS).length > 0;
-if(hasSavedPos){
-  // Restore saved positions: mark all IPOS nodes as manual so layout respects them
-  Object.entries(IPOS).forEach(([id,p])=>{
-    if(p && p.x != null) uP[id]={x:p.x,y:p.y,manual:true};
-  });
-  computeRTLayout(false);
-  tick(); updateLanes();
-  setTimeout(doFit,80);
-} else {
-  doColumnLayout(true);
-}
-// Only pan to focus if no saved positions — if positions are saved,
-// user is already viewing where they want to be
-if(FOCUSID && !hasSavedPos) setTimeout(()=>panTo(FOCUSID),900);
-
-// Listen for position restore from localStorage (pushed by parent page on load)
-window.addEventListener("message", function(e){
-  try{
-    const d = typeof e.data === "string" ? JSON.parse(e.data) : e.data;
-    if(d && d.type === "fta_restore_pos"){
-      let changed = false;
-      Object.entries(d.data).forEach(([id,p])=>{
-        if(p && p.x != null && !uP[id]?.manual){
-          uP[id]={x:p.x,y:p.y,manual:p.manual||false};
-          changed = true;
-        }
-      });
-      if(changed){ computeRTLayout(false); tick(); updateLanes(); }
-    }
-  }catch(err){}
-});
-
-// ── Multi-select ──────────────────────────────────────────────────────
-function toggleMultiSel(id, e){
+function toggleMultiSel(id,e){
   if(multiSel.has(id)) multiSel.delete(id);
   else multiSel.add(id);
   updateMultiSelUI();
   sendMultiSel();
 }
-
 function updateMultiSelUI(){
   const msp=document.getElementById("msp");
   const count=multiSel.size;
   document.getElementById("msc").textContent=count;
-  // Render chip list
   const list=document.getElementById("mslist");
   list.innerHTML="";
   multiSel.forEach(id=>{
     const n=NM[id]; if(!n) return;
     const chip=document.createElement("span");
-    chip.style.cssText=`background:#0a1a2e;border:1px solid ${n.color};color:${n.color};
-      font-size:9px;padding:1px 6px;border-radius:10px;font-family:monospace;
-      font-weight:700;cursor:pointer;white-space:nowrap;`;
-    chip.title="Click to deselect";
-    chip.textContent=(n.nodeId||n.id)+" "+n.name.slice(0,18)+(n.name.length>18?"…":"");
+    chip.style.cssText=`background:#0a1a2e;border:1px solid ${n.color};color:${n.color};font-size:9px;padding:1px 6px;border-radius:10px;font-family:monospace;font-weight:700;cursor:pointer;`;
+    chip.textContent=(n.nodeId||n.id)+" "+n.name.slice(0,18);
     chip.onclick=()=>{multiSel.delete(id);updateMultiSelUI();sendMultiSel();};
     list.appendChild(chip);
   });
   msp.style.display=count>0?"block":"none";
-  // Rehighlight all nodes
   ng.selectAll("g.nd").each(function(d){
     const isSel=multiSel.has(d.id);
     const el=d3.select(this);
@@ -1156,12 +1237,10 @@ function updateMultiSelUI(){
     el.attr("opacity",count>0?(isSel?1:0.25):d.isRoot?0.75:1);
   });
 }
-
 function clearMultiSel(){
   multiSel.clear();
   updateMultiSelUI();
   sendMultiSel();
-  // Restore normal opacity
   ng.selectAll("g.nd").each(function(d){
     d3.select(this).attr("opacity",d.isRoot?0.75:1)
       .select("rect.nb")
@@ -1171,37 +1250,45 @@ function clearMultiSel(){
       .attr("filter",null);
   });
 }
-
 function sendMultiSel(){
   try{
     window.parent.postMessage(JSON.stringify({
       type:"fta_multisel",
       data: Array.from(multiSel).map(id=>{
         const n=NM[id]||{};
-        return {id,name:n.name||id,nodeId:n.nodeId||id,type:n.type||"",
-                color:n.color||"#888",parents:n.parents||[],children:n.children||[]};
+        return {id,name:n.name||id,nodeId:n.nodeId||id,type:n.type||"",color:n.color||"#888",parents:n.parents||[],children:n.children||[]};
       })
     }),"*");
   }catch(e){}
 }
-
-// ── Position save-back ────────────────────────────────────────────
 function savePositions(){
   const pos={};
-  // Save ALL positions — manual and auto — so full layout is preserved
-  sN.forEach(n=>{
-    if(n.x!=null && n.y!=null)
-      pos[n.id]={x:Math.round(n.x),y:Math.round(n.y),manual:!!(uP[n.id]?.manual)};
-  });
-  try{
-    window.parent.postMessage(JSON.stringify({type:"fta_pos",data:pos}),"*");
-  }catch(e){}
+  sN.forEach(n=>{if(n.x!=null&&n.y!=null)pos[n.id]={x:Math.round(n.x),y:Math.round(n.y),manual:!!(uP[n.id]?.manual)};});
+  try{window.parent.postMessage(JSON.stringify({type:"fta_pos",data:pos}),"*");}catch(e){}
 }
-setInterval(savePositions, 15000);
-document.addEventListener("pointerup", ()=>setTimeout(savePositions,300));
+setInterval(savePositions,15000);
+document.addEventListener("pointerup",()=>setTimeout(savePositions,300));
+
+refresh();
+const hasSavedPos=Object.keys(IPOS).length>0;
+if(hasSavedPos){
+  Object.entries(IPOS).forEach(([id,p])=>{if(p&&p.x!=null)uP[id]={x:p.x,y:p.y,manual:true};});
+  computeRTLayout(false); tick(); updateLanes();
+  setTimeout(doFit,80);
+} else {doColumnLayout(true);}
+if(FOCUSID&&!hasSavedPos) setTimeout(()=>panTo(FOCUSID),900);
+window.addEventListener("message",function(e){
+  try{
+    const d=typeof e.data==="string"?JSON.parse(e.data):e.data;
+    if(d&&d.type==="fta_restore_pos"){
+      let changed=false;
+      Object.entries(d.data).forEach(([id,p])=>{if(p&&p.x!=null&&!uP[id]?.manual){uP[id]={x:p.x,y:p.y,manual:p.manual||false};changed=true;}});
+      if(changed){computeRTLayout(false);tick();updateLanes();}
+    }
+  }catch(err){}
+});
 </script></body></html>"""
 
-    # Substitute data placeholders
     html = html.replace("__NODES__", nodes_js)
     html = html.replace("__LINKS__", links_js)
     html = html.replace("__IPOS__",  init_pos_js)
@@ -1254,7 +1341,6 @@ GITHUB_TOKEN = get_secret("GITHUB_TOKEN")
 GIST_ID      = get_secret("GIST_ID")
 configured   = bool(GITHUB_TOKEN and GIST_ID)
 
-# ── Load on first run ─────────────────────────────────────────────────────
 if configured and not st.session_state.gist_loaded:
     with st.spinner("Loading from Gist..."):
         st.session_state.file_list = list_gist_files(GITHUB_TOKEN, GIST_ID)
@@ -1271,7 +1357,6 @@ if configured and not st.session_state.gist_loaded:
         else:
             _loaded = []
         st.session_state.nodes = _loaded
-        # Restore saved positions from node _pos fields
         _restored_pos = extract_positions(_loaded)
         if _restored_pos:
             st.session_state["_pending_positions"] = _restored_pos
@@ -1295,14 +1380,11 @@ def save_current(nodes=None, filename=None, status_label=None):
     return False
 
 def set_nodes(n, recalc=False):
-    """Save nodes. Injects any pending canvas positions into _pos fields so
-    layout survives page refresh. Call with recalc=True to run calculation."""
     if recalc:
         n = recalculate(n)
         st.session_state.nodes_since_calc = 0
         st.session_state.pending_node_names = []
         st.session_state.nodes_hash = ""
-    # Inject latest canvas positions into node data
     pending_pos = st.session_state.get("_pending_positions", {})
     if pending_pos:
         n = inject_positions(n, pending_pos)
@@ -1352,1536 +1434,559 @@ st.markdown(f"""
 if not configured:
     st.warning("Gist not configured — data resets on refresh. Add GITHUB_TOKEN + GIST_ID to Streamlit secrets.")
 
-# ── Sidebar ───────────────────────────────────────────────────────────────
+# ── Main tabs ─────────────────────────────────────────────────────────────
+tab_tree, tab_verify, tab_hier, tab_data, tab_search = st.tabs([
+    "🌳 TREE", "🔬 VERIFY", "📋 HIERARCHY", "📊 DATA", "🔍 SEARCH"
+])
+
+# ── Sidebar (unchanged — render_sidebar inline) ───────────────────────────
 @st.fragment
 def render_sidebar():
-    """
-    @st.fragment means this function reruns in isolation when its buttons are
-    clicked — the main page (and the tree iframe) is NOT re-rendered.
-    The tree only re-renders when the user explicitly presses CALCULATE or
-    switches the hazard filter dropdown on the main page.
-    """
     nodes  = st.session_state.nodes
     by_id  = {n["id"]: n for n in nodes}
     hazards = [n for n in nodes if n["type"] == "HAZARD"]
 
-    # ── SELECTION PANEL — shown when nodes are multi-selected ─────────────
-    sel_ids = st.session_state.get("multisel_ids", [])
+    sel_ids   = st.session_state.get("multisel_ids", [])
     sel_nodes = [by_id[i] for i in sel_ids if i in by_id]
 
     if sel_nodes:
         st.markdown(f"""
         <div style="background:#080f1a;border:2px solid #4fc3f7;border-radius:8px;
-                    padding:8px 12px;margin-bottom:10px;">
-          <div style="font-size:9px;color:#4fc3f7;font-weight:700;letter-spacing:2px;
-                      margin-bottom:6px;">⬡ SELECTION — {len(sel_nodes)} NODES</div>
-          <div style="display:flex;flex-wrap:wrap;gap:3px;margin-bottom:8px;">
-            {''.join(f'<span style="background:#0a1a2e;border:1px solid {LEVEL_COLORS.get(n["type"],"#888")};color:{LEVEL_COLORS.get(n["type"],"#888")};font-size:8px;padding:1px 6px;border-radius:10px;font-family:monospace;font-weight:700;">{esc(n.get("nodeId",n["id"]))}</span>' for n in sel_nodes)}
-          </div>
-        </div>""", unsafe_allow_html=True)
+                    padding:10px 14px;margin-bottom:8px;">
+          <div style="font-size:8px;color:#4fc3f7;font-weight:700;letter-spacing:2px;margin-bottom:4px;">
+            SELECTION — {len(sel_nodes)} NODES
+          </div>""", unsafe_allow_html=True)
+        for sn in sel_nodes[:5]:
+            c = LEVEL_COLORS.get(sn["type"],"#888")
+            st.markdown(
+                f"<div style='font-size:9px;color:{c};font-family:monospace;padding:1px 0;'>"
+                f"{'◈ ' if len(sn.get('parentIds') or [])>1 else ''}"
+                f"{esc(sn.get('nodeId',sn['id']))} {esc(sn['name'][:28])}</div>",
+                unsafe_allow_html=True)
+        if len(sel_nodes) > 5:
+            st.markdown(f"<div style='font-size:9px;color:#555;'>+ {len(sel_nodes)-5} more</div>",
+                        unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-        if len(sel_nodes) >= 2:
-            st.markdown("<div style='font-size:9px;color:#aaa;margin-bottom:4px;font-weight:700;'>ACTIONS</div>",
+    with st.expander("📁 FILES", expanded=False):
+        if configured:
+            fl = st.session_state.file_list
+            named_files = [f for f in fl if is_named(f)]
+            if named_files:
+                cur = st.session_state.active_file
+                idx = named_files.index(cur) if cur in named_files else 0
+                chosen = st.selectbox("File", named_files, index=idx, key="file_sel",
+                                      label_visibility="collapsed")
+                if chosen != st.session_state.active_file:
+                    st.session_state.active_file = chosen
+                    _l = load_gist_file(GITHUB_TOKEN, GIST_ID, chosen)
+                    st.session_state.nodes = _l
+                    _rp = extract_positions(_l)
+                    if _rp:
+                        st.session_state["_pending_positions"] = _rp
+                        st.session_state.tree_state["positions"] = _rp
+                    st.rerun()
+            new_fname = st.text_input("New file name", placeholder="project_v2.json", key="new_fname")
+            if st.button("＋ Create", use_container_width=True) and new_fname.strip():
+                fn = new_fname.strip()
+                if not fn.endswith(".json"): fn += ".json"
+                save_gist_file(GITHUB_TOKEN, GIST_ID, fn, [])
+                st.session_state.active_file = fn
+                st.session_state.nodes = []
+                st.session_state.file_list = list_gist_files(GITHUB_TOKEN, GIST_ID)
+                st.rerun()
+        else:
+            st.markdown("<div style='font-size:9px;color:#555;'>Configure Gist to use files.</div>",
                         unsafe_allow_html=True)
 
-            # ── Determine existing relationships ──────────────────────
-            pairs = [(sel_nodes[i], sel_nodes[j])
-                     for i in range(len(sel_nodes))
-                     for j in range(i+1, len(sel_nodes))]
-
-            connected_pairs = [
-                (a, b) for a, b in pairs
-                if b["id"] in (a.get("parentIds") or []) or a["id"] in (b.get("parentIds") or [])
-            ]
-
-            # ── Action 1: Link as parent→child ─────────────────────────
-            with st.expander("🔗 Link (set parent → child)", expanded=True):
-                st.markdown("<div style='font-size:9px;color:#777;margin-bottom:4px;'>Pick which node is the PARENT and which is the CHILD:</div>",
-                            unsafe_allow_html=True)
-                node_labels = {f"{n.get('nodeId',n['id'])} — {n['name'][:28]}": n["id"] for n in sel_nodes}
-                parent_lbl = st.selectbox("Parent", list(node_labels.keys()), key="ms_parent")
-                child_lbl  = st.selectbox("Child",  [l for l in node_labels if l != parent_lbl],
-                                           key="ms_child")
-                parent_id  = node_labels[parent_lbl]
-                child_id   = node_labels[[l for l in node_labels if l != parent_lbl][0]] \
-                             if child_lbl not in node_labels else node_labels[child_lbl]
-                if st.button("🔗 Add parent→child link", use_container_width=True, type="primary",
-                             key="ms_link"):
-                    upd = []
-                    for n in nodes:
-                        n = dict(n)
-                        if n["id"] == child_id:
-                            pids = list(n.get("parentIds") or [])
-                            if parent_id not in pids:
-                                pids.append(parent_id)
-                            n["parentIds"] = pids
-                        upd.append(n)
-                    st.session_state.nodes_since_calc += 1
-                    st.session_state.multisel_ids = []
-                    set_nodes(upd)
-                    st.success(f"Linked: {parent_lbl} → {child_lbl}")
-                    st.rerun(scope="app")
-
-            # ── Action 2: Make same node (sync nodeId) ─────────────────
-            with st.expander("◈ Mark as same failure (sync Node ID)"):
-                st.markdown(
-                    "<div style='font-size:9px;color:#777;margin-bottom:4px;line-height:1.5;'>"
-                    "Makes all selected nodes carry the same Node ID — they become "
-                    "duplicate instances of the same failure. Pick which ID to use:</div>",
+    with st.expander("📥 IMPORT / EXPORT", expanded=False):
+        st.markdown("<div style='font-size:9px;color:#555;letter-spacing:1px;margin-bottom:4px;'>IMPORT</div>",
                     unsafe_allow_html=True)
-                id_opts = [n.get("nodeId", n["id"]) for n in sel_nodes]
-                chosen_nid = st.selectbox("Node ID to use", id_opts, key="ms_nid")
-                if st.button("◈ Sync Node IDs", use_container_width=True, key="ms_sync"):
-                    upd = []
-                    for n in nodes:
-                        n = dict(n)
-                        if n["id"] in sel_ids:
-                            n["nodeId"] = chosen_nid
-                        upd.append(n)
-                    st.session_state.nodes_since_calc += 1
-                    st.session_state.multisel_ids = []
-                    set_nodes(upd)
-                    st.success(f"All selected nodes now share Node ID: {chosen_nid}")
-                    st.rerun(scope="app")
+        up = st.file_uploader("Upload JSON", type=["json"], key="json_up",
+                               label_visibility="collapsed")
+        if up:
+            try:
+                raw = json.loads(up.read())
+                for n in raw:
+                    n.setdefault("nodeId", n.get("id",""))
+                    n.setdefault("ftLabel","")
+                    n.setdefault("fixedValue",None)
+                    n.setdefault("targetValue",None)
+                    n.setdefault("calculatedValue",None)
+                    n.setdefault("parentIds",[])
+                    n.setdefault("gate","OR")
+                    n.setdefault("type","IF")
+                set_nodes(raw, recalc=True)
+                st.success(f"Imported {len(raw)} nodes")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Import failed: {e}")
 
-            # ── Action 3: Break connection ──────────────────────────────
-            if connected_pairs:
-                with st.expander("✂️ Break connection"):
-                    st.markdown("<div style='font-size:9px;color:#777;margin-bottom:4px;'>Connected pairs found:</div>",
-                                unsafe_allow_html=True)
-                    for a, b in connected_pairs:
-                        # Determine direction
-                        if b["id"] in (a.get("parentIds") or []):
-                            child_n, parent_n = a, b
-                        else:
-                            child_n, parent_n = b, a
-                        label = f"{child_n.get('nodeId',child_n['id'])} ← {parent_n.get('nodeId',parent_n['id'])}"
-                        if st.button(f"✂️ Break: {label}", key=f"ms_brk_{child_n['id']}_{parent_n['id']}",
-                                     use_container_width=True):
-                            upd = []
-                            for n in nodes:
-                                n = dict(n)
-                                if n["id"] == child_n["id"]:
-                                    n["parentIds"] = [p for p in (n.get("parentIds") or [])
-                                                      if p != parent_n["id"]]
-                                upd.append(n)
-                            st.session_state.nodes_since_calc += 1
-                            st.session_state.multisel_ids = []
-                            set_nodes(upd)
-                            st.success(f"Broke connection: {label}")
-                            st.rerun(scope="app")
-
-        # Clear selection button
-        if st.button("✕ Clear selection", use_container_width=True, key="ms_clear"):
-            st.session_state.multisel_ids = []
-            try: st.query_params.pop("msel", None)
-            except: pass
-            st.rerun(scope="app")
-
-        st.markdown("---")
-
-    # ── Manual selection builder (always visible, compact) ────────────────
-    with st.expander("⬡ SELECT NODES (Ctrl+click in tree, or pick here)", expanded=False):
-        st.markdown("<div style='font-size:9px;color:#777;margin-bottom:4px;'>Pick nodes to add to the selection panel above:</div>",
+        st.markdown("<div style='font-size:9px;color:#555;letter-spacing:1px;margin:8px 0 4px;'>EXPORT</div>",
                     unsafe_allow_html=True)
-        all_opts = {f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name'][:30]}": n["id"]
-                    for n in nodes}
-        cur_labels = [lbl for lbl, nid in all_opts.items()
-                      if nid in st.session_state.get("multisel_ids", [])]
-        picked = st.multiselect("Nodes", list(all_opts.keys()),
-                                default=cur_labels, key="ms_manual_pick",
-                                label_visibility="collapsed")
-        if st.button("✓ Apply selection", use_container_width=True, key="ms_apply"):
-            st.session_state.multisel_ids = [all_opts[l] for l in picked]
-            st.rerun(scope="app")
+        if nodes:
+            st.download_button("↓ JSON", export_json(nodes),
+                               file_name=f"fta_{now_str()}.json", mime="application/json",
+                               use_container_width=True)
+            cypher_data = export_cypher(nodes)
+            st.download_button("↓ Cypher (Neo4j)", cypher_data,
+                               file_name=f"fta_{now_str()}.cypher", mime="text/plain",
+                               use_container_width=True)
+            xl = export_excel(nodes)
+            if xl:
+                st.download_button("↓ Excel", xl,
+                                   file_name=f"fta_{now_str()}.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                   use_container_width=True)
 
-    st.markdown("---")
-
-    # ── Floating root nodes warning ───────────────────────────────────────
-    unpinned_roots = [n for n in nodes
-                      if n["type"] != "HAZARD"
-                      and not n.get("parentIds")
-                      and n.get("fixedValue") is None
-                      and n.get("calculatedValue") is None]
-    if unpinned_roots:
-        names = ", ".join(n.get("nodeId", n["id"]) for n in unpinned_roots[:3])
-        if len(unpinned_roots) > 3: names += f" +{len(unpinned_roots)-3} more"
-        st.markdown(f"""
-        <div style="background:#1a0000;border:2px solid #ff4d4d;border-radius:7px;
-                    padding:8px 12px;margin-bottom:8px;">
-          <div style="font-size:9px;color:#ff4d4d;font-weight:700;letter-spacing:1px;
-                      margin-bottom:4px;">⚠ FLOATING NODES NEED A VALUE</div>
-          <div style="font-size:9px;color:#cc8888;line-height:1.6;">
-            <b style="color:#ff6666;">{esc(names)}</b><br>
-            These root nodes have no parent and no pinned value.<br>
-            Their children <b>cannot receive calculated values</b>.<br>
-            → Go to <b>EDIT</b> tab → select the node → <b>📌 Pin to fixed value</b>
-          </div>
-        </div>""", unsafe_allow_html=True)
-
-    # FILE MANAGER
-    with st.expander("📁 FILE MANAGER", expanded=False):
-        st.markdown(f"<div style='font-size:10px;color:#ff8c42;font-weight:700;margin-bottom:6px;'>▶ {st.session_state.active_file}</div>", unsafe_allow_html=True)
-        new_name = st.text_input("Save as name", placeholder="e.g. baseline", key="ns_name", label_visibility="collapsed")
-        c1,c2 = st.columns(2)
-        with c1:
-            if st.button("💾 Save As", use_container_width=True):
-                fn = new_name.strip()
-                if fn:
-                    if not fn.endswith(".json"): fn += ".json"
-                    if save_current(filename=fn, status_label=f"Saved as '{fn}' at {datetime.now().strftime('%H:%M:%S')}"):
-                        st.session_state.active_file = fn; st.rerun(scope="app")
-        with c2:
-            if st.button("📸 Snapshot", use_container_width=True):
-                snap = f"snapshot_{now_str()}.json"
-                save_current(filename=snap, status_label=f"Snapshot: {snap}"); st.rerun(scope="app")
-        if configured:
-            if st.button("🔄 Refresh", use_container_width=True):
-                st.session_state.file_list = list_gist_files(GITHUB_TOKEN, GIST_ID); st.rerun(scope="app")
-            named = [f for f in st.session_state.file_list if is_named(f)]
-            snaps = sorted([f for f in st.session_state.file_list if is_snap(f)], reverse=True)
-            if named:
-                st.markdown("<div style='font-size:9px;color:#ff8c42;margin:6px 0 3px;'>NAMED FILES</div>", unsafe_allow_html=True)
-                for fn in named:
-                    ia = fn == st.session_state.active_file
-                    ca,cb,cc = st.columns([5,2,2])
-                    with ca: st.markdown(f"<div style='font-size:10px;color:{'#ff8c42' if ia else '#aaa'};padding:3px 0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;'>{'▶ ' if ia else ''}{fn}</div>", unsafe_allow_html=True)
-                    with cb:
-                        if st.button("Load", key=f"l_{fn}"):
-                            st.session_state.nodes = load_gist_file(GITHUB_TOKEN, GIST_ID, fn)
-                            st.session_state.active_file = fn
-                            st.session_state.save_status = "loaded"
-                            st.session_state.save_msg = f"Loaded '{fn}'"
-                            st.session_state.selected_id = None
-                            st.session_state.nodes_since_calc = 0
-                            st.session_state.pending_node_names = []
-                            st.session_state.nodes_hash = ""
-                            st.rerun(scope="app")
-                    with cc:
-                        if not ia and st.button("Del", key=f"d_{fn}"):
-                            del_gist_file(GITHUB_TOKEN, GIST_ID, fn)
-                            st.session_state.file_list = list_gist_files(GITHUB_TOKEN, GIST_ID); st.rerun(scope="app")
-            if snaps:
-                st.markdown("<div style='font-size:9px;color:#4fc3f7;margin:8px 0 3px;'>SNAPSHOTS (last 5)</div>", unsafe_allow_html=True)
-                for fn in snaps[:5]:
-                    short = fn.replace("snapshot_","").replace(".json","")
-                    ca,cb,cc = st.columns([5,2,2])
-                    with ca: st.markdown(f"<div style='font-size:9px;color:#4fc3f7;padding:3px 0;'>📸 {short}</div>", unsafe_allow_html=True)
-                    with cb:
-                        if st.button("Load", key=f"l_{fn}"):
-                            st.session_state.nodes = load_gist_file(GITHUB_TOKEN, GIST_ID, fn)
-                            st.session_state.active_file = fn
-                            st.session_state.save_status = "loaded"
-                            st.session_state.save_msg = f"Loaded snapshot '{fn}'"
-                            st.session_state.selected_id = None
-                            st.session_state.nodes_since_calc = 0
-                            st.session_state.pending_node_names = []
-                            st.session_state.nodes_hash = ""
-                            st.rerun(scope="app")
-                    with cc:
-                        if st.button("Del", key=f"d_{fn}"):
-                            del_gist_file(GITHUB_TOKEN, GIST_ID, fn)
-                            st.session_state.file_list = list_gist_files(GITHUB_TOKEN, GIST_ID); st.rerun(scope="app")
-
-    st.markdown("---")
-
-    # NODE EDITOR
-    st.markdown("### 🔧 NODE EDITOR")
-    tab_add, tab_edit, tab_shared = st.tabs(["➕ ADD", "✏️ EDIT", "🔗 SHARED"])
-
-    with tab_add:
-        # Add Hazard
-        st.markdown("<div style='font-size:9px;color:#ff4d4d;letter-spacing:2px;margin-bottom:4px;'>ADD HAZARD</div>", unsafe_allow_html=True)
-        h_name = st.text_input("Hazard Name", placeholder="e.g. Engine Fire", key="h_name")
-        h_val  = st.text_input("Target Rate", placeholder="e.g. 1e-7", key="h_val")
-        if st.button("➕ ADD HAZARD", use_container_width=True):
-            if h_name.strip():
-                try:
-                    val = float(h_val)
-                    nid = str(uuid.uuid4())[:7]
-                    node = {"id": nid, "nodeId": nid, "name": h_name.strip(),
-                            "type": "HAZARD", "gate": "OR",
-                            "targetValue": val, "calculatedValue": val, "parentIds": []}
-                    st.session_state.tree_state["focus_id"] = nid
-                    st.session_state.tree_filter = nid
-                    set_nodes(nodes + [node])  # no recalc needed for HAZARD
-                    st.rerun()
-                except ValueError:
-                    st.error("Invalid rate — use e.g. 1e-7")
-            else:
-                st.error("Enter hazard name")
+    # ── HAZARD MANAGEMENT ────────────────────────────────────────────────
+    with st.expander("⚠ HAZARDS", expanded=True):
+        hname = st.text_input("Hazard name", placeholder="Loss of Propulsion", key="haz_name")
+        htgt  = st.text_input("Target probability", placeholder="1e-7", key="haz_tgt")
+        hgate = st.radio("Gate", ["OR","AND"], horizontal=True, key="haz_gate")
+        if st.button("＋ ADD HAZARD", use_container_width=True, type="primary"):
+            if hname.strip():
+                try:    tv = float(htgt) if htgt.strip() else 1e-7
+                except: tv = 1e-7
+                nid = str(uuid.uuid4())[:7]
+                new_h = {"id":nid,"nodeId":f"HAZ-{len(hazards)+1}","ftLabel":"",
+                         "name":hname.strip(),"type":"HAZARD","gate":hgate,
+                         "fixedValue":None,"targetValue":tv,"calculatedValue":tv,"parentIds":[]}
+                st.session_state.tree_state["focus_id"] = nid
+                set_nodes(nodes + [new_h])
+                st.rerun()
 
         if hazards:
             st.markdown("---")
-            st.markdown("<div style='font-size:9px;color:#ff8c42;letter-spacing:2px;margin-bottom:4px;'>ADD CHILD NODE</div>", unsafe_allow_html=True)
-
-            with st.expander("💡 Mixed AND/OR gate guide"):
-                st.markdown("""
-**Use a GROUP node for Combined Faults:**
-
-*SF-14 (OR) → two AND groups:*
-- SF-14 gate=OR
-- "Combined Faults A" type=GROUP, gate=AND, parent=SF-14 → FF-01, FF-02
-- "Combined Faults B" type=GROUP, gate=AND, parent=SF-14 → IF-016, IF-208
-
-*FF-05 (mixed):*
-- FF-05 gate=OR, direct children: IF-286, IF-287, IF-288
-- "Combined Faults" type=GROUP, gate=AND, parent=FF-05 → IF-293, IF-289
-
-GROUP = purple oval. AND edges = dashed. Shared edges = yellow dashes.
-                """)
-
-            node_name = st.text_input("Node Name", placeholder="e.g. Pack mechanical damage due to crash", key="add_name")
-
-            # ── Node ID (mandatory) — split into type prefix + number ──
-            # Column 1: prefix dropdown (SF, FF, IF, GROUP)
-            # Column 2: alphanumeric number (196, 23a, 56b)
-            # Column 3: FT Label (optional, e.g. FT-46)
-            st.markdown("<div style='font-size:9px;color:#ff8c42;font-weight:700;letter-spacing:1px;margin:4px 0 2px 0;'>NODE ID ★ required</div>", unsafe_allow_html=True)
-            c_prefix, c_num, c_ft = st.columns([1, 1, 1])
-            with c_prefix:
-                id_prefix = st.selectbox(
-                    "Type",
-                    ["IF", "FF", "SF", "GROUP", "HAZ", "OTHER"],
-                    key="add_id_prefix",
-                    label_visibility="collapsed",
-                    help="Node type prefix: IF / FF / SF / GROUP / HAZ"
-                )
-            with c_num:
-                id_num = st.text_input(
-                    "Number",
-                    placeholder="e.g. 196, 23a, 56b",
-                    key="add_id_num",
-                    label_visibility="collapsed",
-                    help="Alphanumeric part of the ID e.g. 196, 23a, 56b"
-                )
-            with c_ft:
-                ft_label = st.text_input(
-                    "FT Label",
-                    placeholder="FT-46 (optional)",
-                    key="add_ft",
-                    label_visibility="collapsed",
-                    help="Fault tree reference label e.g. FT-46"
-                )
-
-            # Compose full Node ID from prefix + number
-            id_num_clean = id_num.strip()
-            ft_clean     = ft_label.strip()
-            cid_clean    = f"{id_prefix}-{id_num_clean}" if id_num_clean else ""
-
-            # ── Live search: check BOTH nodeId AND name ───────────────
-            # nodeId search: exact match (IF-196 ≠ IF-195)
-            # Name search: case-insensitive contains (partial match)
-            id_matches   = []   # exact nodeId match
-            name_matches = []   # name contains typed string
-
-            if len(cid_clean) >= 2:
-                id_matches = [
-                    n for n in nodes
-                    if (n.get("nodeId") or "").strip() == cid_clean
-                    and (n.get("nodeId") or "").strip() != ""
-                ]
-
-            if len(node_name.strip()) >= 4:
-                lname = node_name.strip().lower()
-                name_matches = [
-                    n for n in nodes
-                    if lname in (n.get("name") or "").lower()
-                    and n not in id_matches  # don't double-show
-                ]
-
-            # ── Parent selector (MUST come before match cards so sel_pids is defined) ──
-            # Parent options: standard parent types + any floating root nodes
-            _root_nodes = [n for n in nodes
-                           if n["type"] not in ("HAZARD",) + tuple(VALID_CHILD_TYPES)
-                           or (n["type"] in VALID_CHILD_TYPES and not n.get("parentIds"))]
-            parent_opts = {f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name']}": n["id"]
-                           for n in nodes
-                           if n["type"] in VALID_PARENT_TYPES
-                           or (n["type"] in VALID_CHILD_TYPES and not n.get("parentIds"))}
-            sel_labels  = st.multiselect("Parent Node(s)", list(parent_opts.keys()), key="add_par")
-            sel_pids    = [parent_opts[l] for l in sel_labels]
-
-            if not sel_pids and cid_clean:
-                st.markdown("""
-                <div style="background:#0d1a0d;border:1.5px solid #4caf7d44;border-radius:6px;
-                            padding:6px 10px;margin:2px 0 4px 0;">
-                  <span style="font-size:9px;color:#4caf7d;font-weight:700;">ℹ ROOT NODE MODE</span>
-                  <div style="font-size:9px;color:#777;margin-top:2px;line-height:1.5;">
-                    No parent selected — node will be created as a <b style="color:#4caf7d;">root node</b>
-                    (no parent, floats independently).<br>
-                    Use this when a node like FF-32 exists in a second hazard without a parent chain above it.<br>
-                    You can connect it later via the <b>EDIT</b> tab or by using
-                    <b>◈ Place under selected parent(s)</b> when adding another node with the same ID.
-                  </div>
-                </div>""", unsafe_allow_html=True)
-
-            # ── Render search results ─────────────────────────────────
-            def render_match_card(matches, match_type):
-                for ex in matches:
-                    ex_color  = LEVEL_COLORS.get(ex["type"], "#888")
-                    ex_pids   = ex.get("parentIds") or []
-                    ex_pnames = " · ".join(by_id[p]["name"] for p in ex_pids if p in by_id) or "—"
-                    ex_val    = fmt(ex.get("calculatedValue"))
-                    ex_nid    = ex.get("nodeId", ex["id"])
-                    def find_hazards_of(node_id, depth=0):
-                        if depth > 8: return []
-                        n = by_id.get(node_id)
-                        if not n: return []
-                        if n["type"] == "HAZARD": return [n["name"]]
-                        result = []
-                        for pid in (n.get("parentIds") or []):
-                            result.extend(find_hazards_of(pid, depth+1))
-                        return list(dict.fromkeys(result))
-                    ex_fts    = find_hazards_of(ex["id"])
-                    ex_ft_str = " · ".join(ex_fts) if ex_fts else "—"
-
-                    st.markdown(f"""
-                    <div style="background:#080f1a;border:1.5px solid #4fc3f7;
-                                border-radius:7px;padding:9px 12px;margin:3px 0 4px 0;">
-                      <div style="font-size:8px;color:#4fc3f7;font-weight:700;
-                                  letter-spacing:1px;margin-bottom:4px;">⚠ NODE ALREADY EXISTS</div>
-                      <div style="display:flex;align-items:center;gap:8px;margin-bottom:3px;">
-                        <code style="background:#0a1a2e;color:#4fc3f7;padding:1px 6px;
-                               border-radius:3px;font-size:10px;font-weight:700;">{ex_nid}</code>
-                        <span style="font-size:10px;color:{ex_color};font-weight:700;">{esc(ex['name'])}</span>
-                        <span style="font-size:9px;color:#555;">[{ex['type']} · {ex['gate']}]</span>
-                      </div>
-                      <div style="font-size:9px;color:#777;line-height:1.7;">
-                        <b style="color:#555;">Value:</b>
-                        <span style="font-family:monospace;color:{ex_color};">{ex_val}</span>
-                        &nbsp;·&nbsp;<b style="color:#555;">In FT:</b> {ex_ft_str}<br>
-                        <b style="color:#555;">Current parents:</b> {ex_pnames}
-                      </div>
-                      <div style="font-size:9px;color:#4fc3f7;margin-top:5px;line-height:1.5;">
-                        ℹ Same failure — same node, new location.<br>
-                        Select parent(s) above, then click below to place it there too.<br>
-                        It will appear with a <b style="color:#4fc3f7;">blue ◈</b> border in the tree.
-                      </div>
-                    </div>""", unsafe_allow_html=True)
-
-                    if st.button(f"◈ Place under selected parent(s)",
-                                 key=f"place_{ex['id']}",
-                                 use_container_width=True,
-                                 type="primary"):
-                        if not sel_pids:
-                            st.error("Select at least one parent above first")
-                        else:
-                            updated = []
-                            for n in nodes:
-                                if n["id"] == ex["id"]:
-                                    n = dict(n)
-                                    ep = list(n.get("parentIds") or [])
-                                    ep += [p for p in sel_pids if p not in ep]
-                                    n["parentIds"] = ep
-                                updated.append(n)
-                            st.session_state.tree_state["focus_id"] = ex["id"]
-                            st.session_state.nodes_since_calc += 1
-                            set_nodes(updated)
-                            st.success(f"✓ '{ex['name']}' now also appears under the new parent(s). Shown in blue in the tree.")
-                            st.rerun()
-
-            # Show name matches first, then ID matches
-            if name_matches:
-                render_match_card(name_matches, "name")
-            if id_matches:
-                render_match_card(id_matches, "id")
-
-            # ── ID validation banner ──────────────────────────────────
-            if not cid_clean:
+            for h in hazards:
+                c = "#ff4d4d"
+                tv = h.get("targetValue")
+                cv = h.get("calculatedValue")
                 st.markdown(
-                    "<div style='font-size:9px;color:#e94560;margin:2px 0 4px 0;'>★ Node ID is required</div>",
+                    f"<div style='background:#1a0a0a;border:1px solid {c}33;border-radius:5px;"
+                    f"padding:5px 8px;margin-bottom:3px;'>"
+                    f"<div style='font-size:10px;color:{c};font-weight:700;'>{esc(h['name'])}</div>"
+                    f"<div style='font-size:9px;color:#555;font-family:monospace;'>"
+                    f"target: {fmt(tv)} · calc: {fmt(cv)}</div></div>",
                     unsafe_allow_html=True)
-            elif len(cid_clean) >= 2 and not id_matches:
+
+    # ── NODE MANAGEMENT ──────────────────────────────────────────────────
+    tab_add, tab_edit, tab_shared = st.tabs(["➕ ADD", "✏️ EDIT", "⚡ SHARED"])
+
+    with tab_add:
+        nodes = st.session_state.nodes
+        by_id = {n["id"]: n for n in nodes}
+
+        node_name = st.text_input("Node name", placeholder="Valve fails to close", key="add_name")
+
+        nc1, nc2 = st.columns([2, 1])
+        with nc1:
+            valid_prefixes = ["IF","FF","SF","GROUP","HAZ","OTHER"]
+            add_prefix = st.selectbox("ID Prefix", valid_prefixes, key="add_prefix",
+                                      label_visibility="visible")
+        with nc2:
+            add_num = st.text_input("Number", placeholder="196", key="add_num",
+                                    label_visibility="visible")
+        add_ft = st.text_input("FT Label (optional)", placeholder="FT-46", key="add_ft",
+                               label_visibility="visible")
+        cid_clean = f"{add_prefix}-{add_num.strip()}" if add_num.strip() else ""
+        ft_clean  = re.sub(r'[^A-Za-z0-9\-_\.]','', add_ft.strip()) if add_ft.strip() else ""
+
+        # Duplicate detection
+        name_matches = [n for n in nodes if n["name"].lower() == node_name.strip().lower()] if node_name.strip() else []
+        id_matches   = [n for n in nodes if (n.get("nodeId","") or "").upper() == cid_clean.upper()] if cid_clean else []
+
+        def render_match_card(matches, match_type):
+            for ex in matches:
+                ex_color = LEVEL_COLORS.get(ex["type"],"#888")
+                ex_val   = fmt(ex.get("calculatedValue"))
+                ex_pnames = " · ".join(by_id[p]["name"] for p in (ex.get("parentIds") or []) if p in by_id) or "—"
+                ex_nid    = ex.get("nodeId", ex["id"])
+                def find_hazards_of(node_id, depth=0):
+                    if depth > 8: return []
+                    n = by_id.get(node_id)
+                    if not n: return []
+                    if n["type"] == "HAZARD": return [n["name"]]
+                    result = []
+                    for pid in (n.get("parentIds") or []):
+                        result.extend(find_hazards_of(pid, depth+1))
+                    return list(dict.fromkeys(result))
+                ex_fts    = find_hazards_of(ex["id"])
+                ex_ft_str = " · ".join(ex_fts) if ex_fts else "—"
                 st.markdown(f"""
-                <div style="background:#0a1a0a;border:1.5px solid #4caf7d;border-radius:6px;
-                            padding:5px 10px;margin:2px 0 4px 0;">
-                  <span style="font-size:9px;color:#4caf7d;font-weight:700;">
-                    ✓ {cid_clean} is available
-                  </span>
+                <div style="background:#080f1a;border:1.5px solid #4fc3f7;border-radius:7px;padding:9px 12px;margin:3px 0 4px 0;">
+                  <div style="font-size:8px;color:#4fc3f7;font-weight:700;letter-spacing:1px;margin-bottom:4px;">⚠ NODE ALREADY EXISTS</div>
+                  <div style="font-size:10px;color:{ex_color};font-weight:700;">{esc(ex['name'])}</div>
+                  <div style="font-size:9px;color:#777;">Value: <span style="font-family:monospace;color:{ex_color};">{ex_val}</span> · In FT: {ex_ft_str}</div>
+                  <div style="font-size:9px;color:#4fc3f7;margin-top:4px;">Same failure — select parent(s) below then click Place.</div>
                 </div>""", unsafe_allow_html=True)
-            node_type   = st.selectbox("Type", VALID_CHILD_TYPES, key="add_type",
-                                       help="GROUP = Combined Faults oval (placed between FF and IF layers)")
-            gate        = st.radio("Gate", ["OR","AND"], horizontal=True, key="add_gate")
-
-            use_fixed  = st.checkbox("📌 Pin to fixed value", key="add_use_fixed",
-                                     help="Overrides calculated value. Subtracts from parent budget, gives remainder to siblings.")
-            fixed_val_input = None
-            if use_fixed:
-                fixed_val_input = st.text_input("Fixed Value", placeholder="e.g. 1.67e-9 or 0",
-                                                key="add_fixed_val",
-                                                help="Node always carries this exact failure rate.")
-
-            # ── ADD NODE ──────────────────────────────────────────────
-            add_btn = st.button("✅ ADD NODE", use_container_width=True, type="primary",
-                                disabled=not cid_clean)
-
-            if add_btn:
-                if not cid_clean:
-                    st.error("★ Node ID is required — please enter a reference ID (e.g. IF-196)")
-                elif not node_name.strip():
-                    st.error("Enter a node name")
-                else:
-                    fv = None
-                    if use_fixed and fixed_val_input:
-                        try:    fv = float(fixed_val_input)
-                        except: st.error("Fixed value must be a number e.g. 1.67e-9"); fv = None
-                    # Build the display name — optionally include FT label
-                    display_name = node_name.strip()
-                    if ft_clean:
-                        display_name = f"[{ft_clean}] {display_name}"
-                    nid = str(uuid.uuid4())[:7]
-                    new_node = {
-                        "id":             nid,
-                        "nodeId":         cid_clean,
-                        "ftLabel":        ft_clean or "",
-                        "name":           display_name,
-                        "type":           node_type,
-                        "gate":           gate,
-                        "fixedValue":     fv,
-                        "targetValue":    None,
-                        "calculatedValue": fv,
-                        "parentIds":      sel_pids,
-                    }
-                    st.session_state.tree_state["focus_id"] = nid  # pan to the new node
-                    st.session_state.nodes_since_calc += 1
-                    pnn = st.session_state.get("pending_node_names", [])
-                    pnn.append(f"{cid_clean} {display_name[:30]}")
-                    st.session_state.pending_node_names = pnn[-20:]  # keep last 20
-                    set_nodes(nodes + [new_node])
-                    st.rerun()
-
-            st.markdown("---")
-            # Delete node
-            del_opts = {f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name']}": n["id"]
-                        for n in nodes if n["type"] != "HAZARD"}
-            if del_opts:
-                dl = st.selectbox("Delete Node", ["— select —"] + list(del_opts.keys()), key="del_sel")
-                if dl != "— select —":
-                    del_id = del_opts[dl]
-                    is_shared_child = any(
-                        del_id in (n.get("parentIds") or []) and len(n.get("parentIds") or []) > 1
-                        for n in nodes
-                    )
-                    if is_shared_child:
-                        st.markdown(
-                            "<div style='font-size:9px;color:#f5c518;background:#1a1200;"
-                            "border:1px solid #f5c51844;border-radius:5px;padding:5px 8px;margin:4px 0;'>"
-                            "⚠ Shared children will keep their other parents.</div>",
-                            unsafe_allow_html=True)
-                    if st.button("🗑 DELETE NODE", use_container_width=True):
-                        # Track which nodes were already root nodes BEFORE deletion
-                        pre_existing_roots = {
-                            n["id"] for n in nodes
-                            if n["type"] != "HAZARD" and not n.get("parentIds")
-                        }
-                        temp_nodes = [dict(n) for n in nodes if n["id"] != del_id]
-                        for n in temp_nodes:
-                            if del_id in (n.get("parentIds") or []):
-                                n["parentIds"] = [p for p in n["parentIds"] if p != del_id]
-                        changed = True
-                        while changed:
-                            changed = False
-                            orphan_ids = {
-                                n["id"] for n in temp_nodes
-                                if n["type"] != "HAZARD"
-                                and not n.get("parentIds")
-                                and n["id"] not in pre_existing_roots  # keep intentional roots
-                            }
-                            if orphan_ids:
-                                temp_nodes = [n for n in temp_nodes if n["id"] not in orphan_ids]
-                                for n in temp_nodes:
-                                    before = len(n.get("parentIds") or [])
-                                    n["parentIds"] = [p for p in (n.get("parentIds") or []) if p not in orphan_ids]
-                                    if len(n.get("parentIds") or []) != before:
-                                        changed = True
+                if st.button(f"◈ Place under selected parent(s)", key=f"place_{ex['id']}", use_container_width=True, type="primary"):
+                    cur_sel = sel_pids if sel_pids else []
+                    if not cur_sel:
+                        st.error("Select at least one parent above first")
+                    else:
+                        updated = []
+                        for n in nodes:
+                            if n["id"] == ex["id"]:
+                                n = dict(n)
+                                ep = list(n.get("parentIds") or [])
+                                ep += [p for p in cur_sel if p not in ep]
+                                n["parentIds"] = ep
+                            updated.append(n)
+                        st.session_state.tree_state["focus_id"] = ex["id"]
                         st.session_state.nodes_since_calc += 1
-                        set_nodes(temp_nodes)
+                        set_nodes(updated)
+                        st.success(f"✓ Placed under new parent(s).")
                         st.rerun()
 
-            st.markdown("---")
-            if st.button("🗑 CLEAR ALL NODES", use_container_width=True):
-                set_nodes([])
-                st.session_state.selected_id = None
-                st.session_state.nodes_since_calc = 0
-                st.session_state.pending_node_names = []
-                st.session_state.nodes_hash = ""
-                st.rerun(scope="app")
+        if name_matches: render_match_card(name_matches, "name")
+        if id_matches:   render_match_card(id_matches, "id")
+
+        if not cid_clean:
+            st.markdown("<div style='font-size:9px;color:#e94560;margin:2px 0 4px 0;'>★ Node ID required</div>", unsafe_allow_html=True)
+        elif len(cid_clean) >= 2 and not id_matches:
+            st.markdown(f"<div style='background:#0a1a0a;border:1px solid #4caf7d;border-radius:5px;padding:4px 8px;margin:2px 0 4px 0;'><span style='font-size:9px;color:#4caf7d;font-weight:700;'>✓ {cid_clean} available</span></div>", unsafe_allow_html=True)
+
+        parent_opts = {f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name']}": n["id"]
+                       for n in nodes if n["type"] in VALID_PARENT_TYPES
+                       or (n["type"] in VALID_CHILD_TYPES and not n.get("parentIds"))}
+        sel_labels = st.multiselect("Parent Node(s)", list(parent_opts.keys()), key="add_par")
+        sel_pids   = [parent_opts[l] for l in sel_labels]
+
+        node_type = st.selectbox("Type", VALID_CHILD_TYPES, key="add_type")
+        gate      = st.radio("Gate", ["OR","AND"], horizontal=True, key="add_gate")
+        use_fixed = st.checkbox("📌 Pin to fixed value", key="add_use_fixed")
+        fixed_val_input = None
+        if use_fixed:
+            fixed_val_input = st.text_input("Fixed Value", placeholder="1.67e-9", key="add_fixed_val")
+
+        add_btn = st.button("✅ ADD NODE", use_container_width=True, type="primary", disabled=not cid_clean)
+        if add_btn:
+            if not cid_clean:
+                st.error("Node ID is required")
+            elif not node_name.strip():
+                st.error("Enter a node name")
+            else:
+                fv = None
+                if use_fixed and fixed_val_input:
+                    try:    fv = float(fixed_val_input)
+                    except: st.error("Fixed value must be a number"); fv = None
+                display_name = node_name.strip()
+                if ft_clean:
+                    display_name = f"[{ft_clean}] {display_name}"
+                nid = str(uuid.uuid4())[:7]
+                new_node = {"id":nid,"nodeId":cid_clean,"ftLabel":ft_clean or "","name":display_name,
+                            "type":node_type,"gate":gate,"fixedValue":fv,"targetValue":None,
+                            "calculatedValue":fv,"parentIds":sel_pids}
+                st.session_state.tree_state["focus_id"] = nid
+                st.session_state.nodes_since_calc += 1
+                pnn = st.session_state.get("pending_node_names",[])
+                pnn.append(f"{cid_clean} {display_name[:30]}")
+                st.session_state.pending_node_names = pnn[-20:]
+                set_nodes(nodes + [new_node])
+                st.rerun()
+
+        st.markdown("---")
+        del_opts = {f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name']}": n["id"]
+                    for n in nodes if n["type"] != "HAZARD"}
+        if del_opts:
+            dl = st.selectbox("Delete Node", ["— select —"] + list(del_opts.keys()), key="del_sel")
+            if dl != "— select —":
+                del_id = del_opts[dl]
+                if st.button("🗑 DELETE NODE", use_container_width=True):
+                    pre_existing_roots = {n["id"] for n in nodes if n["type"] != "HAZARD" and not n.get("parentIds")}
+                    temp_nodes = [dict(n) for n in nodes if n["id"] != del_id]
+                    for n in temp_nodes:
+                        if del_id in (n.get("parentIds") or []):
+                            n["parentIds"] = [p for p in n["parentIds"] if p != del_id]
+                    changed = True
+                    while changed:
+                        changed = False
+                        orphan_ids = {n["id"] for n in temp_nodes if n["type"] != "HAZARD" and not n.get("parentIds") and n["id"] not in pre_existing_roots}
+                        if orphan_ids:
+                            temp_nodes = [n for n in temp_nodes if n["id"] not in orphan_ids]
+                            for n in temp_nodes:
+                                before = len(n.get("parentIds") or [])
+                                n["parentIds"] = [p for p in (n.get("parentIds") or []) if p not in orphan_ids]
+                                if len(n.get("parentIds") or []) != before: changed = True
+                    st.session_state.nodes_since_calc += 1
+                    set_nodes(temp_nodes)
+                    st.rerun()
+
+        st.markdown("---")
+        if st.button("🗑 CLEAR ALL", use_container_width=True):
+            set_nodes([])
+            st.session_state.selected_id = None
+            st.session_state.nodes_since_calc = 0
+            st.rerun(scope="app")
 
     with tab_edit:
-        nodes = st.session_state.nodes  # re-read — may have changed
+        nodes = st.session_state.nodes
         by_id = {n["id"]: n for n in nodes}
         if not nodes:
             st.markdown("<div style='color:#555;font-size:11px;'>No nodes yet.</div>", unsafe_allow_html=True)
         else:
             edit_opts  = {f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name']}": n["id"] for n in nodes}
             edit_label = st.selectbox("Select node to edit", ["— select —"] + list(edit_opts.keys()), key="edit_sel")
-
             if edit_label != "— select —":
                 eid = edit_opts[edit_label]
                 en  = next((n for n in nodes if n["id"] == eid), None)
-
-                # ── Detect node switch — clear stale widget state ──────
                 prev_eid = st.session_state.get("_edit_prev_eid")
                 if prev_eid != eid:
-                    for k in ["en_name","en_nid_prefix","en_nid_num","en_ft","en_gate",
-                               "en_type","en_par","en_tgt","en_use_fix","en_fv",
-                               "en_name_input","en_gate_radio"]:
+                    for k in ["en_name","en_nid_prefix","en_nid_num","en_ft","en_gate","en_type","en_par","en_tgt","en_use_fix","en_fv"]:
                         st.session_state.pop(k, None)
                     st.session_state["_edit_prev_eid"] = eid
-
                 if en:
-                    color     = LEVEL_COLORS.get(en["type"], "#888")
-                    is_shared = len(en.get("parentIds") or []) > 1
-                    ex_pnames = " · ".join(
-                        by_id[p]["name"] for p in (en.get("parentIds") or []) if p in by_id
-                    ) or "—"
-
+                    color = LEVEL_COLORS.get(en["type"], "#888")
                     st.markdown(f"""
-                    <div style="background:#141414;border:2px solid {color};border-radius:8px;
-                                padding:8px 12px;margin-bottom:8px;">
-                      <div style="font-size:8px;color:#888;letter-spacing:2px;margin-bottom:2px;">EDITING</div>
+                    <div style="background:#141414;border:2px solid {color};border-radius:8px;padding:8px 12px;margin-bottom:8px;">
+                      <div style="font-size:8px;color:#888;letter-spacing:2px;">EDITING</div>
                       <div style="font-weight:700;color:{color};font-size:13px;">{esc(en['name'])}</div>
-                      <div style="display:flex;align-items:center;gap:10px;margin-top:3px;">
-                        <div style="font-size:9px;color:#666;">
-                          {esc(en['type'])} · {esc(en['gate'])} · {esc(en.get('nodeId', en['id']))}
-                          {'&nbsp;<span style="background:#f5c518;color:#111;font-size:7px;padding:1px 4px;border-radius:3px;font-weight:700;">SHARED</span>' if is_shared else ''}
-                          {'&nbsp;<span style="background:#ffffff22;color:#fff;font-size:7px;padding:1px 4px;border-radius:3px;font-weight:700;">⬡ ROOT</span>' if not (en.get("parentIds") or []) and en["type"] != "HAZARD" else ''}
-                        </div>
-                        <div style="font-size:11px;color:{color};font-family:monospace;font-weight:700;margin-left:auto;">
-                          {fmt(en.get('calculatedValue'))}{'📌' if en.get('fixedValue') is not None else ''}
-                        </div>
-                      </div>
-                      <div style="font-size:9px;color:#555;margin-top:2px;">Parents: {esc(ex_pnames)}</div>
+                      <div style="font-size:11px;color:{color};font-family:monospace;">{fmt(en.get('calculatedValue'))}</div>
                     </div>""", unsafe_allow_html=True)
 
-                    # ── Edit fields ───────────────────────────────────────
                     new_name = st.text_input("Name", value=en["name"], key="en_name")
-
-                    # Node ID split: prefix + number + FT label
                     cur_nid = en.get("nodeId", en["id"])
                     import re as _re
                     nid_match  = _re.match(r'^([A-Za-z]+)-(.+)$', cur_nid)
                     cur_prefix = nid_match.group(1).upper() if nid_match else "IF"
                     cur_num    = nid_match.group(2) if nid_match else cur_nid
-
-                    st.markdown("<div style='font-size:9px;color:#aaa;margin:4px 0 2px;'>Node ID  &nbsp;·&nbsp; FT Label</div>",
-                                unsafe_allow_html=True)
                     ec1, ec2, ec3 = st.columns([1, 2, 1])
                     with ec1:
-                        valid_prefixes = ["IF","FF","SF","GROUP","HAZ","OTHER"]
-                        prefix_idx = valid_prefixes.index(cur_prefix) if cur_prefix in valid_prefixes else 0
-                        edit_prefix = st.selectbox("Prefix", valid_prefixes,
-                                                   index=prefix_idx, key="en_nid_prefix",
-                                                   label_visibility="collapsed")
+                        vp = ["IF","FF","SF","GROUP","HAZ","OTHER"]
+                        pi = vp.index(cur_prefix) if cur_prefix in vp else 0
+                        ep = st.selectbox("Prefix", vp, index=pi, key="en_nid_prefix", label_visibility="collapsed")
                     with ec2:
-                        edit_num = st.text_input("Number", value=cur_num,
-                                                 key="en_nid_num", label_visibility="collapsed",
-                                                 placeholder="196, 23a …")
+                        en_num = st.text_input("Number", value=cur_num, key="en_nid_num", label_visibility="collapsed")
                     with ec3:
-                        edit_ft = st.text_input("FT", value=en.get("ftLabel",""),
-                                                key="en_ft", label_visibility="collapsed",
-                                                placeholder="FT-46")
-                    new_node_id  = f"{edit_prefix}-{edit_num.strip()}" if edit_num.strip() else cur_nid
-                    new_ft_label = edit_ft.strip()
-
-                    new_gate = st.radio("Gate", ["OR","AND"],
-                                        index=0 if en["gate"] == "OR" else 1,
-                                        horizontal=True, key="en_gate")
-
-                    new_type = en["type"]
-                    new_pids = list(en.get("parentIds") or [])
-                    new_tgt  = None
+                        en_ft = st.text_input("FT", value=en.get("ftLabel",""), key="en_ft", label_visibility="collapsed")
+                    new_nid = f"{ep}-{en_num.strip()}" if en_num.strip() else cur_nid
+                    new_ft  = re.sub(r'[^A-Za-z0-9\-_\.]','', en_ft.strip()) if en_ft.strip() else ""
+                    valid_types = ["HAZARD"] + VALID_CHILD_TYPES if en["type"] == "HAZARD" else VALID_CHILD_TYPES
+                    ti = valid_types.index(en["type"]) if en["type"] in valid_types else 0
+                    new_type = st.selectbox("Type", valid_types, index=ti, key="en_type")
+                    new_gate = st.radio("Gate", ["OR","AND"], index=0 if en.get("gate","OR")=="OR" else 1, horizontal=True, key="en_gate")
 
                     if en["type"] != "HAZARD":
-                        ti       = VALID_CHILD_TYPES.index(en["type"]) if en["type"] in VALID_CHILD_TYPES else 0
-                        new_type = st.selectbox("Type", VALID_CHILD_TYPES, index=ti, key="en_type")
-                        avail_p  = {f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name']}": n["id"]
-                                    for n in nodes
-                                    if (n["type"] in VALID_PARENT_TYPES or
-                                        (n["type"] in VALID_CHILD_TYPES and not n.get("parentIds")))
-                                    and n["id"] != eid}
-                        cur_pl   = [lbl for lbl, pid in avail_p.items()
-                                    if pid in (en.get("parentIds") or []) and lbl in avail_p]
-                        # Safety: ensure default values are subset of options
-                        cur_pl   = [l for l in cur_pl if l in avail_p]
-                        new_pl   = st.multiselect("Parents", list(avail_p.keys()),
-                                                   default=cur_pl, key="en_par",
-                                                   help="Add/remove parents — links this node as shared.")
-                        new_pids = [avail_p[l] for l in new_pl]
+                        par_opts = {f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name']}": n["id"]
+                                    for n in nodes if n["id"] != eid and n["type"] in VALID_PARENT_TYPES}
+                        cur_par_labels = [f"[{by_id[p]['type']}] {by_id[p].get('nodeId',p)} — {by_id[p]['name']}"
+                                          for p in (en.get("parentIds") or []) if p in by_id]
+                        new_pars = st.multiselect("Parents", list(par_opts.keys()), default=cur_par_labels, key="en_par")
+                        new_par_ids = [par_opts[l] for l in new_pars]
                     else:
-                        new_tgt = st.text_input("Target Rate",
-                                                value=str(en.get("targetValue", "")),
-                                                key="en_tgt")
+                        new_par_ids = []
 
-                    # ── Fixed value pin ──────────────────────────────────
-                    cur_fv     = en.get("fixedValue")
-                    en_use_fix = st.checkbox("📌 Pin to fixed value",
-                                             value=(cur_fv is not None),
-                                             key="en_use_fix",
-                                             help="Pin this node's rate. Siblings get the remainder.")
-                    en_fv_input = None
-                    if en_use_fix:
-                        en_fv_input = st.text_input(
-                            "Fixed Value",
-                            value=str(cur_fv) if cur_fv is not None else "",
-                            placeholder="e.g. 1.67e-9 or 0",
-                            key="en_fv",
-                            help="e.g. 0 for negligible, 1e-12 for residual")
-                    if cur_fv is not None and not en_use_fix:
-                        st.markdown(
-                            f"<div style='font-size:9px;color:#f5c518;margin-top:2px;'>"
-                            f"📌 Currently pinned to <b>{fmt(cur_fv)}</b> — uncheck removes pin</div>",
-                            unsafe_allow_html=True)
+                    if en["type"] == "HAZARD":
+                        tv_str = str(en.get("targetValue","")) if en.get("targetValue") is not None else ""
+                        new_tgt_str = st.text_input("Target Probability", value=tv_str, key="en_tgt")
+                        try:    new_tgt = float(new_tgt_str) if new_tgt_str.strip() else None
+                        except: new_tgt = en.get("targetValue")
+                    else:
+                        new_tgt = en.get("targetValue")
 
-                    # ── Buttons ──────────────────────────────────────────
-                    # Show what APPLY will do to parents
-                    old_pids = list(en.get("parentIds") or [])
-                    added   = [p for p in new_pids if p not in old_pids]
-                    removed = [p for p in old_pids if p not in new_pids]
-                    if added or removed:
-                        add_names = " · ".join(by_id[p]["name"] for p in added   if p in by_id)
-                        rem_names = " · ".join(by_id[p]["name"] for p in removed if p in by_id)
-                        diff_html = ""
-                        if added:   diff_html += f'<span style="color:#4caf7d;">+ {esc(add_names)}</span> '
-                        if removed: diff_html += f'<span style="color:#e94560;">− {esc(rem_names)}</span>'
-                        st.markdown(
-                            f"<div style='font-size:9px;background:#111;border-radius:5px;"
-                            f"padding:4px 8px;margin-bottom:4px;'>Parent change: {diff_html}</div>",
-                            unsafe_allow_html=True)
+                    use_fix = st.checkbox("📌 Pin fixed value", value=en.get("fixedValue") is not None, key="en_use_fix")
+                    new_fv = en.get("fixedValue")
+                    if use_fix:
+                        fv_str = str(en.get("fixedValue","")) if en.get("fixedValue") is not None else ""
+                        fv_inp = st.text_input("Fixed Value", value=fv_str, key="en_fv")
+                        try:    new_fv = float(fv_inp) if fv_inp.strip() else None
+                        except: new_fv = en.get("fixedValue")
+                    else:
+                        new_fv = None
 
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        if st.button("💾 APPLY", use_container_width=True, type="primary"):
-                            new_fv = None
-                            if en_use_fix and en_fv_input is not None:
-                                try:    new_fv = float(en_fv_input)
-                                except: st.error("Fixed value must be a number e.g. 1.67e-9")
+                    if st.button("💾 SAVE CHANGES", use_container_width=True, type="primary"):
+                        dn = new_name.strip()
+                        if new_ft: dn = f"[{new_ft}] {dn}" if not dn.startswith(f"[{new_ft}]") else dn
+                        updated = []
+                        for n in nodes:
+                            if n["id"] == eid:
+                                n = dict(n)
+                                n["name"] = dn; n["nodeId"] = new_nid; n["ftLabel"] = new_ft
+                                n["type"] = new_type; n["gate"] = new_gate
+                                n["fixedValue"] = new_fv; n["targetValue"] = new_tgt
+                                if en["type"] != "HAZARD": n["parentIds"] = new_par_ids
+                            updated.append(n)
+                        st.session_state.tree_state["focus_id"] = eid
+                        st.session_state.nodes_since_calc += 1
+                        set_nodes(updated)
+                        st.success("✓ Saved")
+                        st.rerun()
 
-                            upd = []
-                            for n in nodes:
-                                if n["id"] == eid:
-                                    n = dict(n)
-                                    n["name"]       = new_name.strip() or n["name"]
-                                    n["gate"]       = new_gate
-                                    n["nodeId"]     = new_node_id
-                                    n["ftLabel"]    = new_ft_label
-                                    n["fixedValue"] = new_fv
-                                    # Immediately reflect fixedValue in calculatedValue
-                                    # so the tree shows the value without needing CALCULATE
-                                    if new_fv is not None:
-                                        n["calculatedValue"] = new_fv
-                                    elif n.get("calculatedValue") == n.get("fixedValue"):
-                                        # Was pinned, now unpinned — clear calculated so
-                                        # it gets recomputed on next CALCULATE
-                                        n["calculatedValue"] = None
-                                    if n["type"] != "HAZARD":
-                                        n["type"]      = new_type
-                                        n["parentIds"] = new_pids
-                                    else:
-                                        if new_tgt:
-                                            try:
-                                                tv = float(new_tgt)
-                                                n["targetValue"]    = tv
-                                                n["calculatedValue"] = tv
-                                            except: pass
-                                upd.append(n)
-
-                            # Clear stale widget state and force tree rebuild
-                            for k in ["en_name","en_nid_prefix","en_nid_num","en_ft","en_gate",
-                                      "en_type","en_par","en_tgt","en_use_fix","en_fv",
-                                      "_edit_prev_eid","en_name_input","en_gate_radio"]:
-                                st.session_state.pop(k, None)
-
-                            st.session_state.nodes_hash       = ""   # force tree redraw
-                            st.session_state.nodes_since_calc += 1
-                            st.session_state.tree_state["focus_id"] = eid
-                            set_nodes(upd)
-                            st.rerun(scope="app")   # full page rerun so tree redraws
-
-                    with c2:
-                        if en["type"] != "HAZARD":
-                            if st.button("🗑 DELETE", use_container_width=True):
-                                pre_existing_roots = {
-                                    n["id"] for n in nodes
-                                    if n["type"] != "HAZARD" and not n.get("parentIds")
-                                }
-                                temp_nodes = [dict(n) for n in nodes if n["id"] != eid]
-                                for n in temp_nodes:
-                                    if eid in (n.get("parentIds") or []):
-                                        n["parentIds"] = [p for p in n["parentIds"] if p != eid]
-                                # Cascade delete only newly-orphaned nodes, not intentional roots
-                                changed = True
-                                while changed:
-                                    changed = False
-                                    orphan_ids = {
-                                        n["id"] for n in temp_nodes
-                                        if n["type"] != "HAZARD"
-                                        and not n.get("parentIds")
-                                        and n["id"] not in pre_existing_roots
-                                    }
-                                    if orphan_ids:
-                                        temp_nodes = [n for n in temp_nodes if n["id"] not in orphan_ids]
-                                        for n in temp_nodes:
-                                            before = len(n.get("parentIds") or [])
-                                            n["parentIds"] = [p for p in (n.get("parentIds") or [])
-                                                              if p not in orphan_ids]
-                                            if len(n.get("parentIds") or []) != before:
-                                                changed = True
-
-                                for k in ["_edit_prev_eid","edit_sel"]:
-                                    st.session_state.pop(k, None)
-                                st.session_state.nodes_hash       = ""
-                                st.session_state.nodes_since_calc += 1
-                                st.session_state.tree_state["focus_id"] = None
-                                set_nodes(temp_nodes)
-                                st.rerun(scope="app")
-
-    # ── SHARED tab ────────────────────────────────────────────────────────
     with tab_shared:
         nodes  = st.session_state.nodes
         by_id  = {n["id"]: n for n in nodes}
-
         if not nodes:
-            st.markdown("<div style='color:#555;font-size:11px;'>No nodes yet.</div>",
-                        unsafe_allow_html=True)
+            st.markdown("<div style='color:#555;font-size:11px;'>No nodes yet.</div>", unsafe_allow_html=True)
         else:
             from collections import defaultdict as _dd2
-
-            # ── Build unified shared registry ─────────────────────────
-            # Two kinds of "shared" — treated uniformly:
-            # A) Duplicate instances: same nodeId, multiple separate nodes
-            # B) Link-Shared: one node with multiple parentIds
-            # Both appear in the same dropdown.
-
             nid_map = _dd2(list)
             for n in nodes:
                 nid = (n.get("nodeId") or "").strip()
-                if nid:
-                    nid_map[nid].append(n)
-
-            # Group A: nodeId groups with 2+ separate nodes
-            dup_groups = {nid: grp for nid, grp in nid_map.items() if len(grp) > 1}
-            # Group B: single nodes with 2+ parents
+                if nid: nid_map[nid].append(n)
+            dup_groups  = {nid: grp for nid, grp in nid_map.items() if len(grp) > 1}
             link_shared = [n for n in nodes if len(n.get("parentIds") or []) > 1]
-
-            # Build unified list for dropdown
-            # Format: "◈ IF-085 (2 instances)" or "⊗ SF-06 (link-shared, 2 parents)"
-            registry = {}  # label → {"type": "dup"|"link", "key": nodeId|nodeId, "data": grp|node}
-            for nid_lbl, grp in sorted(dup_groups.items()):
-                typ = grp[0].get("type","?")
-                label = f"◈ {nid_lbl}  ·  {len(grp)} instances  ·  {typ}"
-                registry[label] = {"kind": "dup", "nid": nid_lbl, "grp": grp}
-            for n in sorted(link_shared, key=lambda x: x.get("nodeId","") or x["id"]):
-                nid_lbl = n.get("nodeId", n["id"])
-                np = len(n.get("parentIds") or [])
-                # Skip if this node is already in a dup group (avoid double listing)
-                if nid_lbl in dup_groups:
-                    continue
-                label = f"⊗ {nid_lbl}  ·  link-shared  ·  {np} parents  ·  {n['type']}"
-                registry[label] = {"kind": "link", "nid": nid_lbl, "node": n}
-
-            # Summary
-            tot = len(registry)
             c1, c2 = st.columns(2)
             with c1:
                 col = "#f5c518" if dup_groups else "#333"
-                st.markdown(f'<div style="background:#141414;border:1.5px solid {col}44;border-radius:6px;padding:7px;text-align:center;">'
-                            f'<div style="font-size:8px;color:#555;letter-spacing:2px;">DUPLICATE INSTANCES</div>'
-                            f'<div style="font-size:22px;font-weight:700;color:{col};">{len(dup_groups)}</div>'
-                            f'<div style="font-size:8px;color:#555;">same nodeId, separate nodes</div></div>',
-                            unsafe_allow_html=True)
+                st.markdown(f'<div style="background:#141414;border:1px solid {col}44;border-radius:6px;padding:7px;text-align:center;"><div style="font-size:8px;color:#555;">DUPLICATE</div><div style="font-size:22px;font-weight:700;color:{col};">{len(dup_groups)}</div></div>', unsafe_allow_html=True)
             with c2:
                 col2 = "#4fc3f7" if link_shared else "#333"
-                st.markdown(f'<div style="background:#141414;border:1.5px solid {col2}44;border-radius:6px;padding:7px;text-align:center;">'
-                            f'<div style="font-size:8px;color:#555;letter-spacing:2px;">LINK-SHARED</div>'
-                            f'<div style="font-size:22px;font-weight:700;color:{col2};">{len(link_shared)}</div>'
-                            f'<div style="font-size:8px;color:#555;">one node, multiple parents</div></div>',
-                            unsafe_allow_html=True)
+                st.markdown(f'<div style="background:#141414;border:1px solid {col2}44;border-radius:6px;padding:7px;text-align:center;"><div style="font-size:8px;color:#555;">LINK-SHARED</div><div style="font-size:22px;font-weight:700;color:{col2};">{len(link_shared)}</div></div>', unsafe_allow_html=True)
+            for nid_lbl, grp in sorted(dup_groups.items()):
+                gc = LEVEL_COLORS.get(grp[0]["type"],"#888")
+                pinned_vals = [n["fixedValue"] for n in grp if n.get("fixedValue") is not None]
+                pin_note = f" · MAX={fmt(max(pinned_vals))}" if pinned_vals else ""
+                st.markdown(
+                    f"<div style='background:#141414;border:1px solid {gc}44;border-radius:6px;"
+                    f"padding:6px 10px;margin:3px 0;'>"
+                    f"<span style='color:{gc};font-weight:700;font-size:10px;'>◈ {esc(nid_lbl)}</span>"
+                    f"<span style='font-size:9px;color:#555;'> · {len(grp)} instances{pin_note}</span></div>",
+                    unsafe_allow_html=True)
 
-            if not registry:
-                st.markdown('<div style="text-align:center;color:#333;font-size:11px;margin-top:24px;">✓ No shared or duplicate nodes</div>',
-                            unsafe_allow_html=True)
-            else:
-                st.markdown("---")
-                # ── Dropdown selector ─────────────────────────────────
-                sel_label = st.selectbox(
-                    "Select a shared node to inspect",
-                    ["— select —"] + list(registry.keys()),
-                    key="sh_sel",
-                    label_visibility="collapsed",
-                    format_func=lambda x: x
-                )
+    # ── CALCULATE button ─────────────────────────────────────────────────
+    st.markdown("---")
+    pending = st.session_state.nodes_since_calc
+    calc_label = f"⚡ CALCULATE" + (f" ({pending} pending)" if pending else "")
+    if st.button(calc_label, use_container_width=True, type="primary",
+                 key="calc_btn"):
+        set_nodes(st.session_state.nodes, recalc=True)
+        st.rerun(scope="app")
 
-                if sel_label != "— select —":
-                    entry = registry[sel_label]
-                    kind  = entry["kind"]
+    # ── SNAPSHOT ─────────────────────────────────────────────────────────
+    if configured:
+        st.markdown("---")
+        if st.button("📸 Snapshot", use_container_width=True, key="snap_btn",
+                     help="Save a timestamped copy of current state"):
+            snap_name = f"snapshot_{now_str()}.json"
+            save_current(st.session_state.nodes, snap_name, f"Snapshot saved: {snap_name}")
+            st.session_state.file_list = list_gist_files(GITHUB_TOKEN, GIST_ID)
+            st.success(f"Snapshot: {snap_name}")
+        snaps = [f for f in st.session_state.file_list if is_snap(f)]
+        if snaps:
+            del_snap = st.selectbox("Delete snapshot", ["— keep —"] + snaps, key="del_snap")
+            if del_snap != "— keep —" and st.button("🗑 Delete Snapshot", key="del_snap_btn"):
+                del_gist_file(GITHUB_TOKEN, GIST_ID, del_snap)
+                st.session_state.file_list = list_gist_files(GITHUB_TOKEN, GIST_ID)
+                st.rerun()
 
-                    # ── Helper: get full hazard path for a node ───────
-                    def node_path(start_id, depth=0):
-                        """Returns list of nodes from HAZARD down to start_id."""
-                        if depth > 10: return []
-                        nd = by_id.get(start_id)
-                        if not nd: return []
-                        pids = nd.get("parentIds") or []
-                        if not pids or nd["type"] == "HAZARD":
-                            return [nd]
-                        result = node_path(pids[0], depth+1)
-                        result.append(nd)
-                        return result
-
-                    def path_badge(nid):
-                        """Colored breadcrumb: HAZARD › SF-10 › FF-01"""
-                        parts = node_path(nid)
-                        badges = []
-                        for p in parts:
-                            c   = LEVEL_COLORS.get(p["type"], "#888")
-                            lbl = p.get("nodeId","") or p["type"]
-                            # Use type label if nodeId looks like raw UUID
-                            if lbl and len(lbl) <= 8 and lbl.isalnum() and lbl.islower():
-                                lbl = p["type"]
-                            badges.append(f'<span style="color:{c};font-weight:700;font-size:8px;">{esc(lbl)}</span>')
-                        return ' <span style="color:#444;font-size:9px;">›</span> '.join(badges)
-
-                    # ═══════════════════════════════════════════════════
-                    # CASE A: Duplicate instance group
-                    # ═══════════════════════════════════════════════════
-                    if kind == "dup":
-                        grp     = entry["grp"]
-                        nid_lbl = entry["nid"]
-                        gc      = LEVEL_COLORS.get(grp[0]["type"], "#888")
-
-                        # Check if any instance is pinned
-                        pinned_vals = [n.get("fixedValue") for n in grp if n.get("fixedValue") is not None]
-                        pin_info = ""
-                        if pinned_vals:
-                            pin_info = (f'<div style="background:#1a0000;border:1px solid #e9456044;'
-                                        f'border-radius:5px;padding:5px 8px;margin-bottom:6px;font-size:8px;color:#e94560;">'
-                                        f'📌 Pinned to <b>{fmt(pinned_vals[0])}</b> — '
-                                        f'all {len(grp)} instances share this value on CALCULATE</div>')
-                            st.markdown(pin_info, unsafe_allow_html=True)
-
-                        # Each instance
-                        for i, inst in enumerate(grp):
-                            ic      = LEVEL_COLORS.get(inst["type"], "#888")
-                            iv      = fmt(inst.get("calculatedValue"))
-                            ift     = inst.get("ftLabel","")
-                            ip      = [by_id[p] for p in (inst.get("parentIds") or []) if p in by_id]
-                            ich     = [c for c in nodes if inst["id"] in (c.get("parentIds") or [])]
-                            is_pin  = inst.get("fixedValue") is not None
-                            pin_tag = f' <span style="color:#e94560;font-size:7px;">📌{fmt(inst.get("fixedValue"))}</span>' if is_pin else ""
-                            ft_tag  = f'<code style="background:#1e1530;color:#7e57c2;font-size:7px;padding:1px 4px;border-radius:3px;">{esc(ift)}</code> ' if ift else ""
-                            pbadge  = path_badge(inst["id"])
-                            pname   = esc(ip[0]["name"]) if ip else "<i style='color:#444'>no parent</i>"
-                            cnames  = esc(", ".join(c["name"] for c in ich)) if ich else "<i style='color:#333'>leaf</i>"
-
-                            st.markdown(
-                                f'<div style="background:#111;border:1.5px solid #f5c51855;'
-                                f'border-left:3px solid {ic};border-radius:0 7px 7px 0;'
-                                f'padding:8px 10px;margin-bottom:4px;">'
-                                f'<div style="margin-bottom:3px;">{ft_tag}'
-                                f'<span style="font-weight:700;font-size:11px;color:#ddd;">{esc(inst["name"])}</span>'
-                                f'&nbsp;<span style="color:{ic};font-family:monospace;font-size:11px;font-weight:700;">{iv}</span>{pin_tag}</div>'
-                                f'<div style="font-size:8px;color:#666;margin-bottom:2px;">{esc(inst["type"])} · {esc(inst["gate"])}</div>'
-                                f'<div style="font-size:8px;color:#555;margin-bottom:2px;">📍 {pbadge}</div>'
-                                f'<div style="font-size:8px;color:#666;">↑ {pname}</div>'
-                                f'<div style="font-size:8px;color:#555;">↓ {cnames}</div>'
-                                f'</div>',
-                                unsafe_allow_html=True
-                            )
-
-                            # Per-instance actions
-                            ba, bb, bc = st.columns(3)
-                            with ba:
-                                with st.popover("✏️ Edit", use_container_width=True):
-                                    e_name = st.text_input("Name", value=inst["name"], key=f"se_n_{inst['id']}")
-                                    e_gate = st.radio("Gate", ["OR","AND"],
-                                                      index=0 if inst["gate"]=="OR" else 1,
-                                                      key=f"se_g_{inst['id']}", horizontal=True)
-                                    e_fv_on = st.checkbox("📌 Pin value",
-                                                          value=is_pin, key=f"se_fon_{inst['id']}")
-                                    e_fv = None
-                                    if e_fv_on:
-                                        e_fv = st.text_input("Fixed value",
-                                                             value=str(inst.get("fixedValue","")) if is_pin else "",
-                                                             key=f"se_fv_{inst['id']}", placeholder="e.g. 1e-12")
-                                    st.markdown('<div style="font-size:8px;color:#f5c518;">Pinning any instance syncs to all others on CALCULATE.</div>', unsafe_allow_html=True)
-                                    if st.button("💾 Apply", key=f"se_apply_{inst['id']}", type="primary", use_container_width=True):
-                                        fv_p = None
-                                        if e_fv_on and e_fv:
-                                            try: fv_p = float(e_fv)
-                                            except: pass
-                                        upd = []
-                                        for nd in nodes:
-                                            nd = dict(nd)
-                                            if nd["id"] == inst["id"]:
-                                                nd["name"] = e_name.strip() or nd["name"]
-                                                nd["gate"] = e_gate
-                                                nd["fixedValue"] = fv_p
-                                            upd.append(nd)
-                                        st.session_state.nodes_hash = ""
-                                        st.session_state.nodes_since_calc += 1
-                                        set_nodes(upd); st.rerun(scope="app")
-                            with bb:
-                                # Add new copy under a different parent
-                                with st.popover("➕ Add copy", use_container_width=True):
-                                    st.markdown(f'<div style="font-size:9px;color:#aaa;">Add <b>{esc(nid_lbl)}</b> under new parent</div>', unsafe_allow_html=True)
-                                    avp = {f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name']}": n["id"]
-                                           for n in nodes if n["type"] in VALID_PARENT_TYPES}
-                                    new_p_lbl = st.selectbox("Parent", ["— select —"] + list(avp.keys()),
-                                                             key=f"se_np_{inst['id']}")
-                                    if new_p_lbl != "— select —":
-                                        new_pid = avp[new_p_lbl]
-                                        already = any(
-                                            n.get("nodeId","") == nid_lbl and new_pid in (n.get("parentIds") or [])
-                                            for n in nodes
-                                        )
-                                        if already:
-                                            st.warning(f"{nid_lbl} already under that parent.")
-                                        elif st.button("➕ Create copy", key=f"se_cp_{inst['id']}", type="primary", use_container_width=True):
-                                            new_n = {
-                                                "id": str(uuid.uuid4())[:7],
-                                                "nodeId": nid_lbl,
-                                                "ftLabel": inst.get("ftLabel",""),
-                                                "name": inst["name"],
-                                                "type": inst["type"],
-                                                "gate": inst["gate"],
-                                                "fixedValue": inst.get("fixedValue"),
-                                                "targetValue": None,
-                                                "calculatedValue": inst.get("fixedValue"),
-                                                "parentIds": [new_pid],
-                                            }
-                                            st.session_state.nodes_hash = ""
-                                            st.session_state.nodes_since_calc += 1
-                                            st.session_state.tree_state["focus_id"] = new_pid
-                                            set_nodes(nodes + [new_n]); st.rerun(scope="app")
-                            with bc:
-                                # Break = remove this instance (only if not last)
-                                if len(grp) > 1:
-                                    if st.button("✂️ Break", key=f"se_brk_{inst['id']}",
-                                                 use_container_width=True,
-                                                 help="Remove this instance from the tree"):
-                                        upd = [dict(nd) for nd in nodes if nd["id"] != inst["id"]]
-                                        for nd in upd:
-                                            if inst["id"] in (nd.get("parentIds") or []):
-                                                nd["parentIds"] = [p for p in nd["parentIds"] if p != inst["id"]]
-                                        st.session_state.nodes_hash = ""
-                                        st.session_state.nodes_since_calc += 1
-                                        set_nodes(upd); st.rerun(scope="app")
-                                else:
-                                    st.markdown('<div style="font-size:8px;color:#333;padding:4px;">last instance</div>', unsafe_allow_html=True)
-
-                    # ═══════════════════════════════════════════════════
-                    # CASE B: Link-Shared node (one node, multiple parents)
-                    # ═══════════════════════════════════════════════════
-                    elif kind == "link":
-                        n       = entry["node"]
-                        nid_lbl = entry["nid"]
-                        nc      = LEVEL_COLORS.get(n["type"], "#888")
-                        iv      = fmt(n.get("calculatedValue"))
-                        pids    = n.get("parentIds") or []
-                        ich     = [c for c in nodes if n["id"] in (c.get("parentIds") or [])]
-                        is_pin  = n.get("fixedValue") is not None
-
-                        st.markdown(
-                            f'<div style="background:#0a1a2e;border:1.5px solid #4fc3f755;'
-                            f'border-radius:7px;padding:8px 11px;margin-bottom:8px;">'
-                            f'<div style="font-weight:700;font-size:12px;color:#ddd;margin-bottom:3px;">{esc(n["name"])}</div>'
-                            f'<div style="font-size:8px;color:#666;">{esc(n["type"])} · {esc(n["gate"])} &nbsp;·&nbsp; '
-                            f'Value: <span style="color:{nc};font-family:monospace;">{iv}</span>'
-                            f'{"&nbsp;📌" if is_pin else ""}</div>'
-                            f'<div style="font-size:8px;color:#4fc3f7;margin-top:3px;">{len(pids)} parents &nbsp;·&nbsp; MAX rule applies on CALCULATE</div>'
-                            f'</div>',
-                            unsafe_allow_html=True
-                        )
-
-                        # Show each parent connection with break option
-                        st.markdown('<div style="font-size:9px;color:#4fc3f7;font-weight:700;letter-spacing:1px;margin-bottom:5px;">PARENT CONNECTIONS</div>', unsafe_allow_html=True)
-                        for pid in pids:
-                            pn = by_id.get(pid)
-                            if not pn: continue
-                            pc     = LEVEL_COLORS.get(pn["type"], "#888")
-                            pbadge = path_badge(pid)
-                            pv     = fmt(pn.get("calculatedValue"))
-                            pca, pcb = st.columns([3,1])
-                            with pca:
-                                st.markdown(
-                                    f'<div style="background:#111;border:1px solid #4fc3f722;'
-                                    f'border-left:3px solid {pc};border-radius:0 5px 5px 0;'
-                                    f'padding:5px 8px;margin-bottom:3px;">'
-                                    f'<div style="font-size:9px;color:#ddd;font-weight:700;">{esc(pn["name"])}</div>'
-                                    f'<div style="font-size:8px;color:#666;">{esc(pn["type"])} · {pv}</div>'
-                                    f'<div style="font-size:8px;color:#555;">📍 {pbadge}</div>'
-                                    f'</div>',
-                                    unsafe_allow_html=True
-                                )
-                            with pcb:
-                                if len(pids) > 1:
-                                    if st.button("✂️", key=f"lnk_brk_{n['id']}_{pid}",
-                                                 help=f"Break connection to {pn['name']}",
-                                                 use_container_width=True):
-                                        upd = []
-                                        for nd in nodes:
-                                            nd = dict(nd)
-                                            if nd["id"] == n["id"]:
-                                                nd["parentIds"] = [p for p in nd["parentIds"] if p != pid]
-                                            upd.append(nd)
-                                        st.session_state.nodes_hash = ""
-                                        st.session_state.nodes_since_calc += 1
-                                        set_nodes(upd); st.rerun(scope="app")
-                                else:
-                                    st.markdown('<div style="font-size:7px;color:#333;text-align:center;">last</div>', unsafe_allow_html=True)
-
-                        # Add new parent connection
-                        st.markdown('<div style="font-size:9px;color:#4fc3f7;font-weight:700;letter-spacing:1px;margin:8px 0 5px;">ADD PARENT CONNECTION</div>', unsafe_allow_html=True)
-                        avp2 = {f"[{nd['type']}] {nd.get('nodeId',nd['id'])} — {nd['name']}": nd["id"]
-                                for nd in nodes
-                                if (nd["type"] in VALID_PARENT_TYPES or
-                                    (nd["type"] in VALID_CHILD_TYPES and not nd.get("parentIds")))
-                                and nd["id"] not in pids and nd["id"] != n["id"]}
-                        new_p2 = st.selectbox("New parent", ["— select —"] + list(avp2.keys()),
-                                              key=f"lnk_newp_{n['id']}")
-                        if new_p2 != "— select —":
-                            if st.button("🔗 Add connection", key=f"lnk_add_{n['id']}",
-                                         type="primary", use_container_width=True):
-                                upd = []
-                                for nd in nodes:
-                                    nd = dict(nd)
-                                    if nd["id"] == n["id"]:
-                                        nd["parentIds"] = list(nd.get("parentIds") or []) + [avp2[new_p2]]
-                                    upd.append(nd)
-                                st.session_state.nodes_hash = ""
-                                st.session_state.nodes_since_calc += 1
-                                set_nodes(upd); st.rerun(scope="app")
-
-                        # Split into duplicate instances
-                        st.markdown("---")
-                        st.markdown('<div style="font-size:9px;color:#f5c518;font-weight:700;margin-bottom:4px;">CONVERT TO DUPLICATE INSTANCES</div>', unsafe_allow_html=True)
-                        st.markdown(
-                            f'<div style="font-size:8px;color:#666;">Currently one node with {len(pids)} parents. '
-                            f'Split into {len(pids)} separate nodes (one per parent), each with the same nodeId.</div>',
-                            unsafe_allow_html=True
-                        )
-                        if st.button(f"✂️ Split into {len(pids)} separate instances",
-                                     key=f"lnk_split_{n['id']}",
-                                     use_container_width=True):
-                            # Create one new node per parent (except keep original for first parent)
-                            new_nodes_list = []
-                            for i2, pid2 in enumerate(pids):
-                                if i2 == 0:
-                                    # Update original — keep only first parent
-                                    pass
-                                else:
-                                    new_n2 = {
-                                        "id": str(uuid.uuid4())[:7],
-                                        "nodeId": nid_lbl,
-                                        "ftLabel": n.get("ftLabel",""),
-                                        "name": n["name"],
-                                        "type": n["type"],
-                                        "gate": n["gate"],
-                                        "fixedValue": n.get("fixedValue"),
-                                        "targetValue": None,
-                                        "calculatedValue": n.get("fixedValue"),
-                                        "parentIds": [pid2],
-                                    }
-                                    new_nodes_list.append(new_n2)
-                            upd = []
-                            for nd in nodes:
-                                nd = dict(nd)
-                                if nd["id"] == n["id"]:
-                                    nd["parentIds"] = [pids[0]]  # keep only first parent
-                                upd.append(nd)
-                            upd.extend(new_nodes_list)
-                            st.session_state.nodes_hash = ""
-                            st.session_state.nodes_since_calc += 1
-                            st.session_state.tree_state["focus_id"] = n["id"]
-                            set_nodes(upd)
-                            st.success(f"Split into {len(pids)} instances. Press CALCULATE.")
-                            st.rerun(scope="app")
-
+# Handle canvas messages (positions + multisel)
+cmp_html = """
+<script>
+window.addEventListener("message",function(e){
+  try{
+    const d=typeof e.data==="string"?JSON.parse(e.data):e.data;
+    if(d&&d.type==="fta_pos"){
+      window.parent.postMessage(JSON.stringify({type:"streamlit:setComponentValue",value:{type:"fta_pos",data:d.data}}),"*");
+    }
+    if(d&&d.type==="fta_multisel"){
+      window.parent.postMessage(JSON.stringify({type:"streamlit:setComponentValue",value:{type:"fta_multisel",data:d.data}}),"*");
+    }
+  }catch(err){}
+});
+</script>"""
+msg_val = components.html(cmp_html, height=0)
+if msg_val and isinstance(msg_val, dict):
+    if msg_val.get("type") == "fta_pos":
+        new_pos = msg_val.get("data", {})
+        if new_pos:
+            st.session_state["_pending_positions"] = {**st.session_state.get("_pending_positions",{}), **new_pos}
+            st.session_state.tree_state["positions"] = st.session_state["_pending_positions"]
+    elif msg_val.get("type") == "fta_multisel":
+        new_sel = [item["id"] for item in msg_val.get("data",[]) if "id" in item]
+        if new_sel != st.session_state.get("multisel_ids",[]):
+            st.session_state["multisel_ids"] = new_sel
+            st.rerun(scope="fragment")
 
 with st.sidebar:
     render_sidebar()
 
-# ── Action bar ────────────────────────────────────────────────────────────
-nsc = st.session_state.nodes_since_calc
-
-# Warning banner when nodes added without calculating
-if nsc > 0:
-    warn_color  = "#ff4d4d" if nsc >= 10 else "#f5c518"
-    warn_bg     = "#1a0000" if nsc >= 10 else "#1a1200"
-    warn_icon   = "🔴" if nsc >= 10 else "🟡"
-    pending     = st.session_state.get("pending_node_names", [])
-    warn_msg    = (f"{warn_icon} **{nsc} node{'s' if nsc!=1 else ''} added without calculating** — "
-                   f"values shown are stale. Press **▶ CALCULATE** to update.")
-    if pending:
-        names_preview = ", ".join(f"`{n}`" for n in pending[-5:])
-        if len(pending) > 5:
-            names_preview = f"…{len(pending)-5} more, " + names_preview
-        warn_msg += f"  \nPending: {names_preview}"
-    if nsc >= 10:
-        warn_msg += f"  \n⚠ {nsc} nodes without calculating — values are likely very stale."
-    st.markdown(
-        f'<div style="background:{warn_bg};border:2px solid {warn_color};border-radius:8px;'
-        f'padding:9px 14px;margin-bottom:8px;font-size:11px;color:{warn_color};">'
-        f'{warn_msg}</div>',
-        unsafe_allow_html=True)
-
-a1,a2,a3,a4,a5 = st.columns([1,1,1,1,2])
-with a1:
-    calc_label = f"▶ CALCULATE{f' ({nsc}✱)' if nsc>0 else ''}"
-    if st.button(calc_label, type="primary", use_container_width=True,
-                 help="Run top-down reverse distribution across the full tree"):
-        if nodes:
-            new_nodes = recalculate(nodes)
-            # Preserve layout positions through recalc
-            pending_pos = st.session_state.get("_pending_positions", {})
-            if pending_pos:
-                new_nodes = inject_positions(new_nodes, pending_pos)
-            snap = f"snapshot_{now_str()}.json"
-            save_current(new_nodes, filename=snap, status_label=f"Calculated + snap: {snap}")
-            save_current(new_nodes)
-            st.session_state.nodes = new_nodes
-            st.session_state.nodes_since_calc = 0
-            st.session_state.pending_node_names = []
-            st.session_state.nodes_hash = ""
-            st.rerun()
-with a2:
-    if st.button("💾 SAVE", use_container_width=True): save_current(); st.rerun()
-with a3:
-    if nodes:
-        st.download_button("⬇ JSON", data=export_json(nodes),
-                           file_name=f"fta_{now_str()}.json", mime="application/json",
-                           use_container_width=True)
-with a4:
-    if nodes:
-        xl = export_excel(nodes)
-        if xl:
-            st.download_button("⬇ EXCEL", data=xl, file_name=f"fta_{now_str()}.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                               use_container_width=True)
-with a5:
-    if nodes:
-        st.download_button("⬇ CYPHER (Neo4j)", data=export_cypher(nodes),
-                           file_name=f"fta_{now_str()}.cypher", mime="text/plain",
-                           use_container_width=True)
-
-st.markdown("---")
-
-# ── Refresh data after possible recalc ───────────────────────────────────
-nodes    = st.session_state.nodes
-hazards  = [n for n in nodes if n["type"] == "HAZARD"]
-by_id    = {n["id"]: n for n in nodes}
-by_level = {lvl:[n for n in nodes if n["type"]==lvl] for lvl in DISPLAY_ORDER}
-
-# ── Tabs ──────────────────────────────────────────────────────────────────
-tab_tree, tab_hier, tab_vals, tab_search = st.tabs(["🌳 TREE", "📋 HIERARCHY", "📊 VALUES", "🔍 SEARCH"])
-
-# ── TAB 1: Tree ───────────────────────────────────────────────────────────
+# ── TAB 1: TREE ───────────────────────────────────────────────────────────
 with tab_tree:
     if not nodes:
-        st.markdown("<div style='text-align:center;color:#333;margin-top:60px;letter-spacing:2px;'>ADD A HAZARD TO START</div>", unsafe_allow_html=True)
+        st.markdown("""
+        <div style='text-align:center;color:#333;margin-top:60px;'>
+          <div style='font-size:32px;'>⚠</div>
+          <div style='font-size:14px;color:#555;margin-top:8px;'>No nodes yet</div>
+          <div style='font-size:10px;color:#333;margin-top:4px;'>Add a HAZARD node in the sidebar to begin</div>
+        </div>""", unsafe_allow_html=True)
     else:
-        # Sticky hazard filter — default to first hazard, not full tree
-        # Collect floating root nodes (non-HAZARD, no parents)
-        floating_roots = [n for n in nodes
-                          if n["type"] != "HAZARD" and not n.get("parentIds")]
-
-        filter_opts = {"Full Tree (all hazards)": "ALL"}
-        if floating_roots:
-            filter_opts["⬡ Floating Root Nodes"] = "FLOATING"
-        filter_opts |= {
-            f"🎯 {h['name']}  ({fmt(h.get('targetValue'))})": h["id"] for h in hazards
-        }
-        opt_keys = list(filter_opts.keys())
-        opt_vals = list(filter_opts.values())
-
-        # Default to first hazard (index 1) on first load
-        saved_filter = st.session_state.get("tree_filter", "ALL")
-        default_idx  = opt_vals.index(saved_filter) if saved_filter in opt_vals else (1 if len(opt_vals) > 1 else 0)
-
-        filter_label = st.selectbox("View", opt_keys, index=default_idx,
-                                    key="tree_filter_sel", label_visibility="collapsed")
-        filter_id = filter_opts[filter_label]
-        if filter_id == "FLOATING":
-            fid = None
-            # Build a special floating-only node list
-            _float_ids = set()
-            _fq = [n["id"] for n in floating_roots]
-            while _fq:
-                _cur = _fq.pop()
-                if _cur in _float_ids: continue
-                _float_ids.add(_cur)
-                for _ch in [n for n in nodes if _cur in (n.get("parentIds") or [])]:
-                    _fq.append(_ch["id"])
-            _float_nodes = [n for n in nodes if n["id"] in _float_ids]
-            ts = st.session_state.tree_state
-            pending_pos = st.session_state.get("_pending_positions", {})
-            if pending_pos:
-                ts = dict(ts)
-                ts["positions"] = {**ts.get("positions", {}), **pending_pos}
-            tree_html = build_html_tree(_float_nodes, filter_hazard_id=None, tree_state=ts)
-            if tree_html:
-                components.html(tree_html, height=780, scrolling=False)
-            else:
-                st.markdown("<div style='color:#4caf7d;text-align:center;margin-top:60px;'>No floating nodes yet.</div>", unsafe_allow_html=True)
+        filt_opts  = {"ALL": None} | {h["name"]: h["id"] for h in hazards}
+        filt_label = st.selectbox("Filter by hazard", list(filt_opts.keys()),
+                                  key="tree_filter_sel", label_visibility="collapsed")
+        filt_id    = filt_opts[filt_label]
+        tree_html  = build_html_tree(nodes, filter_hazard_id=filt_id,
+                                     tree_state=st.session_state.tree_state)
+        if tree_html:
+            components.html(tree_html, height=700, scrolling=False)
         else:
-            fid = None if filter_id == "ALL" else filter_id
+            st.info("No nodes visible for this filter.")
 
-        # When user changes hazard in dropdown → focus on that hazard
-        if filter_id != saved_filter:
-            st.session_state.tree_filter = filter_id
-            st.session_state.tree_state["focus_id"] = fid if filter_id != "FLOATING" else None
+# ── TAB 2: VERIFY (NEW — PFTA integration) ───────────────────────────────
+with tab_verify:
+    render_pfta_verification(nodes)
 
-        if filter_id != "FLOATING":
-            ts = st.session_state.tree_state
-            st.markdown(
-                "<div style='font-size:9px;color:#333;margin-bottom:3px;'>"
-                "⚡ Force ON/OFF · Scroll=zoom · Right-drag=pan · Left-drag=move · "
-                "Click=inspect · Ctrl+click=multi-select · Dbl-click=collapse"
-                "</div>", unsafe_allow_html=True)
-
-            # ── Hash-based cache ──────────────────────────────────────────
-            import hashlib as _hl, json as _js
-            _hash_data = _js.dumps([{
-                "id": n["id"], "name": n["name"], "type": n["type"],
-                "gate": n["gate"], "val": fmt(n.get("calculatedValue")),
-                "parents": sorted(n.get("parentIds") or []),
-                "fixed": str(n.get("fixedValue"))
-            } for n in nodes], sort_keys=True) + (fid or "ALL")
-
-            # Always inject latest pending positions into tree state
-            pending_pos = st.session_state.get("_pending_positions", {})
-            if pending_pos:
-                ts = dict(ts)
-                ts["positions"] = {**ts.get("positions", {}), **pending_pos}
-
-            # Include a position fingerprint so cache rebuilds when layout changes
-            _pos_fingerprint = str(len(pending_pos)) + str(sorted(pending_pos.keys())[:5])
-            tree_key = _hl.md5((_hash_data + _pos_fingerprint).encode()).hexdigest()[:12]
-
-            if st.session_state.nodes_hash != tree_key:
-                st.session_state.nodes_hash = tree_key
-                tree_html = build_html_tree(nodes, filter_hazard_id=fid, tree_state=ts)
-                st.session_state["_cached_tree_html"] = tree_html
-            else:
-                tree_html = st.session_state.get("_cached_tree_html") or \
-                            build_html_tree(nodes, filter_hazard_id=fid, tree_state=ts)
-
-            components.html(tree_html, height=780, scrolling=False)
-            st.session_state.tree_state["focus_id"] = None
-
-        # ── Message receiver (position + multi-select) ────────────────
-        components.html("""
-        <script>
-        window.addEventListener("message", function(e){
-            try{
-                const d = typeof e.data === "string" ? JSON.parse(e.data) : e.data;
-                if(d && d.type === "fta_pos"){
-                    // Store in localStorage (persists across page reloads in same browser)
-                    try{ localStorage.setItem("fta_pos_v2", JSON.stringify(d.data)); }catch(ex){}
-                    // Also write compact form to parent URL for Python to read
-                    try{
-                        const url = new URL(window.parent.location.href);
-                        const posStr = Object.entries(d.data)
-                            .map(([id,p])=>id+':'+p.x+':'+p.y+':'+(p.manual?1:0))
-                            .join(',');
-                        if(posStr.length < 4000){
-                            url.searchParams.set("fpos", posStr);
-                        } else {
-                            // Too long for URL — just store in localStorage
-                            url.searchParams.delete("fpos");
-                        }
-                        window.parent.history.replaceState(null,"",url.toString());
-                    }catch(ex){}
-                }
-                if(d && d.type === "fta_multisel"){
-                    const ids = d.data.map(n=>n.id).join(",");
-                    try{
-                        const url = new URL(window.parent.location.href);
-                        if(ids){ url.searchParams.set("msel", ids); }
-                        else   { url.searchParams.delete("msel"); }
-                        window.parent.history.replaceState(null,"",url.toString());
-                    }catch(ex){}
-                }
-            }catch(err){}
-        });
-        // On load, restore positions from localStorage into the tree iframe
-        window.addEventListener("load", function(){
-            try{
-                const saved = localStorage.getItem("fta_pos_v2");
-                if(saved){
-                    const frames = document.querySelectorAll("iframe");
-                    frames.forEach(f=>{
-                        try{ f.contentWindow.postMessage(
-                            JSON.stringify({type:"fta_restore_pos", data:JSON.parse(saved)}), "*");
-                        }catch(ex){}
-                    });
-                }
-            }catch(err){}
-        });
-        </script>
-        """, height=0)
-
-        # Read positions from query params
-        try:
-            _qp_pos = st.query_params.get("fpos","")
-            if _qp_pos:
-                _pending = {}
-                for _entry in _qp_pos.split(","):
-                    _parts = _entry.split(":")
-                    if len(_parts) >= 3:
-                        try:
-                            _nid = _parts[0]
-                            _x, _y = float(_parts[1]), float(_parts[2])
-                            _manual = len(_parts) > 3 and _parts[3] == "1"
-                            _pending[_nid] = {"x": _x, "y": _y, "manual": _manual}
-                        except: pass
-                if _pending:
-                    # Merge with existing — don't overwrite positions for nodes
-                    # that already have saved positions
-                    existing = st.session_state.get("_pending_positions", {})
-                    existing.update(_pending)
-                    st.session_state["_pending_positions"] = existing
-        except Exception:
-            pass
-
-        # Read multi-select from query params
-        try:
-            _qp_msel = st.query_params.get("msel","")
-            if _qp_msel:
-                _new_ids = [i for i in _qp_msel.split(",") if i in by_id]
-                if _new_ids != st.session_state.multisel_ids:
-                    st.session_state.multisel_ids = _new_ids
-        except Exception:
-            pass
-
-# ── TAB 2: Hierarchy ─────────────────────────────────────────────────────
+# ── TAB 3: HIERARCHY ─────────────────────────────────────────────────────
 with tab_hier:
     if not nodes:
-        st.markdown("<div style='color:#333;text-align:center;'>No nodes yet</div>", unsafe_allow_html=True)
+        st.markdown("<div style='color:#333;text-align:center;margin-top:40px;'>No nodes yet</div>",
+                    unsafe_allow_html=True)
     else:
-        h_opts = {"All Hazards": None} | {h["name"]: h["id"] for h in hazards}
-        h_sel  = st.selectbox("Filter by Hazard", list(h_opts.keys()), key="hier_filter")
-        rows   = build_hierarchy_rows(nodes, filter_hazard_id=h_opts[h_sel])
-        for row in rows:
-            node = row["node"]; depth = row["depth"]; is_ref = row.get("ref", False)
-            color     = LEVEL_COLORS.get(node["type"], "#888")
-            val       = fmt(node.get("calculatedValue"))
-            node_id   = node.get("nodeId", "")
-            ft_lbl    = node.get("ftLabel", "")
-            indent    = depth * 24
-            is_pinned = node.get("fixedValue") is not None
+        fh_opts  = {"ALL hazards": None} | {h["name"]: h["id"] for h in hazards}
+        fh_label = st.selectbox("Filter", list(fh_opts.keys()), key="hier_filter",
+                                label_visibility="collapsed")
+        fh_id    = fh_opts[fh_label]
+        rows     = build_hierarchy_rows(nodes, filter_hazard_id=fh_id)
+
+        for r in rows:
+            node  = r["node"]
+            depth = r["depth"]
+            is_ref = r["ref"]
+            color  = LEVEL_COLORS.get(node["type"], "#7e57c2")
+            val    = fmt(node.get("calculatedValue"))
+            indent = depth * 20
+            val_color  = "#e94560" if node.get("fixedValue") is not None else color
+            val_display = val + (" 📌" if node.get("fixedValue") is not None else "")
+            tgt_str = fmt(node.get("targetValue")) if node.get("targetValue") else ""
+            node_id = node.get("nodeId", node["id"])
             is_shared = len(node.get("parentIds") or []) > 1
-
-            ref_tag    = '<span style="background:#2a2a2a;color:#777;font-size:7px;padding:1px 4px;border-radius:4px;margin-left:4px;">REF</span>' if is_ref else ""
-            shared_tag = '<span style="background:#f5c518;color:#111;font-size:7px;padding:1px 4px;border-radius:4px;margin-left:4px;font-weight:700;">SHARED</span>' if is_shared else ""
-            pin_tag    = f'<span style="background:#e9456022;color:#e94560;font-size:7px;padding:1px 4px;border-radius:4px;margin-left:4px;border:1px solid #e9456044;">📌 {fmt(node.get("fixedValue"))}</span>' if is_pinned else ""
-            gate_col   = "#4fc3f7" if node["gate"] == "OR" else "#ffb74d"
-            gate_tag   = f'<span style="color:{gate_col};font-size:8px;margin-left:5px;font-weight:700;">[{node["gate"]}]</span>'
-            nid_tag    = f'<code style="background:#1a1a2e;color:{color};font-size:8px;padding:1px 5px;border-radius:3px;margin-left:5px;">{node_id}</code>' if node_id else ""
-            ft_tag     = f'<code style="background:#1a1a2e;color:#7e57c2;font-size:8px;padding:1px 5px;border-radius:3px;margin-left:4px;">{ft_lbl}</code>' if ft_lbl else ""
-            val_color  = "#e94560" if is_pinned else color
-
+            pnames = " · ".join(by_id[p]["name"] for p in (node.get("parentIds") or []) if p in by_id) or "—"
+            cnames = " · ".join(n["name"] for n in nodes if node["id"] in (n.get("parentIds") or [])) or "—"
+            shape_style = "border-radius:50px;" if node["type"] == "GROUP" else "border-radius:6px;"
+            pin_border  = "border:2px solid #e94560;" if node.get("fixedValue") is not None else f"border:1px solid {color}33;"
+            ref_style   = "opacity:0.55;border-style:dashed;" if is_ref else ""
             st.markdown(f"""
-            <div style="display:flex;align-items:center;padding:5px 10px;margin-left:{indent}px;
-                        margin-bottom:2px;background:#141414;
-                        border-left:3px solid {color};border-radius:0 5px 5px 0;
-                        {'border:1px solid #e9456033;' if is_pinned else ''}">
-              <div style="flex:1;min-width:0;">
-                <span style="color:#444;font-size:9px;">{'└─ ' if depth>0 else ''}</span>
-                <span style="font-weight:{'700' if depth==0 else '500'};color:#ddd;font-size:11px;">{esc(node['name'])}</span>
-                <span style="font-size:8px;color:#555;margin-left:5px;">{node['type']}</span>
-                {nid_tag}{ft_tag}{gate_tag}{shared_tag}{pin_tag}{ref_tag}
+            <div style="margin-left:{indent}px;background:#141414;{pin_border}{shape_style}{ref_style}
+                        padding:7px 12px;margin-bottom:3px;">
+              <div style="display:grid;grid-template-columns:2fr 0.6fr 0.6fr 1.2fr 1.8fr;gap:8px;align-items:center;">
+                <div>
+                  <span style="font-size:11px;font-weight:700;color:#ddd;">{esc(node['name'])}</span>
+                  {'<span style="background:#f5c518;color:#111;font-size:7px;padding:0 3px;border-radius:3px;margin-left:5px;font-weight:700;">SHR</span>' if is_shared else ''}
+                  {'<span style="background:#4444aa;color:#fff;font-size:7px;padding:0 3px;border-radius:3px;margin-left:3px;">REF</span>' if is_ref else ''}
+                </div>
+                <div style="font-size:7px;color:#444;letter-spacing:1px;margin-bottom:1px;">
+                  <div>NODE ID</div><div style="font-size:10px;color:{color};font-weight:700;font-family:monospace;">{esc(node_id)}</div>
+                </div>
+                <div>
+                  <div style="font-size:7px;color:#444;letter-spacing:1px;">TYPE</div>
+                  <div style="font-size:10px;color:{color};font-weight:700;">{esc(node['type'])}</div>
+                </div>
+                <div>
+                  <div style="font-size:7px;color:#444;letter-spacing:1px;">CALC VALUE</div>
+                  <div style="font-size:11px;color:{val_color};font-weight:700;font-family:monospace;">{val_display}</div>
+                  {f'<div style="font-size:8px;color:#555;font-family:monospace;">target: {tgt_str}</div>' if tgt_str else ''}
+                </div>
+                <div>
+                  <div style="font-size:9px;color:#555;">↑ {pnames}</div>
+                  <div style="font-size:9px;color:#444;">↓ {cnames}</div>
+                </div>
               </div>
-              <div style="font-weight:700;font-size:12px;color:{val_color};
-                          font-family:monospace;flex-shrink:0;margin-left:12px;">{val}</div>
             </div>""", unsafe_allow_html=True)
-
-# ── TAB 3: Values ─────────────────────────────────────────────────────────
-with tab_vals:
-    if not nodes:
-        st.markdown("<div style='color:#333;text-align:center;'>No nodes yet</div>", unsafe_allow_html=True)
-    else:
-        # Filter by hazard
-        hf_opts = {"All Hazards": None} | {h["name"]: h["id"] for h in hazards}
-        hf_sel  = st.selectbox("Filter by Hazard", list(hf_opts.keys()), key="vals_filter")
-        hf_id   = hf_opts[hf_sel]
-
-        # If filtered, collect nodes reachable from that hazard
-        if hf_id:
-            visible = set(); q = [hf_id]
-            while q:
-                cur = q.pop()
-                if cur in visible: continue
-                visible.add(cur)
-                for child in [n for n in nodes if cur in (n.get("parentIds") or [])]: q.append(child["id"])
-            show = [n for n in nodes if n["id"] in visible]
-        else:
-            show = nodes
-
-        show_by_level = {lvl: [n for n in show if n["type"] == lvl] for lvl in DISPLAY_ORDER}
-
-        for level in DISPLAY_ORDER:
-            lvl_nodes = show_by_level[level]
-            if not lvl_nodes: continue
-            color = LEVEL_COLORS[level]
-            st.markdown(f"<div style='font-size:9px;letter-spacing:3px;color:{color};border-bottom:1px solid {color}33;padding-bottom:3px;margin:12px 0 5px;'>{level} — {len(lvl_nodes)} nodes</div>", unsafe_allow_html=True)
-            for node in lvl_nodes:
-                pnames    = " · ".join(by_id[p]["name"] for p in (node.get("parentIds") or []) if p in by_id) or "—"
-                cnames    = " · ".join(n["name"] for n in nodes if node["id"] in (n.get("parentIds") or [])) or "—"
-                is_shared = len(node.get("parentIds") or []) > 1
-                is_pinned = node.get("fixedValue") is not None
-                gc        = "#4fc3f7" if node["gate"] == "OR" else "#ffb74d"
-                val_color = "#e94560" if is_pinned else color
-                val_str   = fmt(node.get("calculatedValue"))
-                val_display = f"{val_str} 📌" if is_pinned else val_str
-                node_id   = node.get("nodeId", node["id"])
-                ft_lbl    = node.get("ftLabel", "")
-                tgt_str   = fmt(node.get("targetValue")) if node.get("targetValue") else ""
-
-                badges = ""
-                if is_shared: badges += '<span style="background:#f5c518;color:#111;font-size:7px;padding:1px 4px;border-radius:3px;font-weight:700;margin-right:3px;">SHARED</span>'
-                if is_pinned: badges += f'<span style="background:#e9456022;color:#e94560;font-size:7px;padding:1px 4px;border-radius:3px;font-weight:700;border:1px solid #e9456044;">📌 FIXED={fmt(node.get("fixedValue"))}</span>'
-                if ft_lbl:    badges += f'<span style="background:#1a1a2e;color:#7e57c2;font-size:7px;padding:1px 4px;border-radius:3px;font-weight:700;margin-left:3px;border:1px solid #7e57c244;">{ft_lbl}</span>'
-
-                st.markdown(f"""
-                <div style="background:#141414;border:1px solid {'#e9456044' if is_pinned else '#1e1e1e'};
-                            border-radius:6px;padding:7px 12px;margin-bottom:3px;">
-                  <div style="display:grid;grid-template-columns:1.8fr 0.7fr 0.7fr 0.7fr 1.2fr 2fr;gap:8px;align-items:start;">
-                    <div>
-                      <div style="font-weight:700;font-size:11px;color:#ddd;margin-bottom:2px;">{esc(node['name'])}</div>
-                      <div style="font-size:8px;">{badges}</div>
-                    </div>
-                    <div>
-                      <div style="font-size:7px;color:#444;letter-spacing:1px;margin-bottom:1px;">NODE ID</div>
-                      <div style="font-size:10px;color:{color};font-weight:700;font-family:monospace;">{esc(node_id)}</div>
-                    </div>
-                    <div>
-                      <div style="font-size:7px;color:#444;letter-spacing:1px;margin-bottom:1px;">TYPE</div>
-                      <div style="font-size:10px;color:{color};font-weight:700;">{esc(node['type'])}</div>
-                    </div>
-                    <div>
-                      <div style="font-size:7px;color:#444;letter-spacing:1px;margin-bottom:1px;">GATE</div>
-                      <div style="font-size:10px;color:{gc};font-weight:700;">{esc(node['gate'])}</div>
-                    </div>
-                    <div>
-                      <div style="font-size:7px;color:#444;letter-spacing:1px;margin-bottom:1px;">CALC VALUE</div>
-                      <div style="font-size:11px;color:{val_color};font-weight:700;font-family:monospace;">{val_display}</div>
-                      {f'<div style="font-size:8px;color:#555;font-family:monospace;">target: {tgt_str}</div>' if tgt_str else ''}
-                    </div>
-                    <div>
-                      <div style="font-size:7px;color:#444;letter-spacing:1px;margin-bottom:1px;">PARENTS → CHILDREN</div>
-                      <div style="font-size:9px;color:#555;line-height:1.5;">↑ {pnames}</div>
-                      <div style="font-size:9px;color:#444;line-height:1.5;">↓ {cnames}</div>
-                    </div>
-                  </div>
-                </div>""", unsafe_allow_html=True)
 
         st.markdown("---")
         cols = st.columns(6)
-        counts = [(lvl, len(show_by_level[lvl])) for lvl in DISPLAY_ORDER]
-        counts += [("TOTAL", len(show)), ("📌 PINNED", sum(1 for n in show if n.get("fixedValue") is not None))]
+        counts = [(lvl, len(by_level[lvl])) for lvl in DISPLAY_ORDER]
+        counts += [("TOTAL", len(nodes)), ("📌 PINNED", sum(1 for n in nodes if n.get("fixedValue") is not None))]
         for i,(lvl,cnt) in enumerate(counts):
             with cols[i%6]:
                 c = "#e94560" if lvl == "📌 PINNED" else LEVEL_COLORS.get(lvl,"#e94560")
@@ -2890,109 +1995,124 @@ with tab_vals:
                   <div style="font-size:18px;font-weight:700;color:{c};">{cnt}</div>
                 </div>""", unsafe_allow_html=True)
 
-# ── TAB 4: Search ──────────────────────────────────────────────────────────
+# ── TAB 4: DATA ───────────────────────────────────────────────────────────
+with tab_data:
+    if not nodes:
+        st.markdown("<div style='color:#333;text-align:center;margin-top:40px;'>No nodes yet</div>",
+                    unsafe_allow_html=True)
+    else:
+        show_by_level = {lvl: [n for n in nodes if n["type"] == lvl] for lvl in DISPLAY_ORDER}
+        for level in DISPLAY_ORDER:
+            lvl_nodes = show_by_level[level]
+            if not lvl_nodes: continue
+            color = LEVEL_COLORS.get(level, "#7e57c2")
+            st.markdown(f"<div style='font-size:9px;letter-spacing:3px;color:{color};border-bottom:1px solid {color}33;padding-bottom:3px;margin:10px 0 5px;'>{level} — {len(lvl_nodes)} nodes</div>", unsafe_allow_html=True)
+            for node in lvl_nodes:
+                color     = LEVEL_COLORS.get(node["type"], "#7e57c2")
+                gc        = "#4fc3f7" if node["gate"] == "OR" else "#ffb74d"
+                val       = fmt(node.get("calculatedValue"))
+                node_id   = node.get("nodeId", node["id"])
+                ft_lbl    = node.get("ftLabel","")
+                pnames    = " · ".join(by_id[p]["name"] for p in (node.get("parentIds") or []) if p in by_id) or "—"
+                cnames    = " · ".join(n["name"] for n in nodes if node["id"] in (n.get("parentIds") or [])) or "—"
+                is_shared = len(node.get("parentIds") or []) > 1
+                is_pinned = node.get("fixedValue") is not None
+                val_color = "#e94560" if is_pinned else color
+                tgt_str   = fmt(node.get("targetValue")) if node.get("targetValue") else ""
+                shape_style = "border-radius:50px;" if node["type"] == "GROUP" else "border-radius:6px;"
+                pin_border  = "border:2px solid #e94560;" if is_pinned else f"border:2px solid {color}44;"
+                badges = f'<code style="background:#1a1a2e;color:{color};font-size:9px;padding:1px 5px;border-radius:3px;font-weight:700;">{node_id}</code>'
+                if ft_lbl: badges += f' <code style="background:#1a1a2e;color:#7e57c2;font-size:9px;padding:1px 5px;border-radius:3px;">{ft_lbl}</code>'
+                if is_shared: badges += ' <span style="background:#f5c518;color:#111;font-size:7px;padding:1px 4px;border-radius:3px;font-weight:700;">SHARED</span>'
+                if is_pinned: badges += f' <span style="background:#e9456022;color:#e94560;font-size:7px;padding:1px 4px;border-radius:3px;border:1px solid #e9456044;">📌 FIXED={fmt(node.get("fixedValue"))}</span>'
+                st.markdown(f"""
+                <div style="background:#141414;{pin_border}{shape_style}padding:9px 14px;margin-bottom:5px;">
+                  <div style="display:grid;grid-template-columns:2.5fr 0.7fr 0.7fr 1.5fr 2fr;gap:10px;align-items:start;">
+                    <div>
+                      <div style="font-weight:700;font-size:11px;color:#ddd;margin-bottom:3px;">{esc(node['name'])}</div>
+                      <div>{badges}</div>
+                    </div>
+                    <div><div style="font-size:7px;color:#444;">TYPE</div><div style="font-size:10px;color:{color};font-weight:700;">{node['type']}</div></div>
+                    <div><div style="font-size:7px;color:#444;">GATE</div><div style="font-size:10px;color:{gc};font-weight:700;">{node['gate']}</div></div>
+                    <div>
+                      <div style="font-size:7px;color:#444;">CALC VALUE</div>
+                      <div style="font-size:11px;color:{val_color};font-weight:700;font-family:monospace;">{val}{'📌' if is_pinned else ''}</div>
+                      {f'<div style="font-size:8px;color:#555;font-family:monospace;">target: {tgt_str}</div>' if tgt_str else ''}
+                    </div>
+                    <div>
+                      <div style="font-size:8px;color:#444;">↑ {pnames}</div>
+                      <div style="font-size:8px;color:#333;margin-top:2px;">↓ {cnames}</div>
+                    </div>
+                  </div>
+                </div>""", unsafe_allow_html=True)
+
+# ── TAB 5: SEARCH ─────────────────────────────────────────────────────────
 with tab_search:
     if not nodes:
         st.markdown("<div style='color:#333;text-align:center;margin-top:40px;'>No nodes yet</div>", unsafe_allow_html=True)
     else:
-        st.markdown("<div style='font-size:9px;color:#555;letter-spacing:2px;margin-bottom:10px;'>SEARCH ACROSS ALL NODES — by name, type, value, or gate</div>", unsafe_allow_html=True)
+        st.markdown("<div style='font-size:9px;color:#555;letter-spacing:2px;margin-bottom:10px;'>SEARCH ACROSS ALL NODES</div>", unsafe_allow_html=True)
         sq = st.text_input("Search", placeholder="e.g. IF-016, isolation, 1.25e-04, AND", key="search_q", label_visibility="collapsed")
-
         if sq.strip():
             lq = sq.strip().lower()
             matches = [n for n in nodes if (
-                lq in n["name"].lower() or
-                lq in n["type"].lower() or
-                lq in n["gate"].lower() or
-                lq in fmt(n.get("calculatedValue")).lower() or
-                lq in (n.get("nodeId","")).lower() or
-                lq in (n.get("ftLabel","")).lower()
+                lq in n["name"].lower() or lq in n["type"].lower() or
+                lq in n["gate"].lower() or lq in fmt(n.get("calculatedValue")).lower() or
+                lq in (n.get("nodeId","")).lower() or lq in (n.get("ftLabel","")).lower()
             )]
             st.markdown(f"<div style='font-size:10px;color:#ff8c42;margin-bottom:8px;'>{len(matches)} result(s) for <b>\"{sq}\"</b></div>", unsafe_allow_html=True)
-
-            if not matches:
-                st.markdown("<div style='color:#555;font-size:11px;'>No nodes matched.</div>", unsafe_allow_html=True)
-            else:
-                for node in matches:
-                    color     = LEVEL_COLORS.get(node["type"], "#7e57c2")
-                    gc        = "#4fc3f7" if node["gate"] == "OR" else "#ffb74d"
-                    val       = fmt(node.get("calculatedValue"))
-                    node_id   = node.get("nodeId", node["id"])
-                    ft_lbl    = node.get("ftLabel","")
-                    pnames    = " · ".join(by_id[p]["name"] for p in (node.get("parentIds") or []) if p in by_id) or "—"
-                    cnames    = " · ".join(n["name"] for n in nodes if node["id"] in (n.get("parentIds") or [])) or "—"
-                    is_shared = len(node.get("parentIds") or []) > 1
-                    is_group  = node["type"] == "GROUP"
-                    is_pinned = node.get("fixedValue") is not None
-                    val_color = "#e94560" if is_pinned else color
-
-                    # Highlight matched text in name
-                    display_name = node["name"]
-                    try:
-                        idx = display_name.lower().index(lq)
-                        display_name = (display_name[:idx] +
-                            f'<span style="background:#f5c518;color:#111;border-radius:2px;padding:0 2px;">{display_name[idx:idx+len(lq)]}</span>' +
-                            display_name[idx+len(lq):])
-                    except ValueError:
-                        pass
-
-                    shape_style = "border-radius:50px;" if is_group else "border-radius:6px;"
-                    pin_border  = "border:2px solid #e94560;" if is_pinned else f"border:2px solid {color}44;"
-
-                    badges = f'<code style="background:#1a1a2e;color:{color};font-size:9px;padding:1px 5px;border-radius:3px;font-weight:700;">{node_id}</code>'
-                    if ft_lbl: badges += f' <code style="background:#1a1a2e;color:#7e57c2;font-size:9px;padding:1px 5px;border-radius:3px;">{ft_lbl}</code>'
-                    if is_shared: badges += ' <span style="background:#f5c518;color:#111;font-size:7px;padding:1px 4px;border-radius:3px;font-weight:700;">SHARED</span>'
-                    if is_pinned: badges += f' <span style="background:#e9456022;color:#e94560;font-size:7px;padding:1px 4px;border-radius:3px;border:1px solid #e9456044;">📌 FIXED={fmt(node.get("fixedValue"))}</span>'
-                    if is_group:  badges += ' <span style="background:#7e57c222;color:#7e57c2;font-size:7px;padding:1px 4px;border-radius:3px;">GROUP</span>'
-
-                    st.markdown(f"""
-                    <div style="background:#141414;{pin_border}{shape_style}
-                                padding:9px 14px;margin-bottom:5px;">
-                      <div style="display:grid;grid-template-columns:2.5fr 0.7fr 0.7fr 1.5fr 2fr;gap:10px;align-items:start;">
-                        <div>
-                          <div style="font-weight:700;font-size:11px;color:#ddd;margin-bottom:3px;">{display_name}</div>
-                          <div>{badges}</div>
-                        </div>
-                        <div>
-                          <div style="font-size:7px;color:#444;letter-spacing:1px;">TYPE</div>
-                          <div style="font-size:10px;color:{color};font-weight:700;">{node['type']}</div>
-                        </div>
-                        <div>
-                          <div style="font-size:7px;color:#444;letter-spacing:1px;">GATE</div>
-                          <div style="font-size:10px;color:{gc};font-weight:700;">{node['gate']}</div>
-                        </div>
-                        <div>
-                          <div style="font-size:7px;color:#444;letter-spacing:1px;">VALUE</div>
-                          <div style="font-size:11px;color:{val_color};font-weight:700;font-family:monospace;">{val}{'📌' if is_pinned else ''}</div>
-                        </div>
-                        <div>
-                          <div style="font-size:8px;color:#444;">↑ {pnames}</div>
-                          <div style="font-size:8px;color:#333;margin-top:2px;">↓ {cnames}</div>
-                        </div>
-                      </div>
-                    </div>""", unsafe_allow_html=True)
+            for node in matches:
+                color    = LEVEL_COLORS.get(node["type"], "#7e57c2")
+                gc       = "#4fc3f7" if node["gate"] == "OR" else "#ffb74d"
+                val      = fmt(node.get("calculatedValue"))
+                node_id  = node.get("nodeId", node["id"])
+                pnames   = " · ".join(by_id[p]["name"] for p in (node.get("parentIds") or []) if p in by_id) or "—"
+                cnames   = " · ".join(n["name"] for n in nodes if node["id"] in (n.get("parentIds") or [])) or "—"
+                is_shared = len(node.get("parentIds") or []) > 1
+                is_pinned = node.get("fixedValue") is not None
+                val_color = "#e94560" if is_pinned else color
+                display_name = node["name"]
+                try:
+                    idx = display_name.lower().index(lq)
+                    display_name = (display_name[:idx] +
+                        f'<span style="background:#f5c518;color:#111;border-radius:2px;padding:0 2px;">{display_name[idx:idx+len(lq)]}</span>' +
+                        display_name[idx+len(lq):])
+                except ValueError:
+                    pass
+                st.markdown(f"""
+                <div style="background:#141414;border:2px solid {color}44;border-radius:6px;padding:9px 14px;margin-bottom:5px;">
+                  <div style="display:grid;grid-template-columns:2.5fr 0.7fr 0.7fr 1.5fr 2fr;gap:10px;align-items:start;">
+                    <div><div style="font-weight:700;font-size:11px;color:#ddd;">{display_name}</div>
+                      <code style="font-size:9px;color:{color};">{node_id}</code>
+                      {'<span style="background:#f5c518;color:#111;font-size:7px;padding:0 3px;border-radius:3px;margin-left:4px;">SHR</span>' if is_shared else ''}
+                    </div>
+                    <div><div style="font-size:7px;color:#444;">TYPE</div><div style="font-size:10px;color:{color};font-weight:700;">{node['type']}</div></div>
+                    <div><div style="font-size:7px;color:#444;">GATE</div><div style="font-size:10px;color:{gc};font-weight:700;">{node['gate']}</div></div>
+                    <div><div style="font-size:7px;color:#444;">VALUE</div><div style="font-size:11px;color:{val_color};font-weight:700;font-family:monospace;">{val}{'📌' if is_pinned else ''}</div></div>
+                    <div><div style="font-size:8px;color:#444;">↑ {pnames}</div><div style="font-size:8px;color:#333;">↓ {cnames}</div></div>
+                  </div>
+                </div>""", unsafe_allow_html=True)
         else:
-            # Summary table when no search query
-            st.markdown("<div style='font-size:9px;color:#555;margin-bottom:8px;'>Enter a search term above, or browse all nodes below:</div>", unsafe_allow_html=True)
             for level in DISPLAY_ORDER:
                 lvl_nodes = by_level[level]
                 if not lvl_nodes: continue
                 color = LEVEL_COLORS.get(level, "#7e57c2")
                 st.markdown(f"<div style='font-size:9px;letter-spacing:3px;color:{color};border-bottom:1px solid {color}33;padding-bottom:3px;margin:10px 0 5px;'>{level} — {len(lvl_nodes)} nodes</div>", unsafe_allow_html=True)
                 for node in lvl_nodes:
-                    val    = fmt(node.get("calculatedValue"))
+                    val   = fmt(node.get("calculatedValue"))
+                    gc    = "#4fc3f7" if node["gate"] == "OR" else "#ffb74d"
                     pnames = " · ".join(by_id[p]["name"] for p in (node.get("parentIds") or []) if p in by_id) or "—"
-                    gc     = "#4fc3f7" if node["gate"] == "OR" else "#ffb74d"
                     is_shared = len(node.get("parentIds") or []) > 1
+                    c = LEVEL_COLORS.get(node["type"], "#7e57c2")
                     st.markdown(f"""
-                    <div style="background:#141414;border-left:3px solid {color};border-radius:0 5px 5px 0;
+                    <div style="background:#141414;border-left:3px solid {c};border-radius:0 5px 5px 0;
                                 padding:5px 10px;margin-bottom:3px;
                                 display:grid;grid-template-columns:2.5fr 0.7fr 0.7fr 1.5fr 2fr;gap:8px;align-items:center;">
-                      <div style="font-size:10px;color:#ddd;font-weight:{'700' if node['type']=='HAZARD' else '400'};">
+                      <div style="font-size:10px;color:#ddd;">
                         {esc(node['name'])}{'<span style="background:#f5c518;color:#111;font-size:7px;padding:0 3px;border-radius:3px;margin-left:5px;">SHR</span>' if is_shared else ''}
                       </div>
-                      <div style="font-size:9px;color:{color};">{node['type']}</div>
+                      <div style="font-size:9px;color:{c};">{node['type']}</div>
                       <div style="font-size:9px;color:{gc};">{node['gate']}</div>
-                      <div style="font-size:10px;color:{color};font-family:monospace;font-weight:700;">{val}</div>
+                      <div style="font-size:10px;color:{c};font-family:monospace;font-weight:700;">{val}</div>
                       <div style="font-size:9px;color:#555;">{pnames}</div>
                     </div>""", unsafe_allow_html=True)
