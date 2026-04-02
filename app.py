@@ -935,11 +935,12 @@ function ownerSF(id,depth){
 function refresh(){
   const vis=getVis(); const ex={};
   sN.forEach(n=>ex[n.id]=n);
-  sN=vis.map(n=>Object.assign({...n},{x:ex[n.id]?.x??uP[n.id]?.x??null,y:ex[n.id]?.y??uP[n.id]?.y??null,vx:0,vy:0,fx:null,fy:null,bx:500}));
+  sN=vis.map(n=>Object.assign({...n},{x:ex[n.id]?.x??uP[n.id]?.x??null,y:ex[n.id]?.y??uP[n.id]?.y??null,vx:0,vy:0,fx:null,fy:null,bx:null}));
   const vs=new Set(sN.map(n=>n.id));
   sL=RLINKS.filter(l=>vs.has(l.sid)&&vs.has(l.tid)).map(l=>{const s=sN.find(n=>n.id===l.sid),t=sN.find(n=>n.id===l.tid);return s&&t?{source:s,target:t,andGate:l.andGate,shared:l.shared}:null;}).filter(Boolean);
-  sim.nodes(sN); sim.force("link").links(sL); sim.force("x").x(d=>d.bx||400);
-  computeRTLayout(false); drawLinks(); drawNodes(); tick(); updateLanes();
+  computeRTLayout(false);
+  sim.nodes(sN); sim.force("link").links(sL); sim.force("x").x(d=>d.bx||600);
+  drawLinks(); drawNodes(); tick(); updateLanes();
   if(forceOn) sim.alpha(.3).restart();
 }
 function drawLinks(){
@@ -1038,22 +1039,46 @@ function computeRTLayout(reset){
   // Step 1: Assign SF columns — evenly spaced across canvas
   const sfNodes=sN.filter(n=>n.type==="SF");
   const totalSFs=sfNodes.length||1;
-  const canvasW=Math.max(totalSFs*(NW+HG)+200, 1200);
-  const startX=100;
+  const canvasW=Math.max(totalSFs*(NW+HG)+300, 1400);
+  const startX=120;
   const colStep=(canvasW-startX*2)/(totalSFs>1?totalSFs-1:1);
 
+  // Map: sfId -> column center X
+  const sfColX={};
   sfNodes.forEach((sf,i)=>{
     const cx=startX+i*(totalSFs>1?colStep:0);
+    sfColX[sf.id]=cx;
     sf.bx=cx;
     if(reset||!uP[sf.id]?.manual){sf.x=cx;sf.fx=null;sf.fy=null;}
-    // Assign all descendants of this SF the same bx for column alignment
+  });
+
+  // Map every descendant node to its owning SF column
+  // A node can belong to multiple SFs (shared) — use average of their columns
+  const nodeSFCols={};
+  sfNodes.forEach(sf=>{
     const sub=subIds(sf.id);
-    sN.forEach(n=>{
-      if(n.id!==sf.id&&sub.has(n.id)){
-        n.bx=cx;
-        if(reset||!uP[n.id]?.manual){n.x=cx;n.fx=null;n.fy=null;}
-      }
+    sub.forEach(nid=>{
+      if(!nodeSFCols[nid]) nodeSFCols[nid]=[];
+      nodeSFCols[nid].push(sfColX[sf.id]);
     });
+  });
+
+  // Assign bx to ALL nodes (SF descendants + orphans)
+  sN.forEach(n=>{
+    if(n.type==="SF") return; // already done above
+    const cols=nodeSFCols[n.id];
+    if(cols&&cols.length){
+      // Average if shared across multiple SF columns
+      const cx=cols.reduce((a,b)=>a+b,0)/cols.length;
+      n.bx=cx;
+      if(reset||!uP[n.id]?.manual){n.x=cx;n.fx=null;n.fy=null;}
+    } else if(n.type==="HAZARD"){
+      // handled below
+    } else {
+      // Orphan node with no SF parent — place at far right to keep it visible
+      n.bx=canvasW+100;
+      if(reset||!uP[n.id]?.manual){n.x=n.bx;n.fx=null;n.fy=null;}
+    }
   });
 
   // Step 2: HAZARDs sit above their SF children, centered
@@ -1063,7 +1088,7 @@ function computeRTLayout(reset){
     if(reset||!uP[n.id]?.manual){n.x=n.bx;n.fx=null;n.fy=null;}
   });
 
-  // Step 3: Pin Y strictly by node type — no overlap between levels
+  // Step 3: Pin Y strictly by node type — strong layering, no overlap
   sN.forEach(n=>{
     const ty=layY(n);
     if(reset||!uP[n.id]?.manual){n.y=ty;n.fy=null;}
@@ -1113,6 +1138,7 @@ function clearHL(){
 function openDP(id){
   selId=id;
   const n=NM[id]; if(!n) return;
+  sendSelNode(id);
   document.getElementById("dp").style.display="block";
   document.getElementById("dpt").textContent=n.name;
   document.getElementById("dpt").style.color=n.color;
@@ -1125,7 +1151,7 @@ function openDP(id){
   q("d4",n.shared?"YES":"NO",n.shared?"#f5c518":"#555");
   q("d5",(n.pnames||[]).join(" · ")||"(top event)");q("d6",(n.cnames||[]).join(" · ")||"(leaf)");
 }
-function closeDP(){document.getElementById("dp").style.display="none";clearHL();}
+function closeDP(){document.getElementById("dp").style.display="none";clearHL();selId=null;try{window.parent.postMessage(JSON.stringify({type:"fta_selnode",data:null}),"*");}catch(e){}}
 function doSearch(q){
   ng.selectAll("rect.nb").attr("filter",null);sM=[];sI=0;
   if(!q.trim()){document.getElementById("si").textContent="";return;}
@@ -1139,9 +1165,13 @@ function sNext(){if(!sM.length)return;sI=(sI+1)%sM.length;panTo(sM[sI]);document
 function sPrev(){if(!sM.length)return;sI=(sI-1+sM.length)%sM.length;panTo(sM[sI]);document.getElementById("si").textContent=`${sI+1}/${sM.length}`;}
 function panTo(id){
   const n=sN.find(s=>s.id===id);if(!n)return;
-  const t=getT(),cw=wrap.getBoundingClientRect();
-  svg.transition().duration(400).call(zb.transform,d3.zoomIdentity.translate((cw.width||1000)/2-t.k*(n.x||0),(cw.height||650)/3-t.k*(n.y||0)).scale(t.k));
-  setTimeout(updateLanes,420);
+  const cw=wrap.getBoundingClientRect();
+  // Use a comfortable zoom that shows the node in context (not filling screen)
+  const contextK=Math.min(getT().k, 0.55);
+  const cx=cw.width/2-contextK*(n.x||0);
+  const cy=cw.height/2.5-contextK*(n.y||0);
+  svg.transition().duration(500).call(zb.transform,d3.zoomIdentity.translate(cx,cy).scale(contextK));
+  setTimeout(updateLanes,520);
 }
 function toggleMultiSel(id,e){
   if(multiSel.has(id)) multiSel.delete(id);
@@ -1196,6 +1226,20 @@ function sendMultiSel(){
         const n=NM[id]||{};
         return {id,name:n.name||id,nodeId:n.nodeId||id,type:n.type||"",color:n.color||"#888",parents:n.parents||[],children:n.children||[]};
       })
+    }),"*");
+  }catch(e){}
+}
+function sendSelNode(id){
+  try{
+    const n=NM[id]||{};
+    window.parent.postMessage(JSON.stringify({
+      type:"fta_selnode",
+      data:{id,name:n.name||id,nodeId:n.nodeId||id,type:n.type||"",
+            color:n.color||"#888",gate:n.gate||"OR",
+            value:n.value||"-",isPinned:n.isPinned||false,
+            fixedVal:n.fixedVal||null,
+            parents:n.parents||[],pnames:n.pnames||[],
+            children:n.children||[],cnames:n.cnames||[]}
     }),"*");
   }catch(e){}
 }
@@ -1260,6 +1304,7 @@ DEFS = {"nodes":[],"save_status":"idle","save_msg":"","gist_loaded":False,
         "pending_node_names": [],
         "nodes_hash": "",
         "multisel_ids": [],
+        "selected_node": None,
         "_pending_positions": {},
         "tree_state": {
             "scale": 1.0, "tx": 0, "ty": 0,
@@ -1383,6 +1428,71 @@ def render_sidebar():
     nodes  = st.session_state.nodes
     by_id  = {n["id"]: n for n in nodes}
     hazards = [n for n in nodes if n["type"] == "HAZARD"]
+
+    # ── Single-node selection panel (from canvas click) ──────────────────
+    sel_node_data = st.session_state.get("selected_node")
+    if sel_node_data and isinstance(sel_node_data, dict):
+        snd    = sel_node_data
+        sn_id  = snd.get("id")
+        sn_obj = by_id.get(sn_id)
+        c      = LEVEL_COLORS.get(snd.get("type",""), "#888")
+        st.markdown(
+            f"<div style='background:#0d1a0d;border:2px solid {c};border-radius:8px;"
+            f"padding:10px 14px;margin-bottom:8px;'>"
+            f"<div style='font-size:8px;color:{c};font-weight:700;letter-spacing:2px;margin-bottom:5px;'>&#11044; SELECTED NODE</div>"
+            f"<div style='font-weight:700;font-size:12px;color:#ddd;margin-bottom:2px;'>{esc(snd.get('name','?'))}</div>"
+            f"<div style='font-family:monospace;font-size:9px;color:{c};'>{esc(snd.get('nodeId',''))} &nbsp;·&nbsp; "
+            f"{snd.get('type','')} &nbsp;·&nbsp; GATE:{snd.get('gate','')}</div>"
+            f"<div style='font-size:11px;color:{c};font-family:monospace;font-weight:700;margin-top:4px;'>{snd.get('value','-')}"
+            f"{'&nbsp;&#128204;' if snd.get('isPinned') else ''}</div>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+        if sn_obj:
+            _ac1, _ac2, _ac3 = st.columns(3)
+            with _ac1:
+                if st.button("&#128065; Info", key="sn_info_btn", use_container_width=True,
+                             help="Jump to this node in the DATA tab"):
+                    st.session_state["selected_node"] = None
+                    nid_str  = snd.get('nodeId','')
+                    nm_str   = snd.get('name','')
+                    type_str = snd.get('type','')
+                    gate_str = snd.get('gate','')
+                    val_str  = snd.get('value','-')
+                    st.info(f"Node: {nid_str} — {nm_str}\nType: {type_str} | Gate: {gate_str}\nValue: {val_str}")
+            with _ac2:
+                if st.button("&#9998; Edit", key="sn_edit_btn", use_container_width=True,
+                             help="Pre-select this node in the EDIT tab"):
+                    st.session_state["_sidebar_edit_target"] = sn_id
+                    st.session_state["selected_node"] = None
+                    st.rerun()
+            with _ac3:
+                if sn_obj.get("type") != "HAZARD":
+                    if st.button("&#128465; Delete", key="sn_del_btn", use_container_width=True,
+                                 help="Delete this node and its orphaned children"):
+                        pre_roots = {n["id"] for n in nodes if n["type"] != "HAZARD" and not n.get("parentIds")}
+                        tmp = [dict(n) for n in nodes if n["id"] != sn_id]
+                        for n in tmp:
+                            if sn_id in (n.get("parentIds") or []):
+                                n["parentIds"] = [p for p in n["parentIds"] if p != sn_id]
+                        changed = True
+                        while changed:
+                            changed = False
+                            orphans = {n["id"] for n in tmp if n["type"] != "HAZARD" and not n.get("parentIds") and n["id"] not in pre_roots}
+                            if orphans:
+                                tmp = [n for n in tmp if n["id"] not in orphans]
+                                for n in tmp:
+                                    before = len(n.get("parentIds") or [])
+                                    n["parentIds"] = [p for p in (n.get("parentIds") or []) if p not in orphans]
+                                    if len(n.get("parentIds") or []) != before: changed = True
+                        st.session_state["selected_node"] = None
+                        st.session_state.nodes_since_calc += 1
+                        set_nodes(tmp)
+                        st.rerun()
+                else:
+                    st.markdown("<div style='font-size:8px;color:#555;padding-top:6px;'>HAZARD — cannot delete</div>",
+                                unsafe_allow_html=True)
+        st.markdown("<hr style='border-color:#1a1a1a;margin:6px 0;'>", unsafe_allow_html=True)
 
     sel_ids   = st.session_state.get("multisel_ids", [])
     sel_nodes = [by_id[i] for i in sel_ids if i in by_id]
@@ -1679,7 +1789,16 @@ def render_sidebar():
             st.markdown("<div style='color:#555;font-size:11px;'>No nodes yet.</div>", unsafe_allow_html=True)
         else:
             edit_opts  = {f"[{n['type']}] {n.get('nodeId',n['id'])} — {n['name']}": n["id"] for n in nodes}
-            edit_label = st.selectbox("Select node to edit", ["— select —"] + list(edit_opts.keys()), key="edit_sel")
+            # Auto-select node if triggered from canvas click → Edit button
+            _et = st.session_state.pop("_sidebar_edit_target", None)
+            _et_label = None
+            if _et:
+                _et_label = next((k for k,v in edit_opts.items() if v == _et), None)
+            _default_edit_idx = 0
+            if _et_label and _et_label in (["— select —"] + list(edit_opts.keys())):
+                _default_edit_idx = (["— select —"] + list(edit_opts.keys())).index(_et_label)
+            edit_label = st.selectbox("Select node to edit", ["— select —"] + list(edit_opts.keys()),
+                                      index=_default_edit_idx, key="edit_sel")
             if edit_label != "— select —":
                 eid = edit_opts[edit_label]
                 en  = next((n for n in nodes if n["id"] == eid), None)
@@ -1834,6 +1953,9 @@ window.addEventListener("message",function(e){
     if(d&&d.type==="fta_multisel"){
       window.parent.postMessage(JSON.stringify({type:"streamlit:setComponentValue",value:{type:"fta_multisel",data:d.data}}),"*");
     }
+    if(d&&d.type==="fta_selnode"){
+      window.parent.postMessage(JSON.stringify({type:"streamlit:setComponentValue",value:{type:"fta_selnode",data:d.data}}),"*");
+    }
   }catch(err){}
 });
 </script>"""
@@ -1848,6 +1970,11 @@ if msg_val and isinstance(msg_val, dict):
         new_sel = [item["id"] for item in msg_val.get("data",[]) if "id" in item]
         if new_sel != st.session_state.get("multisel_ids",[]):
             st.session_state["multisel_ids"] = new_sel
+            st.rerun(scope="fragment")
+    elif msg_val.get("type") == "fta_selnode":
+        sn_data = msg_val.get("data")  # None = deselect
+        if sn_data != st.session_state.get("selected_node"):
+            st.session_state["selected_node"] = sn_data
             st.rerun(scope="fragment")
 
 with st.sidebar:
