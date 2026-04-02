@@ -708,16 +708,10 @@ def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
         if n.get("_pos") and n["id"] not in init_pos:
             init_pos[n["id"]] = n["_pos"]
 
-    # Define strict row numbers: HAZARD=0, SF=1, FF=2, GROUP=2.5, IF=3
     LEVEL_ROW   = {"HAZARD": 0, "SF": 1, "FF": 2, "GROUP": 2.5, "IF": 3}
     LEVEL_COLOR = {0: "#ff4d4d", 1: "#ff8c42", 2: "#f5c518", 2.5: "#7e57c2", 3: "#4caf7d"}
     LEVEL_LABEL = {0: "HAZARD", 1: "SF", 2: "FF", 2.5: "GROUP", 3: "IF"}
 
-    # Assign row based on type (no dynamic mid-rows needed)
-    def get_node_row(n):
-        return LEVEL_ROW.get(n["type"], 2)
-
-    # Precompute depth for column placement (used only for initial x)
     _depth_map = {}
     def _get_depth(nid, _seen=None):
         if nid in _depth_map: return _depth_map[nid]
@@ -751,16 +745,15 @@ def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
         "isRoot":      n["type"] != "HAZARD" and not [p for p in (n.get("parentIds") or []) if p in shown_ids],
         "color":       LEVEL_COLORS.get(n["type"], "#7e57c2"),
         "tcolor":      LEVEL_TEXT.get(n["type"], "#fff"),
-        "row":         get_node_row(n),
+        "row":         _depth_map.get(n["id"], LEVEL_ROW.get(n["type"], 2)),
         "parents":     [p for p in (n.get("parentIds") or []) if p in shown_ids],
         "pnames":      [by_id[p]["name"] for p in (n.get("parentIds") or []) if p in shown_ids],
         "children":    [c["id"] for c in show_nodes if n["id"] in (c.get("parentIds") or [])],
         "cnames":      [c["name"] for c in show_nodes if n["id"] in (c.get("parentIds") or [])],
     } for n in show_nodes])
 
-    # IMPORTANT: links now go from child (source) to parent (target)
     links_js = _json.dumps([
-        {"source": n["id"], "target": pid,
+        {"sid": pid, "tid": n["id"],
          "andGate": by_id[pid]["gate"] == "AND" if pid in by_id else False,
          "shared":  n["id"] in shared_ids}
         for n in show_nodes
@@ -773,7 +766,7 @@ def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
     level_label_js = _json.dumps({str(k): v for k, v in LEVEL_LABEL.items()})
     level_color_js = _json.dumps({str(k): v for k, v in LEVEL_COLOR.items()})
 
-    # ── D3 HTML tree with improved layout, correct arrows, standard gate symbols ──
+    # ── D3 HTML tree (improved layout + gate symbols + ID highlighting) ────
     html = """<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style>
@@ -822,12 +815,8 @@ svg{position:absolute;inset:0;width:100%;height:100%;}
 #msp{display:none;position:absolute;bottom:0;left:0;right:0;
   background:rgba(8,8,8,.95);border-top:2px solid #4fc3f7;padding:8px 16px 10px;
   z-index:21;backdrop-filter:blur(14px);}
-/* Gate symbol styles */
-.gate-sym{cursor:pointer;}
-.or-gate, .and-gate{fill:#001a1a;stroke:#4fc3f7;stroke-width:1.5;}
-.and-gate{stroke:#ffb74d;}
-.gate-text{font-size:7px;font-weight:700;text-anchor:middle;dominant-baseline:central;fill:#4fc3f7;}
-.and-gate-text{fill:#ffb74d;}
+/* Gate symbol tooltip */
+.gate-sym{pointer-events:all;cursor:default;}
 </style>
 </head><body>
 <div id="toolbar">
@@ -853,7 +842,7 @@ svg{position:absolute;inset:0;width:100%;height:100%;}
   <div id="lanes"></div>
   <svg id="sv">
     <defs>
-      <!-- Arrow markers pointing from child to parent -->
+      <!-- Arrow markers -->
       <marker id="ma"  markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 Z" fill="#444"/></marker>
       <marker id="mah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 Z" fill="#4fc3f7"/></marker>
       <marker id="ma-or"  markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 Z" fill="#4fc3f7"/></marker>
@@ -896,7 +885,8 @@ const FOCUSID=__FOCUS__;
 const LLABELS=__LLABELS__;
 const LCOLORS=__LCOLORS__;
 const GC={OR:"#4fc3f7",AND:"#ffb74d"};
-const NW=200,NH=100,HG=40,VG=180;  // vertical gap increased
+// Wider nodes, more vertical spacing for readability
+const NW=200,NH=100,HG=40,VG=200;
 let selId=null,forceOn=false,forceSub=null;
 let collapsed=new Set(),sM=[],sI=0;
 let multiSel=new Set();
@@ -914,16 +904,25 @@ svg.call(zb).on("contextmenu",e=>e.preventDefault());
 svg.on("click",()=>{closeDP();if(multiSel.size>0)clearMultiSel();});
 function getT(){return d3.zoomTransform(svg.node());}
 
-// Strict row Y positions
-function getNodeRow(n){ return n.row; }
-function layY(n){ return 80 + getNodeRow(n)*VG; }
+// ── Layer Y positions: each type gets its own strict row
+// Shared-parent nodes (multi-SF parents) get an intermediate row between SF and FF
+const TYPE_ROW={HAZARD:0,SF:1,FF:2,GROUP:2,IF:3};
+// Dynamically computed row for nodes with >1 parent SF (intermediate sub-SF layer)
+function getNodeRow(n){
+  if(n._midRow!=null) return n._midRow;
+  return TYPE_ROW[n.type]??2;
+}
+function layY(n){
+  const r=typeof n==="object"?getNodeRow(n):(TYPE_ROW[n]??2);
+  return 100+r*VG;
+}
 
 let sN=[],sL=[];
 const sim=d3.forceSimulation()
   .force("link",d3.forceLink().id(d=>d.id).distance(NW+HG).strength(.25))
   .force("charge",d3.forceManyBody().strength(-1200).distanceMax(700))
   .force("collide",d3.forceCollide(NW*0.7))
-  .force("y",d3.forceY(d=>layY(d)).strength(2.0))
+  .force("y",d3.forceY(d=>layY(d)).strength(3.0))
   .force("x",d3.forceX(d=>d.bx||600).strength(.18))
   .alphaDecay(.018).velocityDecay(.55)
   .on("tick",tick);
@@ -934,20 +933,76 @@ function getVis(){
   collapsed.forEach(cid=>{const q=[cid];while(q.length){const c=q.shift();(NM[c]?.children||[]).forEach(ch=>{if(!h.has(ch)){h.add(ch);q.push(ch);}});}});
   return RNODES.filter(n=>!h.has(n.id));
 }
+function subIds(id){
+  const s=new Set([id]),q=[id];
+  while(q.length){const c=q.shift();(NM[c]?.children||[]).forEach(ch=>{if(!s.has(ch)&&sN.find(n=>n.id===ch)){s.add(ch);q.push(ch);}});}
+  return s;
+}
+function ownerSF(id,depth){
+  if(depth>8) return null;
+  const n=NM[id]; if(!n) return null;
+  if(n.type==="SF") return id;
+  for(const pid of (n.parents||[])){const r=ownerSF(pid,depth+1);if(r)return r;}
+  return null;
+}
+
+// Count IFs under a node (for Force tooltip)
+function countIFs(id){
+  const seen=new Set(),q=[id];
+  let count=0;
+  while(q.length){
+    const c=q.shift();
+    if(seen.has(c))continue;
+    seen.add(c);
+    const n=NM[c];
+    if(!n)continue;
+    if(n.type==="IF") count++;
+    (n.children||[]).forEach(ch=>q.push(ch));
+  }
+  return count;
+}
 
 function refresh(){
   const vis=getVis(); const ex={};
   sN.forEach(n=>ex[n.id]=n);
-  sN=vis.map(n=>Object.assign({...n},{x:ex[n.id]?.x??uP[n.id]?.x??null,y:ex[n.id]?.y??uP[n.id]?.y??null,vx:0,vy:0,fx:null,fy:null,bx:null}));
+  sN=vis.map(n=>Object.assign({...n},{x:ex[n.id]?.x??uP[n.id]?.x??null,y:ex[n.id]?.y??uP[n.id]?.y??null,vx:0,vy:0,fx:null,fy:null,bx:null,_midRow:null}));
   const vs=new Set(sN.map(n=>n.id));
-  sL=RLINKS.filter(l=>vs.has(l.source)&&vs.has(l.target)).map(l=>{
-    const s=sN.find(n=>n.id===l.source),t=sN.find(n=>n.id===l.target);
-    return s&&t?{source:s,target:t,andGate:l.andGate,shared:l.shared}:null;
-  }).filter(Boolean);
+  sL=RLINKS.filter(l=>vs.has(l.sid)&&vs.has(l.tid)).map(l=>{const s=sN.find(n=>n.id===l.sid),t=sN.find(n=>n.id===l.tid);return s&&t?{source:s,target:t,andGate:l.andGate,shared:l.shared}:null;}).filter(Boolean);
+  assignMidRows();
   computeRTLayout(false);
   sim.nodes(sN); sim.force("link").links(sL); sim.force("x").x(d=>d.bx||600);
   drawLinks(); drawGateSymbols(); drawNodes(); tick(); updateLanes();
   if(forceOn) sim.alpha(.3).restart();
+}
+
+// Assign intermediate rows to nodes that have >1 SF in their ancestry
+// so they appear between the SF row and FF row visually
+function assignMidRows(){
+  // Find SF ancestors for each node
+  const sfAncestors={};
+  sN.forEach(n=>{sfAncestors[n.id]=new Set();});
+  // BFS from each SF downward
+  sN.filter(n=>n.type==="SF").forEach(sf=>{
+    const q=[sf.id];const seen=new Set();
+    while(q.length){
+      const cid=q.shift();
+      if(seen.has(cid))continue;seen.add(cid);
+      if(cid!==sf.id){if(!sfAncestors[cid])sfAncestors[cid]=new Set();sfAncestors[cid].add(sf.id);}
+      const n=sN.find(x=>x.id===cid);
+      if(n)(n.children||[]).forEach(ch=>q.push(ch));
+    }
+  });
+  sN.forEach(n=>{
+    const sfSet=sfAncestors[n.id]||new Set();
+    if(n.type==="FF"&&sfSet.size>1){
+      // Multi-SF FF: place between SF row (1) and FF row (2) → row 1.5
+      n._midRow=1.5;
+    } else if(n.type==="GROUP"&&sfSet.size>1){
+      n._midRow=1.5;
+    } else {
+      n._midRow=null;
+    }
+  });
 }
 
 function drawLinks(){
@@ -967,35 +1022,24 @@ function drawLinks(){
   s.exit().remove();
 }
 
-// Standard FTA gate symbols
+// Draw OR / AND gate symbols at the midpoint of each link
 function drawGateSymbols(){
   const s=gg.selectAll("g.gsym").data(sL,d=>d.source.id+"->"+d.target.id);
   const e=s.enter().append("g").attr("class","gsym gate-sym");
-  e.append("path").attr("class","gate-shape");
-  e.append("text").attr("class","gate-text");
+  // OR gate: curved D shape (arc); AND gate: flat-top D shape
+  // We use small SVG path symbols placed at link midpoints
+  e.append("circle").attr("class","gb").attr("r",9);
+  e.append("text").attr("class","gt")
+    .attr("text-anchor","middle").attr("dominant-baseline","central")
+    .attr("font-size","8px").attr("font-weight","700").attr("font-family","monospace");
   const all=e.merge(s);
-  all.each(function(d){
-    const group=d3.select(this);
-    const isAnd = d.andGate;
-    const color = isAnd ? "#ffb74d" : "#4fc3f7";
-    // Draw shape: OR gate = curved D (arc), AND gate = flat-top D (rectangle + arc)
-    const path = group.select("path.gate-shape");
-    if(isAnd){
-      path.attr("d","M-6,-4 L6,-4 A6,6 0 0,1 6,4 L-6,4 Z")
-          .attr("fill","#1a1000")
-          .attr("stroke",color)
-          .attr("stroke-width","1.5");
-    } else {
-      path.attr("d","M-6,-4 A6,6 0 0,0 -6,4 L6,4 L6,-4 Z")
-          .attr("fill","#001a1a")
-          .attr("stroke",color)
-          .attr("stroke-width","1.5");
-    }
-    group.select("text.gate-text")
-        .text(isAnd?"AND":"OR")
-        .attr("fill",color)
-        .attr("x",0).attr("y",0);
-  });
+  all.select("circle.gb")
+    .attr("fill",d=>d.andGate?"#1a1000":"#001a1a")
+    .attr("stroke",d=>d.andGate?"#ffb74d":"#4fc3f7")
+    .attr("stroke-width","1.5");
+  all.select("text.gt")
+    .text(d=>d.andGate?"AND":"OR")
+    .attr("fill",d=>d.andGate?"#ffb74d":"#4fc3f7");
   s.exit().remove();
 }
 
@@ -1003,20 +1047,26 @@ function drawNodes(){
   const s=ng.selectAll("g.nd").data(sN,d=>d.id);
   const e=s.enter().append("g").attr("class","nd").style("cursor","pointer");
   e.append("rect").attr("class","nb").attr("width",NW).attr("height",NH).attr("rx",8);
+  // Row 1: type badge (left) + gate badge (right)
   e.append("text").attr("class","nt").attr("x",8).attr("y",16)
    .attr("font-size","7px").attr("letter-spacing","1.5px").attr("font-weight","700");
   e.append("text").attr("class","ngate").attr("x",NW-8).attr("y",16)
    .attr("text-anchor","end").attr("font-size","7px").attr("font-weight","700");
+  // Row 2: ID prefix (colored) + ID number
   e.append("text").attr("class","nidpfx").attr("x",8).attr("y",33)
    .attr("font-size","9px").attr("font-weight","700").attr("font-family","monospace");
-  e.append("text").attr("class","nidnum").attr("x",0).attr("y",33)
+  e.append("text").attr("class","nidnum").attr("x",0).attr("y",33)  // x set dynamically
    .attr("font-size","9px").attr("font-weight","400").attr("font-family","monospace").attr("fill","#aaa");
+  // Row 3: node name (bold, colored, full width)
   e.append("text").attr("class","nn").attr("x",NW/2).attr("y",52)
    .attr("text-anchor","middle").attr("font-size","11px").attr("font-weight","700");
+  // Row 4: value
   e.append("text").attr("class","nv").attr("x",NW/2).attr("y",70)
    .attr("text-anchor","middle").attr("font-size","12px").attr("font-weight","700").attr("font-family","monospace");
+  // Row 5: ft label
   e.append("text").attr("class","nfl").attr("x",NW/2).attr("y",86)
    .attr("text-anchor","middle").attr("font-size","8px").attr("fill","#7e57c2");
+  // Pin/root/dup icon top-right
   e.append("text").attr("class","nfx").attr("x",NW-6).attr("y",14).attr("text-anchor","end")
    .attr("font-size","9px").attr("fill","#e94560");
   const all=e.merge(s);
@@ -1049,38 +1099,55 @@ function drawNodes(){
     .attr("stroke-dasharray",d=>d.isRoot?"4,4":d.isDuplicate?"6,3":d.isPinned?"6,3":null)
     .attr("fill",d=>`${d.color}14`);
 
+  // Type badge
   all.select("text.nt")
     .text(d=>d.isGroup?"GROUP":d.type)
     .attr("fill",d=>d.color);
+
+  // Gate badge  
   all.select("text.ngate")
     .text(d=>d.gate)
     .attr("fill",d=>d.gate==="AND"?"#ffb74d":"#4fc3f7");
+
+  // ID prefix (e.g. "IF-", "SF-", "IT-") in type color, bold
   all.select("text.nidpfx").each(function(d){
     const nid=d.nodeId&&d.nodeId!==d.id?d.nodeId:"";
     if(!nid){d3.select(this).text("");return;}
+    // Split at last '-' before number: "IF-042" → prefix="IF-", num="042"
     const m=nid.match(/^([A-Za-z]+-?)(\d+.*)$/);
     const pfx=m?m[1]:nid;
     d3.select(this).text(pfx).attr("fill",d.color);
   });
+  // ID number — positioned after prefix text
   all.select("text.nidnum").each(function(d){
     const nid=d.nodeId&&d.nodeId!==d.id?d.nodeId:"";
     if(!nid){d3.select(this).text("");return;}
     const m=nid.match(/^([A-Za-z]+-?)(\d+.*)$/);
     if(!m){d3.select(this).text("").attr("x",8);return;}
     const num=m[2];
+    // Estimate prefix pixel width (monospace ~6.5px per char at 9px font)
     const pfxPx=8+m[1].length*6.2;
     d3.select(this).text(num).attr("x",pfxPx);
   });
+
+  // Node name
   all.select("text.nn")
     .text(d=>{const nm=d.name||"";return nm.length>22?nm.slice(0,21)+"…":nm;})
     .attr("fill",d=>d.color);
+
+  // Value
   all.select("text.nv")
     .text(d=>d.isPinned?(d.fixedVal||d.value)+" 📌":d.value)
     .attr("fill",d=>d.isPinned?"#e94560":d.color);
+
+  // FT Label
   all.select("text.nfl")
     .text(d=>d.ftLabel?`[${d.ftLabel}]`:"");
+
+  // Icons
   all.select("text.nfx")
     .text(d=>d.isPinned?"📌":d.isRoot?"⬡":d.isDuplicate?"◈":"");
+
   s.exit().remove();
 }
 
@@ -1091,25 +1158,28 @@ function tick(){
     const my=(sy+ty)/2;
     return `M${sx},${sy} C${sx},${my} ${tx},${my} ${tx},${ty}`;
   });
-  // Place gate symbols at 60% from source (child) to target (parent) – closer to parent
+  // Position gate symbols at 40% along path (closer to parent/source)
   gg.selectAll("g.gsym").attr("transform",d=>{
     const sx=d.source.x||0,sy=d.source.y||0,tx=d.target.x||0,ty=d.target.y||0;
-    const t=0.65;
+    const t=0.4;
+    // Cubic bezier point at t=0.4
     const my=(sy+ty)/2;
     const bx=sx*(1-t)**3+3*sx*(1-t)**2*t+3*tx*(1-t)*t**2+tx*t**3;
     const by=sy*(1-t)**3+3*my*(1-t)**2*t+3*my*(1-t)*t**2+ty*t**3;
     return `translate(${bx},${by})`;
   });
 }
-
 function updateLanes(){
   const lc=document.getElementById("lanes"); lc.innerHTML="";
   const t=getT(),h=wrap.getBoundingClientRect().height;
-  const rows=[0,1,2,2.5,3];
-  rows.forEach(r=>{
-    const cy=t.k*(80+r*VG)+t.y;
+  const rows=new Map();
+  sN.forEach(n=>{const r=getNodeRow(n);if(!rows.has(r))rows.set(r,[]);rows.get(r).push(n);});
+  // Add intermediate row label if present
+  const extraLabels={"1.5":"SHARED FF / GROUP"};
+  rows.forEach((nodes,r)=>{
+    const cy=t.k*(layY({_midRow:r,type:"HAZARD"}))+t.y;
     if(cy<-40||cy>h+40) return;
-    const lbl=LLABELS[String(r)]||"";
+    const lbl=LLABELS[String(r)]||extraLabels[String(r)]||"";
     const col=LCOLORS[String(r)]||"#888";
     const div=document.createElement("div");
     div.className="lb";
@@ -1123,14 +1193,16 @@ function updateLanes(){
   });
 }
 
-// Core layout: assign X positions based on SF columns, then spread horizontally
 function computeRTLayout(reset){
+  // ── Step 1: SF columns evenly spaced ──────────────────────────────────
   const sfNodes=sN.filter(n=>n.type==="SF");
   const totalSFs=sfNodes.length||1;
+  // Use wider spacing so nodes don't overlap
   const nodeSpacing=NW+HG+80;
   const canvasW=Math.max(totalSFs*nodeSpacing+400, 1600);
   const startX=200;
   const colStep=(canvasW-startX*2)/(totalSFs>1?totalSFs-1:1);
+
   const sfColX={};
   sfNodes.forEach((sf,i)=>{
     const cx=startX+i*(totalSFs>1?colStep:0);
@@ -1138,33 +1210,32 @@ function computeRTLayout(reset){
     sf.bx=cx;
     if(reset||!uP[sf.id]?.manual){sf.x=cx;sf.fx=null;sf.fy=null;}
   });
-  // For non-SF nodes, find parent SFs and average their x
-  sN.forEach(n=>{
-    if(n.type==="SF"||n.type==="HAZARD") return;
-    const parentSFIds = new Set();
-    const collectSF = (id)=>{
-      const node = sN.find(m=>m.id===id);
-      if(!node) return;
-      if(node.type==="SF") parentSFIds.add(node.id);
-      else node.parents?.forEach(pid=>collectSF(pid));
-    };
-    n.parents?.forEach(pid=>collectSF(pid));
-    if(parentSFIds.size>0){
-      let sum=0, cnt=0;
-      parentSFIds.forEach(pid=>{if(sfColX[pid]){sum+=sfColX[pid]; cnt++;}});
-      n.bx = cnt>0 ? sum/cnt : canvasW/2;
-    } else {
-      n.bx = canvasW/2;
-    }
+
+  // ── Step 2: Map descendants to SF columns ─────────────────────────────
+  const nodeSFCols={};
+  sfNodes.forEach(sf=>{
+    const sub=subIds(sf.id);
+    sub.forEach(nid=>{
+      if(!nodeSFCols[nid]) nodeSFCols[nid]=[];
+      nodeSFCols[nid].push(sfColX[sf.id]);
+    });
   });
-  // Spread nodes with same (bx, row) horizontally
-  const buckets={};
+
+  // ── Step 3: Assign bx per node; separate nodes at same bx by type ─────
+  // Group nodes by (bx, row) to spread them out horizontally
+  const buckets={};  // key = "bx_row" → [node, ...]
   sN.forEach(n=>{
     if(n.type==="SF"||n.type==="HAZARD") return;
-    const key=`${Math.round(n.bx)}_${getNodeRow(n)}`;
+    const cols=nodeSFCols[n.id];
+    const cx=cols&&cols.length?cols.reduce((a,b)=>a+b,0)/cols.length:canvasW+200;
+    n.bx=cx;
+    const row=getNodeRow(n);
+    const key=`${Math.round(cx)}_${row}`;
     if(!buckets[key]) buckets[key]=[];
     buckets[key].push(n);
   });
+
+  // Spread nodes within same bucket horizontally
   Object.values(buckets).forEach(bucket=>{
     const count=bucket.length;
     if(count<=1) return;
@@ -1177,13 +1248,21 @@ function computeRTLayout(reset){
       if(reset||!uP[n.id]?.manual){n.x=n.bx;n.fx=null;n.fy=null;}
     });
   });
-  // HAZARDs centered over their child SFs
+
+  // Apply bx to nodes not yet processed (orphans)
+  sN.forEach(n=>{
+    if(n.type==="SF"||n.type==="HAZARD") return;
+    if(reset||!uP[n.id]?.manual){n.x=n.bx||canvasW+200;n.fx=null;n.fy=null;}
+  });
+
+  // ── Step 4: HAZARDs centered over their SF children ───────────────────
   sN.filter(n=>n.type==="HAZARD").forEach(n=>{
     const childSFs=sN.filter(c=>c.type==="SF"&&c.parents?.includes(n.id));
     n.bx=childSFs.length?childSFs.reduce((a,c)=>a+c.bx,0)/childSFs.length:canvasW/2;
     if(reset||!uP[n.id]?.manual){n.x=n.bx;n.fx=null;n.fy=null;}
   });
-  // Y strictly by row
+
+  // ── Step 5: Y strictly by row ─────────────────────────────────────────
   sN.forEach(n=>{
     const ty=layY(n);
     if(reset||!uP[n.id]?.manual){n.y=ty;n.fy=null;}
@@ -1224,6 +1303,7 @@ function toggleForce(){
     fst.textContent=`⚡ ${n.name.slice(0,18)}  |  ${ifCount} IF`;
     fst.classList.add("show");
   } else if(forceOn){
+    // Global force — show total IF count
     const totalIF=sN.filter(x=>x.type==="IF").length;
     fst.textContent=`⚡ ALL  |  ${totalIF} IF`;
     fst.classList.add("show");
@@ -1233,16 +1313,6 @@ function toggleForce(){
     sim.force("link").links(forceSub?sL.filter(l=>forceSub.has(l.source.id)&&forceSub.has(l.target.id)):sL);
     sim.alpha(.5).restart();
   } else {sim.stop();}
-}
-function subIds(id){
-  const s=new Set([id]),q=[id];
-  while(q.length){const c=q.shift();(NM[c]?.children||[]).forEach(ch=>{if(!s.has(ch)&&sN.find(n=>n.id===ch)){s.add(ch);q.push(ch);}});}
-  return s;
-}
-function countIFs(id){
-  const seen=new Set(),q=[id]; let count=0;
-  while(q.length){const c=q.shift();if(seen.has(c))continue;seen.add(c);const n=NM[c];if(!n)continue;if(n.type==="IF")count++;(n.children||[]).forEach(ch=>q.push(ch));}
-  return count;
 }
 function clearHL(){
   ng.selectAll("g.nd").attr("opacity",d=>d.isRoot?0.75:1);
@@ -1280,6 +1350,7 @@ function sPrev(){if(!sM.length)return;sI=(sI-1+sM.length)%sM.length;panTo(sM[sI]
 function panTo(id){
   const n=sN.find(s=>s.id===id);if(!n)return;
   const cw=wrap.getBoundingClientRect();
+  // Use a comfortable zoom that shows the node in context (not filling screen)
   const contextK=Math.min(getT().k, 0.55);
   const cx=cw.width/2-contextK*(n.x||0);
   const cy=cw.height/2.5-contextK*(n.y||0);
