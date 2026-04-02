@@ -1682,7 +1682,7 @@ def render_sidebar():
                   <div style="font-size:9px;color:#777;">Value: <span style="font-family:monospace;color:{ex_color};">{ex_val}</span> · In FT: {ex_ft_str}</div>
                   <div style="font-size:9px;color:#4fc3f7;margin-top:4px;">Same failure — select parent(s) below then click Place.</div>
                 </div>""", unsafe_allow_html=True)
-                if st.button(f"◈ Place under selected parent(s)", key=f"place_{ex['id']}", use_container_width=True, type="primary"):
+                if st.button(f"◈ Place under selected parent(s)", key=f"place_{match_type}_{ex['id']}", use_container_width=True, type="primary"):
                     cur_sel = sel_pids if sel_pids else []
                     if not cur_sel:
                         st.error("Select at least one parent above first")
@@ -1701,8 +1701,14 @@ def render_sidebar():
                         st.success(f"✓ Placed under new parent(s).")
                         st.rerun()
 
-        if name_matches: render_match_card(name_matches, "name")
-        if id_matches:   render_match_card(id_matches, "id")
+        # Deduplicate — same node can appear in both name_matches and id_matches
+        _seen_match_ids = set()
+        _all_matches = []
+        for _m in (name_matches + id_matches):
+            if _m["id"] not in _seen_match_ids:
+                _seen_match_ids.add(_m["id"])
+                _all_matches.append(_m)
+        if _all_matches: render_match_card(_all_matches, "combined")
 
         if not cid_clean:
             st.markdown("<div style='font-size:9px;color:#e94560;margin:2px 0 4px 0;'>★ Node ID required</div>", unsafe_allow_html=True)
