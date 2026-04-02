@@ -766,57 +766,73 @@ def build_html_tree(nodes, filter_hazard_id=None, tree_state=None):
     level_label_js = _json.dumps({str(k): v for k, v in LEVEL_LABEL.items()})
     level_color_js = _json.dumps({str(k): v for k, v in LEVEL_COLOR.items()})
 
-    # ── D3 HTML tree (improved layout + gate symbols + ID highlighting) ────
+    # ── D3 HTML tree ─────────────────────────────────────────────────────
     html = """<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style>
 *{box-sizing:border-box;margin:0;padding:0;}
 body{background:#0a0a0a;font-family:'JetBrains Mono','Fira Code',monospace;
      color:#e0e0e0;overflow:hidden;height:100vh;display:flex;flex-direction:column;}
-#toolbar{display:flex;align-items:center;gap:7px;padding:7px 14px;
-  background:#111;border-bottom:2px solid #1a1a1a;flex-shrink:0;user-select:none;height:46px;}
-.sep{width:1px;height:24px;background:#2a2a2a;flex-shrink:0;}
+#toolbar{display:flex;align-items:center;gap:6px;padding:6px 12px;
+  background:#111;border-bottom:2px solid #1a1a1a;flex-shrink:0;user-select:none;height:44px;}
+.sep{width:1px;height:22px;background:#2a2a2a;flex-shrink:0;}
 .btn{background:#1c1c1c;border:1.5px solid #2e2e2e;color:#bbb;border-radius:6px;
-  padding:0 13px;cursor:pointer;font-family:inherit;font-size:11px;font-weight:700;
+  padding:0 11px;cursor:pointer;font-family:inherit;font-size:11px;font-weight:700;
   letter-spacing:.4px;transition:.12s;white-space:nowrap;flex-shrink:0;
-  height:30px;display:inline-flex;align-items:center;gap:4px;}
+  height:28px;display:inline-flex;align-items:center;gap:4px;}
 .btn:hover{background:#282828;color:#fff;border-color:#555;}
 .btn.on{background:#e94560;border-color:#e94560;color:#fff;}
-#zlbl{color:#666;font-size:11px;min-width:44px;text-align:center;font-weight:700;}
-#fst{font-size:10px;color:#f5c518;padding:2px 9px;border-radius:5px;
+#zlbl{color:#666;font-size:11px;min-width:40px;text-align:center;font-weight:700;}
+#fst{font-size:10px;color:#f5c518;padding:2px 8px;border-radius:5px;
   background:#1a1300;border:1px solid #f5c51844;white-space:nowrap;display:none;}
 #fst.show{display:inline-block;}
-#swrap{display:flex;align-items:center;gap:5px;margin-left:auto;max-width:290px;}
+#swrap{display:flex;align-items:center;gap:4px;margin-left:auto;max-width:260px;}
 #sbox{background:#1c1c1c;border:1.5px solid #2e2e2e;color:#ccc;border-radius:6px;
-  padding:0 10px;font-family:inherit;font-size:11px;outline:none;width:170px;height:30px;}
+  padding:0 9px;font-family:inherit;font-size:11px;outline:none;width:155px;height:28px;}
 #sbox:focus{border-color:#e94560;color:#fff;}
 #sbox::placeholder{color:#444;}
-#si{color:#666;font-size:10px;min-width:55px;}
+#si{color:#666;font-size:10px;min-width:50px;}
+/* Main layout: canvas + right panel */
+#main{flex:1;display:flex;overflow:hidden;}
 #wrap{flex:1;position:relative;overflow:hidden;}
 svg{position:absolute;inset:0;width:100%;height:100%;}
 #lanes{position:absolute;inset:0;pointer-events:none;z-index:2;overflow:hidden;}
-.lb{position:absolute;left:0;right:0;border-top:1px solid rgba(255,255,255,.035);
+.lb{position:absolute;left:0;right:0;border-top:1px solid rgba(255,255,255,.04);
   display:flex;align-items:flex-start;padding-top:5px;}
-.lt{margin-left:8px;font-size:8px;font-weight:700;letter-spacing:2.5px;opacity:.36;}
-.ls{position:absolute;left:0;top:0;width:3px;height:100%;opacity:.5;}
-#dp{position:absolute;bottom:0;left:0;right:0;background:rgba(8,8,8,.93);
-  border-top:2px solid #222;padding:8px 16px 10px;display:none;z-index:20;
-  backdrop-filter:blur(14px);}
-.dg{display:grid;grid-template-columns:repeat(6,1fr);gap:5px;margin:5px 0;}
-.dc{background:#111;border-radius:5px;padding:6px;text-align:center;}
-.dcl{font-size:7px;color:#555;letter-spacing:2px;margin-bottom:2px;font-weight:700;}
-.dcv{font-size:11px;font-weight:700;word-break:break-all;}
-.dr{display:grid;grid-template-columns:1fr 1fr;gap:5px;}
-.ds{background:#111;border-radius:5px;padding:6px;}
-.dsl{font-size:7px;color:#555;letter-spacing:2px;margin-bottom:2px;font-weight:700;}
-.dsv{font-size:10px;color:#bbb;line-height:1.5;}
-#dpc{position:absolute;top:8px;right:12px;background:none;border:none;color:#555;font-size:17px;cursor:pointer;}
-#dpc:hover{color:#fff;}
+.lt{margin-left:10px;font-size:8px;font-weight:700;letter-spacing:2.5px;opacity:.4;}
+.ls{position:absolute;left:0;top:0;width:3px;height:100%;opacity:.6;}
+/* Right node panel */
+#rp{width:0;min-width:0;background:#0d0d0d;border-left:2px solid #1a1a1a;
+  display:flex;flex-direction:column;transition:width .2s ease,min-width .2s ease;
+  overflow:hidden;flex-shrink:0;}
+#rp.open{width:290px;min-width:290px;}
+#rp-inner{width:290px;padding:10px 12px;overflow-y:auto;height:100%;}
+.rp-hdr{font-size:8px;font-weight:700;letter-spacing:2px;color:#555;margin-bottom:4px;padding-bottom:3px;border-bottom:1px solid #1a1a1a;}
+.rp-row{margin-bottom:8px;}
+.rp-lbl{font-size:7px;color:#444;letter-spacing:1.5px;font-weight:700;margin-bottom:2px;}
+.rp-val{font-size:11px;font-weight:700;font-family:monospace;word-break:break-all;}
+.rp-input{background:#1a1a1a;border:1.5px solid #2e2e2e;color:#ddd;border-radius:5px;
+  padding:4px 8px;font-family:inherit;font-size:11px;outline:none;width:100%;margin-top:2px;}
+.rp-input:focus{border-color:#e94560;}
+.rp-sel{background:#1a1a1a;border:1.5px solid #2e2e2e;color:#ddd;border-radius:5px;
+  padding:4px 8px;font-family:inherit;font-size:11px;outline:none;width:100%;margin-top:2px;}
+.rp-btn{background:#1c1c1c;border:1.5px solid #2e2e2e;color:#bbb;border-radius:5px;
+  padding:5px 10px;cursor:pointer;font-family:inherit;font-size:10px;font-weight:700;
+  width:100%;margin-top:4px;transition:.12s;}
+.rp-btn:hover{background:#282828;color:#fff;border-color:#555;}
+.rp-btn.primary{background:#e9456033;border-color:#e94560;color:#e94560;}
+.rp-btn.primary:hover{background:#e9456055;}
+.rp-btn.save{background:#4caf7d33;border-color:#4caf7d;color:#4caf7d;}
+.rp-btn.save:hover{background:#4caf7d55;}
+.rp-chip{display:inline-block;padding:1px 6px;border-radius:10px;font-size:9px;
+  font-family:monospace;font-weight:700;margin:1px 2px;cursor:pointer;}
+#rp-close{position:absolute;top:8px;right:8px;background:none;border:none;color:#444;
+  font-size:15px;cursor:pointer;padding:2px 5px;}
+#rp-close:hover{color:#fff;}
+/* Multi-select bar */
 #msp{display:none;position:absolute;bottom:0;left:0;right:0;
-  background:rgba(8,8,8,.95);border-top:2px solid #4fc3f7;padding:8px 16px 10px;
+  background:rgba(8,8,8,.95);border-top:2px solid #4fc3f7;padding:8px 14px 10px;
   z-index:21;backdrop-filter:blur(14px);}
-/* Gate symbol tooltip */
-.gate-sym{pointer-events:all;cursor:default;}
 </style>
 </head><body>
 <div id="toolbar">
@@ -824,7 +840,7 @@ svg{position:absolute;inset:0;width:100%;height:100%;}
   <button class="btn" onclick="zBy(-.22)">&#65293;</button>
   <span id="zlbl">85%</span>
   <div class="sep"></div>
-  <button class="btn" id="blay" onclick="doColumnLayout(true)">&#8862; Reset Layout</button>
+  <button class="btn" id="blay" onclick="doColumnLayout(true)">&#8862; Reset</button>
   <button class="btn" onclick="doFit()">&#8865; Fit</button>
   <div class="sep"></div>
   <button class="btn" id="bfrc" onclick="toggleForce()">&#9889; Force</button>
@@ -838,43 +854,108 @@ svg{position:absolute;inset:0;width:100%;height:100%;}
     <span id="si"></span>
   </div>
 </div>
+<div id="main">
 <div id="wrap">
   <div id="lanes"></div>
   <svg id="sv">
     <defs>
-      <!-- Arrow markers -->
-      <marker id="ma"  markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 Z" fill="#444"/></marker>
-      <marker id="mah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 Z" fill="#4fc3f7"/></marker>
-      <marker id="ma-or"  markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 Z" fill="#4fc3f7"/></marker>
-      <marker id="ma-and" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 Z" fill="#ffb74d"/></marker>
+      <!-- FTA standard gate markers: arrows point from child UP to parent -->
+      <marker id="arr" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+        <path d="M0,0 L9,4.5 L0,9 Z" fill="#3a3a3a"/>
+      </marker>
+      <marker id="arr-or" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+        <path d="M0,0 L9,4.5 L0,9 Z" fill="#4fc3f7"/>
+      </marker>
+      <marker id="arr-and" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+        <path d="M0,0 L9,4.5 L0,9 Z" fill="#ffb74d"/>
+      </marker>
+      <marker id="arr-sh" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+        <path d="M0,0 L9,4.5 L0,9 Z" fill="#f5c518"/>
+      </marker>
     </defs>
     <g id="zg"><g id="lg"></g><g id="gg"></g><g id="ng"></g></g>
   </svg>
-</div>
-<div id="dp">
-  <button id="dpc" onclick="closeDP()">&#10005;</button>
-  <div style="font-size:8px;color:#555;letter-spacing:3px;margin-bottom:3px">SELECTED NODE</div>
-  <div id="dpt" style="font-size:14px;font-weight:700;margin-bottom:5px"></div>
-  <div class="dg">
-    <div class="dc"><div class="dcl">TYPE</div><div class="dcv" id="d0"></div></div>
-    <div class="dc"><div class="dcl">GATE</div><div class="dcv" id="d1"></div></div>
-    <div class="dc"><div class="dcl">VALUE</div><div class="dcv" id="d2"></div></div>
-    <div class="dc"><div class="dcl">NODE ID</div><div class="dcv" id="d3" style="font-size:9px"></div></div>
-    <div class="dc"><div class="dcl">FT LABEL</div><div class="dcv" id="d7" style="font-size:9px;color:#7e57c2"></div></div>
-    <div class="dc"><div class="dcl">SHARED</div><div class="dcv" id="d4"></div></div>
-  </div>
-  <div class="dr">
-    <div class="ds"><div class="dsl">PARENTS</div><div class="dsv" id="d5"></div></div>
-    <div class="ds"><div class="dsl">CHILDREN</div><div class="dsv" id="d6"></div></div>
+  <div id="msp">
+    <button onclick="clearMultiSel()" style="position:absolute;top:6px;right:10px;
+      background:none;border:none;color:#555;font-size:15px;cursor:pointer;">&#10005;</button>
+    <div style="font-size:8px;color:#4fc3f7;letter-spacing:3px;margin-bottom:4px;font-weight:700;">
+      MULTI-SELECT — <span id="msc">0</span> NODES
+    </div>
+    <div id="mslist" style="display:flex;flex-wrap:wrap;gap:3px;max-height:44px;overflow-y:auto;"></div>
   </div>
 </div>
-<div id="msp">
-  <button onclick="clearMultiSel()" style="position:absolute;top:8px;right:12px;
-    background:none;border:none;color:#555;font-size:17px;cursor:pointer;">&#10005;</button>
-  <div style="font-size:8px;color:#4fc3f7;letter-spacing:3px;margin-bottom:5px;font-weight:700;">
-    MULTI-SELECT — <span id="msc">0</span> NODES
+<!-- Right Panel: node inspector + editor -->
+<div id="rp">
+  <div id="rp-inner">
+    <button id="rp-close" onclick="closeRP()">&#10005;</button>
+    <div style="font-size:8px;color:#555;letter-spacing:3px;margin-bottom:6px;margin-right:20px;">NODE INSPECTOR</div>
+    <!-- Node header -->
+    <div id="rp-name" style="font-size:13px;font-weight:700;margin-bottom:2px;word-break:break-word;"></div>
+    <div id="rp-badge" style="margin-bottom:10px;"></div>
+    <!-- Stats grid -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-bottom:10px;">
+      <div style="background:#111;border-radius:5px;padding:6px;">
+        <div class="rp-lbl">TYPE</div>
+        <div class="rp-val" id="rp-type"></div>
+      </div>
+      <div style="background:#111;border-radius:5px;padding:6px;">
+        <div class="rp-lbl">GATE</div>
+        <div class="rp-val" id="rp-gate-disp"></div>
+      </div>
+      <div style="background:#111;border-radius:5px;padding:6px;">
+        <div class="rp-lbl">CALC VALUE</div>
+        <div class="rp-val" id="rp-value"></div>
+      </div>
+      <div style="background:#111;border-radius:5px;padding:6px;">
+        <div class="rp-lbl">NODE ID</div>
+        <div class="rp-val" id="rp-nid" style="font-size:10px;"></div>
+      </div>
+    </div>
+    <!-- Parents / Children -->
+    <div style="margin-bottom:8px;">
+      <div class="rp-lbl">&#8593; PARENTS</div>
+      <div id="rp-parents" style="font-size:10px;color:#888;line-height:1.6;margin-top:2px;"></div>
+    </div>
+    <div style="margin-bottom:10px;">
+      <div class="rp-lbl">&#8595; CHILDREN (<span id="rp-ifcount" style="color:#4caf7d"></span>)</div>
+      <div id="rp-children" style="font-size:10px;color:#888;line-height:1.6;margin-top:2px;"></div>
+    </div>
+    <hr style="border-color:#1a1a1a;margin:8px 0;">
+    <!-- Edit section -->
+    <div style="font-size:8px;color:#555;letter-spacing:2px;margin-bottom:6px;font-weight:700;">EDIT NODE</div>
+    <div class="rp-row">
+      <div class="rp-lbl">NAME</div>
+      <input class="rp-input" id="rp-edit-name" type="text" placeholder="Node name"/>
+    </div>
+    <div class="rp-row">
+      <div class="rp-lbl">GATE TYPE</div>
+      <select class="rp-sel" id="rp-edit-gate">
+        <option value="OR">OR</option>
+        <option value="AND">AND</option>
+      </select>
+    </div>
+    <div class="rp-row">
+      <div class="rp-lbl">NODE ID</div>
+      <input class="rp-input" id="rp-edit-nodeid" type="text" placeholder="e.g. IF-042"/>
+    </div>
+    <div class="rp-row">
+      <div class="rp-lbl">FT LABEL</div>
+      <input class="rp-input" id="rp-edit-ftlabel" type="text" placeholder="e.g. FT42"/>
+    </div>
+    <div class="rp-row">
+      <div class="rp-lbl">FIXED VALUE (PIN &#128204;) — leave blank to unpin</div>
+      <input class="rp-input" id="rp-edit-fixed" type="text" placeholder="e.g. 1.5e-5"/>
+    </div>
+    <div class="rp-row">
+      <div class="rp-lbl">TARGET VALUE (HAZARD only)</div>
+      <input class="rp-input" id="rp-edit-target" type="text" placeholder="e.g. 1e-7"/>
+    </div>
+    <button class="rp-btn save" onclick="rpSave()">&#10003; Save Changes</button>
+    <div id="rp-save-msg" style="font-size:9px;color:#4caf7d;margin-top:4px;display:none;">Saved!</div>
+    <hr style="border-color:#1a1a1a;margin:8px 0;">
+    <button class="rp-btn primary" onclick="rpDelete()" id="rp-del-btn">&#128465; Delete Node</button>
   </div>
-  <div id="mslist" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:7px;max-height:48px;overflow-y:auto;"></div>
+</div>
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
 <script>
@@ -885,8 +966,7 @@ const FOCUSID=__FOCUS__;
 const LLABELS=__LLABELS__;
 const LCOLORS=__LCOLORS__;
 const GC={OR:"#4fc3f7",AND:"#ffb74d"};
-// Wider nodes, more vertical spacing for readability
-const NW=200,NH=100,HG=40,VG=200;
+const NW=196,NH=96,HG=50,VG=210;
 let selId=null,forceOn=false,forceSub=null;
 let collapsed=new Set(),sM=[],sI=0;
 let multiSel=new Set();
@@ -901,30 +981,29 @@ const zb=d3.zoom().scaleExtent([.03,6])
   .filter(e=>e.button===2||e.type==="wheel")
   .on("zoom",e=>{zg.attr("transform",e.transform);document.getElementById("zlbl").textContent=Math.round(e.transform.k*100)+"%";updateLanes();});
 svg.call(zb).on("contextmenu",e=>e.preventDefault());
-svg.on("click",()=>{closeDP();if(multiSel.size>0)clearMultiSel();});
+svg.on("click",()=>{if(multiSel.size>0)clearMultiSel();});
 function getT(){return d3.zoomTransform(svg.node());}
 
-// ── Layer Y positions: each type gets its own strict row
-// Shared-parent nodes (multi-SF parents) get an intermediate row between SF and FF
+// ── Layer rows ─────────────────────────────────────────────────────────────
+// FTA top-down: HAZARD at top (y=0), children below
 const TYPE_ROW={HAZARD:0,SF:1,FF:2,GROUP:2,IF:3};
-// Dynamically computed row for nodes with >1 parent SF (intermediate sub-SF layer)
 function getNodeRow(n){
   if(n._midRow!=null) return n._midRow;
   return TYPE_ROW[n.type]??2;
 }
 function layY(n){
   const r=typeof n==="object"?getNodeRow(n):(TYPE_ROW[n]??2);
-  return 100+r*VG;
+  return 80+r*VG;
 }
 
 let sN=[],sL=[];
 const sim=d3.forceSimulation()
-  .force("link",d3.forceLink().id(d=>d.id).distance(NW+HG).strength(.25))
-  .force("charge",d3.forceManyBody().strength(-1200).distanceMax(700))
-  .force("collide",d3.forceCollide(NW*0.7))
-  .force("y",d3.forceY(d=>layY(d)).strength(3.0))
-  .force("x",d3.forceX(d=>d.bx||600).strength(.18))
-  .alphaDecay(.018).velocityDecay(.55)
+  .force("link",d3.forceLink().id(d=>d.id).distance(NW+HG).strength(.2))
+  .force("charge",d3.forceManyBody().strength(-1400).distanceMax(800))
+  .force("collide",d3.forceCollide(NW*0.72))
+  .force("y",d3.forceY(d=>layY(d)).strength(3.5))
+  .force("x",d3.forceX(d=>d.bx||600).strength(.2))
+  .alphaDecay(.015).velocityDecay(.6)
   .on("tick",tick);
 sim.stop();
 
@@ -938,36 +1017,30 @@ function subIds(id){
   while(q.length){const c=q.shift();(NM[c]?.children||[]).forEach(ch=>{if(!s.has(ch)&&sN.find(n=>n.id===ch)){s.add(ch);q.push(ch);}});}
   return s;
 }
-function ownerSF(id,depth){
-  if(depth>8) return null;
-  const n=NM[id]; if(!n) return null;
-  if(n.type==="SF") return id;
-  for(const pid of (n.parents||[])){const r=ownerSF(pid,depth+1);if(r)return r;}
-  return null;
-}
-
-// Count IFs under a node (for Force tooltip)
 function countIFs(id){
-  const seen=new Set(),q=[id];
-  let count=0;
-  while(q.length){
-    const c=q.shift();
-    if(seen.has(c))continue;
-    seen.add(c);
-    const n=NM[c];
-    if(!n)continue;
-    if(n.type==="IF") count++;
-    (n.children||[]).forEach(ch=>q.push(ch));
-  }
-  return count;
+  const seen=new Set(),q=[id]; let c=0;
+  while(q.length){const x=q.shift();if(seen.has(x))continue;seen.add(x);const n=NM[x];if(!n)continue;if(n.type==="IF")c++;(n.children||[]).forEach(ch=>q.push(ch));}
+  return c;
 }
 
 function refresh(){
   const vis=getVis(); const ex={};
   sN.forEach(n=>ex[n.id]=n);
-  sN=vis.map(n=>Object.assign({...n},{x:ex[n.id]?.x??uP[n.id]?.x??null,y:ex[n.id]?.y??uP[n.id]?.y??null,vx:0,vy:0,fx:null,fy:null,bx:null,_midRow:null}));
+  sN=vis.map(n=>Object.assign({...n},{
+    x:ex[n.id]?.x??uP[n.id]?.x??null,
+    y:ex[n.id]?.y??uP[n.id]?.y??null,
+    vx:0,vy:0,fx:null,fy:null,bx:null,_midRow:null
+  }));
   const vs=new Set(sN.map(n=>n.id));
-  sL=RLINKS.filter(l=>vs.has(l.sid)&&vs.has(l.tid)).map(l=>{const s=sN.find(n=>n.id===l.sid),t=sN.find(n=>n.id===l.tid);return s&&t?{source:s,target:t,andGate:l.andGate,shared:l.shared}:null;}).filter(Boolean);
+  // Links go from PARENT (source=sid) to CHILD (target=tid)
+  // Arrow drawn at target (child) end — visual flow: parent→child top-down
+  // But FTA convention: child causes parent — so arrow from child to parent
+  // We flip: source=tid (child), target=sid (parent) for arrow direction
+  sL=RLINKS.filter(l=>vs.has(l.sid)&&vs.has(l.tid)).map(l=>{
+    const child=sN.find(n=>n.id===l.tid);   // child node
+    const parent=sN.find(n=>n.id===l.sid);  // parent node
+    return child&&parent?{source:child,target:parent,andGate:l.andGate,shared:l.shared,parentId:l.sid,childId:l.tid}:null;
+  }).filter(Boolean);
   assignMidRows();
   computeRTLayout(false);
   sim.nodes(sN); sim.force("link").links(sL); sim.force("x").x(d=>d.bx||600);
@@ -975,294 +1048,277 @@ function refresh(){
   if(forceOn) sim.alpha(.3).restart();
 }
 
-// Assign intermediate rows to nodes that have >1 SF in their ancestry
-// so they appear between the SF row and FF row visually
 function assignMidRows(){
-  // Find SF ancestors for each node
   const sfAncestors={};
   sN.forEach(n=>{sfAncestors[n.id]=new Set();});
-  // BFS from each SF downward
   sN.filter(n=>n.type==="SF").forEach(sf=>{
     const q=[sf.id];const seen=new Set();
     while(q.length){
-      const cid=q.shift();
-      if(seen.has(cid))continue;seen.add(cid);
+      const cid=q.shift();if(seen.has(cid))continue;seen.add(cid);
       if(cid!==sf.id){if(!sfAncestors[cid])sfAncestors[cid]=new Set();sfAncestors[cid].add(sf.id);}
-      const n=sN.find(x=>x.id===cid);
-      if(n)(n.children||[]).forEach(ch=>q.push(ch));
+      const n=sN.find(x=>x.id===cid);if(n)(n.children||[]).forEach(ch=>q.push(ch));
     }
   });
   sN.forEach(n=>{
-    const sfSet=sfAncestors[n.id]||new Set();
-    if(n.type==="FF"&&sfSet.size>1){
-      // Multi-SF FF: place between SF row (1) and FF row (2) → row 1.5
-      n._midRow=1.5;
-    } else if(n.type==="GROUP"&&sfSet.size>1){
-      n._midRow=1.5;
-    } else {
-      n._midRow=null;
-    }
+    const s=sfAncestors[n.id]||new Set();
+    n._midRow=(n.type==="FF"||n.type==="GROUP")&&s.size>1?1.5:null;
   });
 }
 
+// ── Links: draw FROM child (bottom) TO parent (top) ───────────────────────
+// source = child, target = parent — line goes bottom-to-top with arrow at parent
 function drawLinks(){
-  const s=lg.selectAll("path.lk").data(sL,d=>d.source.id+"->"+d.target.id);
+  const s=lg.selectAll("path.lk").data(sL,d=>d.childId+"->"+d.parentId);
   const a=s.enter().append("path").attr("class","lk").attr("fill","none").merge(s);
   a.attr("stroke",d=>{
-    if(d.shared) return "#f5c518aa";
-    return d.andGate?"#ffb74d88":"#4fc3f744";
+    if(d.shared) return "#f5c518bb";
+    return d.andGate?"#ffb74d99":"#4fc3f766";
   })
-   .attr("stroke-width",d=>d.shared?1.8:2.2)
+   .attr("stroke-width",d=>d.shared?2:2.5)
    .attr("stroke-dasharray",d=>d.andGate?"8,4":null)
    .attr("marker-end",d=>{
-     if(d.andGate) return "url(#ma-and)";
-     if(d.shared)  return "url(#mah)";
-     return "url(#ma-or)";
+     if(d.shared)  return "url(#arr-sh)";
+     return d.andGate?"url(#arr-and)":"url(#arr-or)";
    });
   s.exit().remove();
 }
 
-// Draw OR / AND gate symbols at the midpoint of each link
+// ── FTA standard gate symbols ──────────────────────────────────────────────
+// OR gate: curved shield shape (standard FTA)
+// AND gate: flat-top D shape (standard FTA)
+// Placed at the parent node's bottom, one per parent showing its gate type
 function drawGateSymbols(){
-  const s=gg.selectAll("g.gsym").data(sL,d=>d.source.id+"->"+d.target.id);
-  const e=s.enter().append("g").attr("class","gsym gate-sym");
-  // OR gate: curved D shape (arc); AND gate: flat-top D shape
-  // We use small SVG path symbols placed at link midpoints
-  e.append("circle").attr("class","gb").attr("r",9);
-  e.append("text").attr("class","gt")
+  // Build per-parent gate data (one gate per parent node)
+  const parentGates=new Map(); // parentId → {node, gate, x, y}
+  sL.forEach(l=>{
+    const pid=l.parentId;
+    if(!parentGates.has(pid)){
+      const pn=sN.find(n=>n.id===pid);
+      if(pn) parentGates.set(pid,{n:pn,andGate:l.andGate});
+    }
+  });
+  const gdata=Array.from(parentGates.values());
+
+  const s=gg.selectAll("g.gsym").data(gdata,d=>d.n.id);
+  const e=s.enter().append("g").attr("class","gsym");
+  // Gate body path (will be set per type)
+  e.append("path").attr("class","gshape");
+  e.append("text").attr("class","glbl")
     .attr("text-anchor","middle").attr("dominant-baseline","central")
-    .attr("font-size","8px").attr("font-weight","700").attr("font-family","monospace");
+    .attr("font-size","7px").attr("font-weight","700").attr("font-family","monospace");
   const all=e.merge(s);
-  all.select("circle.gb")
-    .attr("fill",d=>d.andGate?"#1a1000":"#001a1a")
+
+  // Standard FTA gate sizes
+  const GW=22,GH=16;
+  // OR gate: curved arc (shield) path at origin, centred
+  function orPath(){
+    return `M${-GW/2},${-GH/2} Q0,${-GH/2-6} ${GW/2},${-GH/2} Q${GW/2+4},0 ${GW/2},${GH/2} Q0,${GH/2+8} ${-GW/2},${GH/2} Q${-GW/2-4},0 ${-GW/2},${-GH/2} Z`;
+  }
+  // AND gate: flat top, curved bottom
+  function andPath(){
+    return `M${-GW/2},${-GH/2} L${GW/2},${-GH/2} Q${GW/2+4},0 ${GW/2},${GH/2} Q0,${GH/2+6} ${-GW/2},${GH/2} Z`;
+  }
+
+  all.select("path.gshape")
+    .attr("d",d=>d.andGate?andPath():orPath())
+    .attr("fill",d=>d.andGate?"#1a0e00":"#001216")
     .attr("stroke",d=>d.andGate?"#ffb74d":"#4fc3f7")
-    .attr("stroke-width","1.5");
-  all.select("text.gt")
+    .attr("stroke-width","1.8");
+  all.select("text.glbl")
     .text(d=>d.andGate?"AND":"OR")
     .attr("fill",d=>d.andGate?"#ffb74d":"#4fc3f7");
+
   s.exit().remove();
 }
 
+// ── Nodes ──────────────────────────────────────────────────────────────────
 function drawNodes(){
   const s=ng.selectAll("g.nd").data(sN,d=>d.id);
   const e=s.enter().append("g").attr("class","nd").style("cursor","pointer");
-  e.append("rect").attr("class","nb").attr("width",NW).attr("height",NH).attr("rx",8);
-  // Row 1: type badge (left) + gate badge (right)
-  e.append("text").attr("class","nt").attr("x",8).attr("y",16)
+  e.append("rect").attr("class","nb").attr("width",NW).attr("height",NH).attr("rx",7);
+  // Type label top-left
+  e.append("text").attr("class","nt").attr("x",8).attr("y",14)
    .attr("font-size","7px").attr("letter-spacing","1.5px").attr("font-weight","700");
-  e.append("text").attr("class","ngate").attr("x",NW-8).attr("y",16)
+  // Gate label top-right
+  e.append("text").attr("class","ngt").attr("x",NW-8).attr("y",14)
    .attr("text-anchor","end").attr("font-size","7px").attr("font-weight","700");
-  // Row 2: ID prefix (colored) + ID number
-  e.append("text").attr("class","nidpfx").attr("x",8).attr("y",33)
+  // ID prefix (colored) + ID number — row 2
+  e.append("text").attr("class","nidp").attr("x",8).attr("y",30)
    .attr("font-size","9px").attr("font-weight","700").attr("font-family","monospace");
-  e.append("text").attr("class","nidnum").attr("x",0).attr("y",33)  // x set dynamically
-   .attr("font-size","9px").attr("font-weight","400").attr("font-family","monospace").attr("fill","#aaa");
-  // Row 3: node name (bold, colored, full width)
-  e.append("text").attr("class","nn").attr("x",NW/2).attr("y",52)
+  e.append("text").attr("class","nidn").attr("x",0).attr("y",30)
+   .attr("font-size","9px").attr("font-family","monospace").attr("fill","#aaa");
+  // Node name — row 3, bold
+  e.append("text").attr("class","nn").attr("x",NW/2).attr("y",50)
    .attr("text-anchor","middle").attr("font-size","11px").attr("font-weight","700");
-  // Row 4: value
-  e.append("text").attr("class","nv").attr("x",NW/2).attr("y",70)
+  // Value — row 4
+  e.append("text").attr("class","nv").attr("x",NW/2).attr("y",68)
    .attr("text-anchor","middle").attr("font-size","12px").attr("font-weight","700").attr("font-family","monospace");
-  // Row 5: ft label
-  e.append("text").attr("class","nfl").attr("x",NW/2).attr("y",86)
+  // FT label — row 5
+  e.append("text").attr("class","nfl").attr("x",NW/2).attr("y",84)
    .attr("text-anchor","middle").attr("font-size","8px").attr("fill","#7e57c2");
-  // Pin/root/dup icon top-right
-  e.append("text").attr("class","nfx").attr("x",NW-6).attr("y",14).attr("text-anchor","end")
-   .attr("font-size","9px").attr("fill","#e94560");
+  // Pin/icon top-right corner
+  e.append("text").attr("class","nfx").attr("x",NW-6).attr("y",13).attr("text-anchor","end")
+   .attr("font-size","8px").attr("fill","#e94560");
   const all=e.merge(s);
+
   all.on("click",(ev,d)=>{
     ev.stopPropagation();
     if(ev.shiftKey||ev.ctrlKey||ev.metaKey){toggleMultiSel(d.id,ev);return;}
-    openDP(d.id);
-    clearHL();
-    ng.selectAll("g.nd").each(function(n){
-      const inPath=d.parents?.includes(n.id)||d.children?.includes(n.id)||n.id===d.id;
-      d3.select(this).attr("opacity",inPath?1:0.18);
-    });
-    lg.selectAll("path.lk").attr("opacity",l=>{
-      const src=l.source?.id,tgt=l.target?.id;
-      return (src===d.id||tgt===d.id)?1:0.08;
-    });
-    gg.selectAll("g.gsym").attr("opacity",l=>{
-      const src=l.source?.id,tgt=l.target?.id;
-      return (src===d.id||tgt===d.id)?1:0.08;
-    });
+    selectNode(d.id);
   })
-  .on("dblclick",(ev,d)=>{ev.stopPropagation();if(d.children?.length){collapsed.has(d.id)?collapsed.delete(d.id):collapsed.add(d.id);refresh();}})
-  .call(d3.drag().on("start",(ev,d)=>{if(!forceOn)sim.alphaTarget(0).stop();d.fx=d.x;d.fy=d.y;})
-    .on("drag",(ev,d)=>{d.fx=ev.x;d.fy=ev.y;uP[d.id]={x:ev.x,y:ev.y,manual:true};if(forceOn){sim.alphaTarget(.05).restart();}else{tick();}})
-    .on("end",(ev,d)=>{if(!forceOn){d.fx=null;d.fy=null;}savePositions();}));
+  .on("dblclick",(ev,d)=>{
+    ev.stopPropagation();
+    if(d.children?.length){collapsed.has(d.id)?collapsed.delete(d.id):collapsed.add(d.id);refresh();}
+  })
+  // Drag works whether force is on or off
+  .call(d3.drag()
+    .on("start",(ev,d)=>{
+      ev.sourceEvent.stopPropagation();
+      d.fx=d.x; d.fy=d.y;
+      if(forceOn) sim.alphaTarget(0.05).restart();
+    })
+    .on("drag",(ev,d)=>{
+      d.fx=ev.x; d.fy=ev.y;
+      uP[d.id]={x:ev.x,y:ev.y,manual:true};
+      if(forceOn) sim.alphaTarget(0.05).restart();
+      else tick();
+    })
+    .on("end",(ev,d)=>{
+      // Keep fx/fy so node stays where dropped (force off = sticky)
+      if(forceOn){d.fx=null;d.fy=null;}
+      else{d.fx=d.x;d.fy=d.y;}
+      savePositions();
+    })
+  );
 
   all.select("rect.nb")
-    .attr("stroke",d=>d.isRoot?"#ffffff":d.isDuplicate?"#4fc3f7":d.isPinned?"#e94560":d.color)
-    .attr("stroke-width",d=>d.isRoot?2:d.isDuplicate?2.5:d.isPinned?2.5:1.5)
-    .attr("stroke-dasharray",d=>d.isRoot?"4,4":d.isDuplicate?"6,3":d.isPinned?"6,3":null)
-    .attr("fill",d=>`${d.color}14`);
+    .attr("stroke",d=>d.isRoot?"#ffffff44":d.isDuplicate?"#4fc3f7":d.isPinned?"#e94560":d.color)
+    .attr("stroke-width",d=>selId===d.id?3:d.isDuplicate?2.5:d.isPinned?2.5:1.5)
+    .attr("stroke-dasharray",d=>selId===d.id?null:d.isRoot?"4,4":d.isDuplicate?"6,3":d.isPinned?"6,3":null)
+    .attr("filter",d=>selId===d.id?`drop-shadow(0 0 12px ${d.color}88)`:null)
+    .attr("fill",d=>`${d.color}18`);
 
-  // Type badge
-  all.select("text.nt")
-    .text(d=>d.isGroup?"GROUP":d.type)
-    .attr("fill",d=>d.color);
+  all.select("text.nt").text(d=>d.isGroup?"GROUP":d.type).attr("fill",d=>d.color);
+  all.select("text.ngt").text(d=>d.gate).attr("fill",d=>d.gate==="AND"?"#ffb74d":"#4fc3f7");
 
-  // Gate badge  
-  all.select("text.ngate")
-    .text(d=>d.gate)
-    .attr("fill",d=>d.gate==="AND"?"#ffb74d":"#4fc3f7");
-
-  // ID prefix (e.g. "IF-", "SF-", "IT-") in type color, bold
-  all.select("text.nidpfx").each(function(d){
+  // ID prefix colored, number grey
+  all.select("text.nidp").each(function(d){
     const nid=d.nodeId&&d.nodeId!==d.id?d.nodeId:"";
     if(!nid){d3.select(this).text("");return;}
-    // Split at last '-' before number: "IF-042" → prefix="IF-", num="042"
     const m=nid.match(/^([A-Za-z]+-?)(\d+.*)$/);
-    const pfx=m?m[1]:nid;
-    d3.select(this).text(pfx).attr("fill",d.color);
+    d3.select(this).text(m?m[1]:nid).attr("fill",d.color);
   });
-  // ID number — positioned after prefix text
-  all.select("text.nidnum").each(function(d){
+  all.select("text.nidn").each(function(d){
     const nid=d.nodeId&&d.nodeId!==d.id?d.nodeId:"";
-    if(!nid){d3.select(this).text("");return;}
+    if(!nid){d3.select(this).text("").attr("x",8);return;}
     const m=nid.match(/^([A-Za-z]+-?)(\d+.*)$/);
     if(!m){d3.select(this).text("").attr("x",8);return;}
-    const num=m[2];
-    // Estimate prefix pixel width (monospace ~6.5px per char at 9px font)
-    const pfxPx=8+m[1].length*6.2;
-    d3.select(this).text(num).attr("x",pfxPx);
+    d3.select(this).text(m[2]).attr("x",8+m[1].length*6.2);
   });
-
-  // Node name
-  all.select("text.nn")
-    .text(d=>{const nm=d.name||"";return nm.length>22?nm.slice(0,21)+"…":nm;})
-    .attr("fill",d=>d.color);
-
-  // Value
-  all.select("text.nv")
-    .text(d=>d.isPinned?(d.fixedVal||d.value)+" 📌":d.value)
-    .attr("fill",d=>d.isPinned?"#e94560":d.color);
-
-  // FT Label
-  all.select("text.nfl")
-    .text(d=>d.ftLabel?`[${d.ftLabel}]`:"");
-
-  // Icons
-  all.select("text.nfx")
-    .text(d=>d.isPinned?"📌":d.isRoot?"⬡":d.isDuplicate?"◈":"");
-
+  all.select("text.nn").text(d=>{const nm=d.name||"";return nm.length>22?nm.slice(0,21)+"…":nm;}).attr("fill",d=>d.color);
+  all.select("text.nv").text(d=>d.isPinned?(d.fixedVal||d.value)+" 📌":d.value).attr("fill",d=>d.isPinned?"#e94560":d.color);
+  all.select("text.nfl").text(d=>d.ftLabel?`[${d.ftLabel}]`:"");
+  all.select("text.nfx").text(d=>d.isPinned?"📌":d.isRoot?"⬡":d.isDuplicate?"◈":"");
   s.exit().remove();
 }
 
 function tick(){
   ng.selectAll("g.nd").attr("transform",d=>`translate(${(d.x||0)-NW/2},${(d.y||0)-NH/2})`);
+  // Lines: source=child (bottom), target=parent (top)
+  // Start at top of child node, end at bottom of parent node
   lg.selectAll("path.lk").attr("d",d=>{
-    const sx=d.source.x||0,sy=d.source.y||0,tx=d.target.x||0,ty=d.target.y||0;
-    const my=(sy+ty)/2;
-    return `M${sx},${sy} C${sx},${my} ${tx},${my} ${tx},${ty}`;
+    const cx=d.source.x||0,cy=(d.source.y||0)-NH/2;   // top of child
+    const px=d.target.x||0,py=(d.target.y||0)+NH/2;   // bottom of parent
+    const my=(cy+py)/2;
+    return `M${cx},${cy} C${cx},${my} ${px},${my} ${px},${py}`;
   });
-  // Position gate symbols at 40% along path (closer to parent/source)
+  // Gate symbols at bottom of parent node
   gg.selectAll("g.gsym").attr("transform",d=>{
-    const sx=d.source.x||0,sy=d.source.y||0,tx=d.target.x||0,ty=d.target.y||0;
-    const t=0.4;
-    // Cubic bezier point at t=0.4
-    const my=(sy+ty)/2;
-    const bx=sx*(1-t)**3+3*sx*(1-t)**2*t+3*tx*(1-t)*t**2+tx*t**3;
-    const by=sy*(1-t)**3+3*my*(1-t)**2*t+3*my*(1-t)*t**2+ty*t**3;
-    return `translate(${bx},${by})`;
+    const px=d.n.x||0, py=(d.n.y||0)+NH/2+12;
+    return `translate(${px},${py})`;
   });
 }
+
 function updateLanes(){
   const lc=document.getElementById("lanes"); lc.innerHTML="";
   const t=getT(),h=wrap.getBoundingClientRect().height;
   const rows=new Map();
   sN.forEach(n=>{const r=getNodeRow(n);if(!rows.has(r))rows.set(r,[]);rows.get(r).push(n);});
-  // Add intermediate row label if present
-  const extraLabels={"1.5":"SHARED FF / GROUP"};
-  rows.forEach((nodes,r)=>{
+  const extraLbls={"1.5":"SHARED FF/GROUP"};
+  rows.forEach((_,r)=>{
     const cy=t.k*(layY({_midRow:r,type:"HAZARD"}))+t.y;
     if(cy<-40||cy>h+40) return;
-    const lbl=LLABELS[String(r)]||extraLabels[String(r)]||"";
+    const lbl=LLABELS[String(r)]||extraLbls[String(r)]||"";
     const col=LCOLORS[String(r)]||"#888";
     const div=document.createElement("div");
-    div.className="lb";
-    div.style.top=(cy-50)+"px";
-    const bar=document.createElement("div");
-    bar.className="ls";bar.style.background=col;
-    const txt=document.createElement("div");
-    txt.className="lt";txt.textContent=lbl;txt.style.color=col;
-    div.appendChild(bar);div.appendChild(txt);
-    lc.appendChild(div);
+    div.className="lb"; div.style.top=(cy-52)+"px";
+    const bar=document.createElement("div"); bar.className="ls"; bar.style.background=col;
+    const txt=document.createElement("div"); txt.className="lt"; txt.textContent=lbl; txt.style.color=col;
+    div.appendChild(bar); div.appendChild(txt); lc.appendChild(div);
   });
 }
 
+// ── Hierarchical column layout ─────────────────────────────────────────────
 function computeRTLayout(reset){
-  // ── Step 1: SF columns evenly spaced ──────────────────────────────────
   const sfNodes=sN.filter(n=>n.type==="SF");
   const totalSFs=sfNodes.length||1;
-  // Use wider spacing so nodes don't overlap
   const nodeSpacing=NW+HG+80;
-  const canvasW=Math.max(totalSFs*nodeSpacing+400, 1600);
-  const startX=200;
+  const canvasW=Math.max(totalSFs*nodeSpacing+400,1600);
+  const startX=220;
   const colStep=(canvasW-startX*2)/(totalSFs>1?totalSFs-1:1);
 
   const sfColX={};
   sfNodes.forEach((sf,i)=>{
     const cx=startX+i*(totalSFs>1?colStep:0);
-    sfColX[sf.id]=cx;
-    sf.bx=cx;
+    sfColX[sf.id]=cx; sf.bx=cx;
     if(reset||!uP[sf.id]?.manual){sf.x=cx;sf.fx=null;sf.fy=null;}
   });
 
-  // ── Step 2: Map descendants to SF columns ─────────────────────────────
+  // Map descendants to SF columns
   const nodeSFCols={};
   sfNodes.forEach(sf=>{
-    const sub=subIds(sf.id);
-    sub.forEach(nid=>{
+    subIds(sf.id).forEach(nid=>{
       if(!nodeSFCols[nid]) nodeSFCols[nid]=[];
       nodeSFCols[nid].push(sfColX[sf.id]);
     });
   });
 
-  // ── Step 3: Assign bx per node; separate nodes at same bx by type ─────
-  // Group nodes by (bx, row) to spread them out horizontally
-  const buckets={};  // key = "bx_row" → [node, ...]
+  // Bucket nodes by (centerX, row) and spread them
+  const buckets={};
   sN.forEach(n=>{
     if(n.type==="SF"||n.type==="HAZARD") return;
     const cols=nodeSFCols[n.id];
     const cx=cols&&cols.length?cols.reduce((a,b)=>a+b,0)/cols.length:canvasW+200;
     n.bx=cx;
     const row=getNodeRow(n);
-    const key=`${Math.round(cx)}_${row}`;
+    const key=`${Math.round(cx/50)*50}_${row}`;
     if(!buckets[key]) buckets[key]=[];
     buckets[key].push(n);
   });
-
-  // Spread nodes within same bucket horizontally
   Object.values(buckets).forEach(bucket=>{
-    const count=bucket.length;
-    if(count<=1) return;
-    const spacing=NW+50;
-    const totalW=(count-1)*spacing;
-    const bxCenter=bucket[0].bx;
+    if(bucket.length<=1) return;
+    const spacing=NW+55;
+    const center=bucket[0].bx;
     bucket.forEach((n,i)=>{
-      const xOff=(i-(count-1)/2)*spacing;
-      n.bx=bxCenter+xOff;
+      n.bx=center+(i-(bucket.length-1)/2)*spacing;
       if(reset||!uP[n.id]?.manual){n.x=n.bx;n.fx=null;n.fy=null;}
     });
   });
 
-  // Apply bx to nodes not yet processed (orphans)
+  // Assign bx→x for nodes not in buckets
   sN.forEach(n=>{
     if(n.type==="SF"||n.type==="HAZARD") return;
     if(reset||!uP[n.id]?.manual){n.x=n.bx||canvasW+200;n.fx=null;n.fy=null;}
   });
 
-  // ── Step 4: HAZARDs centered over their SF children ───────────────────
+  // HAZARDs centred over SF children
   sN.filter(n=>n.type==="HAZARD").forEach(n=>{
-    const childSFs=sN.filter(c=>c.type==="SF"&&c.parents?.includes(n.id));
-    n.bx=childSFs.length?childSFs.reduce((a,c)=>a+c.bx,0)/childSFs.length:canvasW/2;
+    const cs=sN.filter(c=>c.type==="SF"&&c.parents?.includes(n.id));
+    n.bx=cs.length?cs.reduce((a,c)=>a+c.bx,0)/cs.length:canvasW/2;
     if(reset||!uP[n.id]?.manual){n.x=n.bx;n.fx=null;n.fy=null;}
   });
 
-  // ── Step 5: Y strictly by row ─────────────────────────────────────────
+  // Y by row
   sN.forEach(n=>{
     const ty=layY(n);
     if(reset||!uP[n.id]?.manual){n.y=ty;n.fy=null;}
@@ -1272,7 +1328,10 @@ function computeRTLayout(reset){
 function doColumnLayout(reset){
   Object.keys(uP).forEach(id=>{if(uP[id])uP[id].manual=false;});
   computeRTLayout(true);
-  sN.forEach(n=>{n.vx=0;n.vy=0;n.fx=null;n.fy=null;});
+  sN.forEach(n=>{n.vx=0;n.vy=0;
+    // Release sticky pins for reset
+    n.fx=null;n.fy=null;
+  });
   tick(); updateLanes();
   setTimeout(doFit,80);
 }
@@ -1282,7 +1341,7 @@ function doFit(){
   const minX=Math.min(...xs)-NW,maxX=Math.max(...xs)+NW;
   const minY=Math.min(...ys)-NH,maxY=Math.max(...ys)+NH;
   const cw=wrap.getBoundingClientRect();
-  const pad=60,k=Math.min(.9,(cw.width-pad*2)/(maxX-minX+1),(cw.height-pad*2)/(maxY-minY+1));
+  const pad=50,k=Math.min(.88,(cw.width-pad*2)/(maxX-minX+1),(cw.height-pad*2)/(maxY-minY+1));
   const tx=cw.width/2-k*(minX+maxX)/2,ty=cw.height/2-k*(minY+maxY)/2;
   svg.transition().duration(600).call(zb.transform,d3.zoomIdentity.translate(tx,ty).scale(k));
   setTimeout(updateLanes,620);
@@ -1298,46 +1357,152 @@ function toggleForce(){
   else{forceSub=null;forceOn=!forceOn;}
   document.getElementById("bfrc").classList.toggle("on",forceOn);
   const fst=document.getElementById("fst");
-  if(forceOn&&n){
-    const ifCount=countIFs(n.id);
-    fst.textContent=`⚡ ${n.name.slice(0,18)}  |  ${ifCount} IF`;
-    fst.classList.add("show");
-  } else if(forceOn){
-    // Global force — show total IF count
-    const totalIF=sN.filter(x=>x.type==="IF").length;
-    fst.textContent=`⚡ ALL  |  ${totalIF} IF`;
-    fst.classList.add("show");
-  } else {fst.classList.remove("show");}
   if(forceOn){
+    const ifc=n?countIFs(n.id):sN.filter(x=>x.type==="IF").length;
+    fst.textContent=`⚡ ${n?n.name.slice(0,16):"ALL"}  ·  ${ifc} IF`;
+    fst.classList.add("show");
+    // Release fx/fy so force can move nodes
+    sN.forEach(x=>{x.fx=null;x.fy=null;});
     sim.nodes(forceSub?sN.filter(n=>forceSub.has(n.id)):sN);
     sim.force("link").links(forceSub?sL.filter(l=>forceSub.has(l.source.id)&&forceSub.has(l.target.id)):sL);
     sim.alpha(.5).restart();
-  } else {sim.stop();}
+  } else {
+    fst.classList.remove("show");
+    sim.stop();
+    // Re-pin all nodes to current positions
+    sN.forEach(n=>{n.fx=n.x;n.fy=n.y;});
+  }
 }
 function clearHL(){
-  ng.selectAll("g.nd").attr("opacity",d=>d.isRoot?0.75:1);
+  ng.selectAll("g.nd").attr("opacity",d=>d.isRoot?0.7:1);
   lg.selectAll("path.lk").attr("opacity",1);
   gg.selectAll("g.gsym").attr("opacity",1);
 }
-function openDP(id){
+
+// ── Right Panel node inspector / editor ───────────────────────────────────
+function selectNode(id){
   selId=id;
   const n=NM[id]; if(!n) return;
   sendSelNode(id);
-  document.getElementById("dp").style.display="block";
-  document.getElementById("dpt").textContent=n.name;
-  document.getElementById("dpt").style.color=n.color;
-  const GCM={OR:"#4fc3f7",AND:"#ffb74d"};
-  const q=(id,v,c)=>{const e=document.getElementById(id);e.textContent=v;if(c)e.style.color=c;};
-  q("d0",n.isGroup?"GROUP":n.type,n.color);q("d1",n.gate,GCM[n.gate]||"#aaa");
-  q("d2",n.isPinned?n.value+" 📌":n.value,n.isPinned?"#e94560":n.color);
-  q("d3",n.nodeId||id,"#aaa");
-  q("d7",n.ftLabel||"—","#7e57c2");
-  q("d4",n.shared?"YES":"NO",n.shared?"#f5c518":"#555");
-  q("d5",(n.pnames||[]).join(" · ")||"(top event)");q("d6",(n.cnames||[]).join(" · ")||"(leaf)");
+  // Highlight connected nodes
+  clearHL();
+  ng.selectAll("g.nd").each(function(x){
+    const inPath=x.parents?.includes(id)||x.children?.includes(id)||x.id===id;
+    d3.select(this).attr("opacity",inPath?1:0.15);
+  });
+  lg.selectAll("path.lk").attr("opacity",l=>{
+    return (l.parentId===id||l.childId===id)?1:0.06;
+  });
+  gg.selectAll("g.gsym").attr("opacity",d=>d.n.id===id?1:0.06);
+  // Update selected node stroke
+  ng.selectAll("rect.nb")
+    .attr("stroke",d=>selId===d.id?"#fff":d.isRoot?"#ffffff44":d.isDuplicate?"#4fc3f7":d.isPinned?"#e94560":d.color)
+    .attr("stroke-width",d=>selId===d.id?3:d.isDuplicate?2.5:d.isPinned?2.5:1.5)
+    .attr("filter",d=>selId===d.id?`drop-shadow(0 0 14px ${d.color}aa)`:null);
+  // Populate right panel
+  openRP(id);
 }
-function closeDP(){document.getElementById("dp").style.display="none";clearHL();selId=null;try{window.parent.postMessage(JSON.stringify({type:"fta_selnode",data:null}),"*");}catch(e){}}
+function openRP(id){
+  const n=NM[id]; if(!n) return;
+  const rp=document.getElementById("rp");
+  rp.classList.add("open");
+  // Header
+  document.getElementById("rp-name").textContent=n.name||"";
+  document.getElementById("rp-name").style.color=n.color;
+  document.getElementById("rp-badge").innerHTML=
+    `<code style="background:#1a1a1a;color:${n.color};font-size:9px;padding:1px 6px;border-radius:3px;">${n.nodeId||id}</code>`+
+    `<code style="background:#1a1a1a;color:#555;font-size:9px;padding:1px 6px;border-radius:3px;margin-left:3px;">${n.type}</code>`+
+    (n.shared?`<span style="background:#f5c51822;color:#f5c518;font-size:8px;padding:1px 5px;border-radius:3px;margin-left:3px;border:1px solid #f5c51844;">SHARED</span>`:"");
+  document.getElementById("rp-type").textContent=n.isGroup?"GROUP":n.type;
+  document.getElementById("rp-type").style.color=n.color;
+  document.getElementById("rp-gate-disp").textContent=n.gate;
+  document.getElementById("rp-gate-disp").style.color=n.gate==="AND"?"#ffb74d":"#4fc3f7";
+  document.getElementById("rp-value").textContent=n.isPinned?(n.fixedVal||n.value)+" 📌":n.value;
+  document.getElementById("rp-value").style.color=n.isPinned?"#e94560":n.color;
+  document.getElementById("rp-nid").textContent=n.nodeId||id;
+  document.getElementById("rp-nid").style.color="#aaa";
+  // IF count
+  const ifc=countIFs(id);
+  document.getElementById("rp-ifcount").textContent=ifc+" IF";
+  // Parents
+  const phtml=(n.pnames||[]).map((nm,i)=>{
+    const pid=(n.parents||[])[i];
+    return `<span class="rp-chip" style="background:#1a1a1a;border:1px solid #333;color:#bbb;"
+      onclick="selectNode('${pid}')">${nm.slice(0,24)}</span>`;
+  }).join("")||`<span style="color:#333;font-size:9px;">(top event)</span>`;
+  document.getElementById("rp-parents").innerHTML=phtml;
+  // Children
+  const chtml=(n.cnames||[]).map((nm,i)=>{
+    const chid=(n.children||[])[i];
+    return `<span class="rp-chip" style="background:#1a1a1a;border:1px solid #333;color:#bbb;"
+      onclick="selectNode('${chid}')">${nm.slice(0,24)}</span>`;
+  }).join("")||`<span style="color:#333;font-size:9px;">(leaf node)</span>`;
+  document.getElementById("rp-children").innerHTML=chtml;
+  // Edit fields
+  document.getElementById("rp-edit-name").value=n.name||"";
+  document.getElementById("rp-edit-gate").value=n.gate||"OR";
+  document.getElementById("rp-edit-nodeid").value=n.nodeId||"";
+  document.getElementById("rp-edit-ftlabel").value=n.ftLabel||"";
+  document.getElementById("rp-edit-fixed").value=n.fixedVal||"";
+  document.getElementById("rp-edit-target").value=n.targetValue||"";
+  // Hide delete for HAZARD
+  document.getElementById("rp-del-btn").style.display=n.type==="HAZARD"?"none":"block";
+  document.getElementById("rp-save-msg").style.display="none";
+}
+function closeRP(){
+  document.getElementById("rp").classList.remove("open");
+  clearHL();
+  ng.selectAll("rect.nb")
+    .attr("stroke",d=>d.isRoot?"#ffffff44":d.isDuplicate?"#4fc3f7":d.isPinned?"#e94560":d.color)
+    .attr("stroke-width",d=>d.isDuplicate?2.5:d.isPinned?2.5:1.5)
+    .attr("filter",null);
+  selId=null;
+  try{window.parent.postMessage(JSON.stringify({type:"fta_selnode",data:null}),"*");}catch(e){}
+}
+function rpSave(){
+  if(!selId) return;
+  const name=document.getElementById("rp-edit-name").value.trim();
+  const gate=document.getElementById("rp-edit-gate").value;
+  const nodeId=document.getElementById("rp-edit-nodeid").value.trim();
+  const ftLabel=document.getElementById("rp-edit-ftlabel").value.trim();
+  const fixedStr=document.getElementById("rp-edit-fixed").value.trim();
+  const targetStr=document.getElementById("rp-edit-target").value.trim();
+  const fixedVal=fixedStr?parseFloat(fixedStr):null;
+  const targetVal=targetStr?parseFloat(targetStr):null;
+  try{
+    window.parent.postMessage(JSON.stringify({
+      type:"fta_edit_node",
+      data:{id:selId,name,gate,nodeId,ftLabel,fixedVal,targetVal}
+    }),"*");
+    // Update local NM for immediate visual refresh
+    if(NM[selId]){
+      NM[selId].name=name; NM[selId].gate=gate;
+      NM[selId].nodeId=nodeId; NM[selId].ftLabel=ftLabel;
+      if(fixedVal!=null){NM[selId].fixedVal=String(fixedVal);NM[selId].isPinned=true;}
+      else{NM[selId].fixedVal=null;NM[selId].isPinned=false;}
+    }
+    const snode=sN.find(n=>n.id===selId);
+    if(snode){
+      snode.name=name;snode.gate=gate;snode.nodeId=nodeId;snode.ftLabel=ftLabel;
+      if(fixedVal!=null){snode.fixedVal=String(fixedVal);snode.isPinned=true;}
+      else{snode.fixedVal=null;snode.isPinned=false;}
+    }
+    drawNodes();
+    document.getElementById("rp-save-msg").style.display="block";
+    setTimeout(()=>{document.getElementById("rp-save-msg").style.display="none";},2000);
+  }catch(ex){}
+}
+function rpDelete(){
+  if(!selId) return;
+  if(!confirm("Delete this node and its orphaned children?")) return;
+  try{
+    window.parent.postMessage(JSON.stringify({type:"fta_delete_node",data:{id:selId}}),"*");
+    closeRP();
+  }catch(e){}
+}
 function doSearch(q){
-  ng.selectAll("rect.nb").attr("filter",null);sM=[];sI=0;
+  ng.selectAll("rect.nb").attr("filter",d=>selId===d.id?`drop-shadow(0 0 14px ${d.color}aa)`:null);
+  sM=[];sI=0;
   if(!q.trim()){document.getElementById("si").textContent="";return;}
   const lq=q.toLowerCase();
   RNODES.forEach(n=>{if([n.name,n.type,n.value,n.nodeId||""].some(v=>v.toLowerCase().includes(lq)))sM.push(n.id);});
@@ -1350,84 +1515,56 @@ function sPrev(){if(!sM.length)return;sI=(sI-1+sM.length)%sM.length;panTo(sM[sI]
 function panTo(id){
   const n=sN.find(s=>s.id===id);if(!n)return;
   const cw=wrap.getBoundingClientRect();
-  // Use a comfortable zoom that shows the node in context (not filling screen)
-  const contextK=Math.min(getT().k, 0.55);
-  const cx=cw.width/2-contextK*(n.x||0);
-  const cy=cw.height/2.5-contextK*(n.y||0);
-  svg.transition().duration(500).call(zb.transform,d3.zoomIdentity.translate(cx,cy).scale(contextK));
+  const k=Math.min(getT().k,0.55);
+  svg.transition().duration(500).call(zb.transform,d3.zoomIdentity.translate(cw.width/2-k*(n.x||0),cw.height/2.5-k*(n.y||0)).scale(k));
   setTimeout(updateLanes,520);
 }
-function toggleMultiSel(id,e){
-  if(multiSel.has(id)) multiSel.delete(id);
-  else multiSel.add(id);
-  updateMultiSelUI();
-  sendMultiSel();
+function toggleMultiSel(id){
+  if(multiSel.has(id)) multiSel.delete(id); else multiSel.add(id);
+  updateMultiSelUI(); sendMultiSel();
 }
 function updateMultiSelUI(){
   const msp=document.getElementById("msp");
   const count=multiSel.size;
   document.getElementById("msc").textContent=count;
-  const list=document.getElementById("mslist");
-  list.innerHTML="";
+  const list=document.getElementById("mslist"); list.innerHTML="";
   multiSel.forEach(id=>{
     const n=NM[id]; if(!n) return;
     const chip=document.createElement("span");
     chip.style.cssText=`background:#0a1a2e;border:1px solid ${n.color};color:${n.color};font-size:9px;padding:1px 6px;border-radius:10px;font-family:monospace;font-weight:700;cursor:pointer;`;
-    chip.textContent=(n.nodeId||n.id)+" "+n.name.slice(0,18);
+    chip.textContent=(n.nodeId||n.id)+" "+n.name.slice(0,16);
     chip.onclick=()=>{multiSel.delete(id);updateMultiSelUI();sendMultiSel();};
     list.appendChild(chip);
   });
   msp.style.display=count>0?"block":"none";
   ng.selectAll("g.nd").each(function(d){
     const isSel=multiSel.has(d.id);
-    const el=d3.select(this);
-    el.select("rect.nb")
-      .attr("stroke",isSel?"#e94560":d.isRoot?"#ffffff":d.isDuplicate?"#4fc3f7":d.isPinned?"#e94560":d.color)
-      .attr("stroke-width",isSel?3.5:d.isRoot?2:d.isDuplicate?2.5:d.isPinned?2.5:1.5)
+    d3.select(this).attr("opacity",count>0?(isSel?1:0.2):d.isRoot?0.7:1)
+      .select("rect.nb")
+      .attr("stroke",isSel?"#e94560":d.isRoot?"#ffffff44":d.isDuplicate?"#4fc3f7":d.isPinned?"#e94560":d.color)
+      .attr("stroke-width",isSel?3.5:d.isDuplicate?2.5:d.isPinned?2.5:1.5)
       .attr("stroke-dasharray",isSel?null:d.isRoot?"4,4":d.isDuplicate?"6,3":d.isPinned?"6,3":null)
       .attr("filter",isSel?"drop-shadow(0 0 10px #e9456088)":null);
-    el.attr("opacity",count>0?(isSel?1:0.25):d.isRoot?0.75:1);
   });
-  gg.selectAll("g.gsym").attr("opacity",count>0?0.2:1);
+  gg.selectAll("g.gsym").attr("opacity",count>0?0.15:1);
 }
 function clearMultiSel(){
-  multiSel.clear();
-  updateMultiSelUI();
-  sendMultiSel();
+  multiSel.clear(); updateMultiSelUI(); sendMultiSel();
   ng.selectAll("g.nd").each(function(d){
-    d3.select(this).attr("opacity",d.isRoot?0.75:1)
+    d3.select(this).attr("opacity",d.isRoot?0.7:1)
       .select("rect.nb")
-      .attr("stroke",d.isRoot?"#ffffff":d.isDuplicate?"#4fc3f7":d.isPinned?"#e94560":d.color)
-      .attr("stroke-width",d.isRoot?2:d.isDuplicate?2.5:d.isPinned?2.5:1.5)
+      .attr("stroke",d.isRoot?"#ffffff44":d.isDuplicate?"#4fc3f7":d.isPinned?"#e94560":d.color)
+      .attr("stroke-width",d.isDuplicate?2.5:d.isPinned?2.5:1.5)
       .attr("stroke-dasharray",d.isRoot?"4,4":d.isDuplicate?"6,3":d.isPinned?"6,3":null)
       .attr("filter",null);
   });
   gg.selectAll("g.gsym").attr("opacity",1);
 }
 function sendMultiSel(){
-  try{
-    window.parent.postMessage(JSON.stringify({
-      type:"fta_multisel",
-      data: Array.from(multiSel).map(id=>{
-        const n=NM[id]||{};
-        return {id,name:n.name||id,nodeId:n.nodeId||id,type:n.type||"",color:n.color||"#888",parents:n.parents||[],children:n.children||[]};
-      })
-    }),"*");
-  }catch(e){}
+  try{window.parent.postMessage(JSON.stringify({type:"fta_multisel",data:Array.from(multiSel).map(id=>{const n=NM[id]||{};return {id,name:n.name||id,nodeId:n.nodeId||id,type:n.type||"",color:n.color||"#888",parents:n.parents||[],children:n.children||[]};})}),"*");}catch(e){}
 }
 function sendSelNode(id){
-  try{
-    const n=NM[id]||{};
-    window.parent.postMessage(JSON.stringify({
-      type:"fta_selnode",
-      data:{id,name:n.name||id,nodeId:n.nodeId||id,type:n.type||"",
-            color:n.color||"#888",gate:n.gate||"OR",
-            value:n.value||"-",isPinned:n.isPinned||false,
-            fixedVal:n.fixedVal||null,
-            parents:n.parents||[],pnames:n.pnames||[],
-            children:n.children||[],cnames:n.cnames||[]}
-    }),"*");
-  }catch(e){}
+  try{const n=NM[id]||{};window.parent.postMessage(JSON.stringify({type:"fta_selnode",data:{id,name:n.name||id,nodeId:n.nodeId||id,type:n.type||"",color:n.color||"#888",gate:n.gate||"OR",value:n.value||"-",isPinned:n.isPinned||false,fixedVal:n.fixedVal||null,parents:n.parents||[],pnames:n.pnames||[],children:n.children||[],cnames:n.cnames||[]}}),"*");}catch(e){}
 }
 function savePositions(){
   const pos={};
@@ -1440,15 +1577,16 @@ document.addEventListener("pointerup",()=>setTimeout(savePositions,300));
 refresh();
 const hasSavedPos=Object.keys(IPOS).length>0;
 if(hasSavedPos){
-  Object.entries(IPOS).forEach(([id,p])=>{if(p&&p.x!=null)uP[id]={x:p.x,y:p.y,manual:true};});
-  computeRTLayout(false); tick(); updateLanes();
+  Object.entries(IPOS).forEach(([id,p])=>{if(p&&p.x!=null){uP[id]={x:p.x,y:p.y,manual:true};const n=sN.find(x=>x.id===id);if(n){n.x=p.x;n.y=p.y;n.fx=p.x;n.fy=p.y;}}});
+  computeRTLayout(false);tick();updateLanes();
   setTimeout(doFit,80);
 } else {doColumnLayout(true);}
 if(FOCUSID&&!hasSavedPos) setTimeout(()=>panTo(FOCUSID),900);
 window.addEventListener("message",function(e){
   try{
     const d=typeof e.data==="string"?JSON.parse(e.data):e.data;
-    if(d&&d.type==="fta_restore_pos"){
+    if(!d) return;
+    if(d.type==="fta_restore_pos"){
       let changed=false;
       Object.entries(d.data).forEach(([id,p])=>{if(p&&p.x!=null&&!uP[id]?.manual){uP[id]={x:p.x,y:p.y,manual:p.manual||false};changed=true;}});
       if(changed){computeRTLayout(false);tick();updateLanes();}
@@ -2133,20 +2271,27 @@ def render_sidebar():
                 st.session_state.file_list = list_gist_files(GITHUB_TOKEN, GIST_ID)
                 st.rerun()
 
-# Handle canvas messages (positions + multisel)
+# Handle canvas messages (positions + multisel + node edits)
 cmp_html = """
 <script>
 window.addEventListener("message",function(e){
   try{
     const d=typeof e.data==="string"?JSON.parse(e.data):e.data;
-    if(d&&d.type==="fta_pos"){
+    if(!d) return;
+    if(d.type==="fta_pos"){
       window.parent.postMessage(JSON.stringify({type:"streamlit:setComponentValue",value:{type:"fta_pos",data:d.data}}),"*");
     }
-    if(d&&d.type==="fta_multisel"){
+    if(d.type==="fta_multisel"){
       window.parent.postMessage(JSON.stringify({type:"streamlit:setComponentValue",value:{type:"fta_multisel",data:d.data}}),"*");
     }
-    if(d&&d.type==="fta_selnode"){
+    if(d.type==="fta_selnode"){
       window.parent.postMessage(JSON.stringify({type:"streamlit:setComponentValue",value:{type:"fta_selnode",data:d.data}}),"*");
+    }
+    if(d.type==="fta_edit_node"){
+      window.parent.postMessage(JSON.stringify({type:"streamlit:setComponentValue",value:{type:"fta_edit_node",data:d.data}}),"*");
+    }
+    if(d.type==="fta_delete_node"){
+      window.parent.postMessage(JSON.stringify({type:"streamlit:setComponentValue",value:{type:"fta_delete_node",data:d.data}}),"*");
     }
   }catch(err){}
 });
@@ -2168,6 +2313,52 @@ if msg_val and isinstance(msg_val, dict):
         if sn_data != st.session_state.get("selected_node"):
             st.session_state["selected_node"] = sn_data
             st.rerun(scope="fragment")
+    elif msg_val.get("type") == "fta_edit_node":
+        ed = msg_val.get("data", {})
+        eid = ed.get("id")
+        if eid:
+            _nodes = st.session_state.nodes
+            _changed = False
+            for _n in _nodes:
+                if _n["id"] == eid:
+                    if ed.get("name"):      _n["name"]       = ed["name"];      _changed = True
+                    if ed.get("gate"):      _n["gate"]       = ed["gate"];      _changed = True
+                    if ed.get("nodeId"):    _n["nodeId"]     = ed["nodeId"];    _changed = True
+                    if "ftLabel" in ed:     _n["ftLabel"]    = ed.get("ftLabel",""); _changed = True
+                    fv = ed.get("fixedVal")
+                    _n["fixedValue"] = fv if fv is not None else None
+                    _n["calculatedValue"] = fv if fv is not None else _n.get("calculatedValue")
+                    tv = ed.get("targetVal")
+                    if tv is not None: _n["targetValue"] = tv
+                    _changed = True
+                    break
+            if _changed:
+                st.session_state.nodes_since_calc += 1
+                set_nodes(_nodes)
+                st.rerun(scope="fragment")
+    elif msg_val.get("type") == "fta_delete_node":
+        del_id = msg_val.get("data", {}).get("id")
+        if del_id:
+            _nodes = st.session_state.nodes
+            _pre_roots = {n["id"] for n in _nodes if n["type"] != "HAZARD" and not n.get("parentIds")}
+            _tmp = [dict(n) for n in _nodes if n["id"] != del_id]
+            for _n in _tmp:
+                if del_id in (_n.get("parentIds") or []):
+                    _n["parentIds"] = [p for p in _n["parentIds"] if p != del_id]
+            _chg = True
+            while _chg:
+                _chg = False
+                _orphans = {n["id"] for n in _tmp if n["type"] != "HAZARD" and not n.get("parentIds") and n["id"] not in _pre_roots}
+                if _orphans:
+                    _tmp = [n for n in _tmp if n["id"] not in _orphans]
+                    for _n in _tmp:
+                        _before = len(_n.get("parentIds") or [])
+                        _n["parentIds"] = [p for p in (_n.get("parentIds") or []) if p not in _orphans]
+                        if len(_n.get("parentIds") or []) != _before: _chg = True
+            st.session_state["selected_node"] = None
+            st.session_state.nodes_since_calc += 1
+            set_nodes(_tmp)
+            st.rerun()
 
 with st.sidebar:
     render_sidebar()
@@ -2189,7 +2380,7 @@ with tab_tree:
         tree_html  = build_html_tree(nodes, filter_hazard_id=filt_id,
                                      tree_state=st.session_state.tree_state)
         if tree_html:
-            components.html(tree_html, height=700, scrolling=False)
+            components.html(tree_html, height=780, scrolling=False)
         else:
             st.info("No nodes visible for this filter.")
 
