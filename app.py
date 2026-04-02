@@ -19,221 +19,145 @@ VALID_CHILD_TYPES  = ["SF","FF","IF","GROUP"]
 DISPLAY_ORDER      = ["HAZARD","SF","FF","IF","GROUP"]
 
 # ── PFTA Forward Verification Engine ─────────────────────────────────────
-def pfta_verify(nodes):
+def builtin_forward_verify(nodes):
     """
-    Use PFTA's FaultTree as a forward verification engine.
+    Built-in forward verification engine — no external dependencies.
 
-    Takes the current node list (with calculatedValues assigned by
-    the inverse solver / recalculate()), builds a PFTA fault tree
-    text from the bottom-up, runs PFTA's exact forward solver, and
-    returns a dict of:
+    Performs a bottom-up forward pass through the fault tree using the
+    calculated leaf values, then compares the forward-computed hazard
+    probabilities against the stored targetValues.
+
+    For OR gates:  P(top) ≈ sum of children (rare-event approximation)
+    For AND gates: P(top) = product of children
+
+    Shared events (same nodeId) are deduplicated — counted only once per gate.
+
+    Returns:
         {
-          "top_gate_results": { gate_id: pfta_probability },
-          "divergence":       { hazard_name: { "target": T, "pfta": P, "delta_pct": D } },
-          "warnings":         [ list of warning strings ],
-          "pfta_text":        the generated fault tree text (for debugging),
-          "success":          bool
+          "success": bool,
+          "hazard_results": { hazard_name: computed_prob },
+          "divergence":     { hazard_name: { target, forward_calc, inverse_calc, delta_pct, ok } },
+          "warnings":       [ list of strings ],
+          "gate_results":   { node_name: computed_prob }   (all gates for debug)
         }
-
-    PFTA uses Boolean algebra / inclusion-exclusion for exact probability
-    calculation — correctly handles shared events in mixed AND/OR trees.
-    This catches approximation errors in the top-down budget distribution.
     """
-    try:
-        from pfta.core import FaultTree
-    except ImportError:
-        return {
-            "success": False,
-            "warnings": ["PFTA not installed. Run: pip install pfta"],
-            "top_gate_results": {},
-            "divergence": {},
-            "pfta_text": ""
-        }
-
     if not nodes:
         return {"success": False, "warnings": ["No nodes to verify."],
-                "top_gate_results": {}, "divergence": {}, "pfta_text": ""}
+                "hazard_results": {}, "divergence": {}, "gate_results": {}}
 
     by_id    = {n["id"]: n for n in nodes}
     warnings = []
 
-    # ── Step 1: Identify structure ────────────────────────────────────────
-    # Children map: parent_id → list of child nodes
+    # Build children map
     children_of = {n["id"]: [] for n in nodes}
     for n in nodes:
         for pid in (n.get("parentIds") or []):
             if pid in children_of:
                 children_of[pid].append(n["id"])
 
-    # Identify top gates (HAZARDs) and intermediate gates (SF, FF, GROUP)
-    gate_ids  = {n["id"] for n in nodes if n["type"] in ("HAZARD","SF","FF","GROUP")}
-    event_ids = {n["id"] for n in nodes if n["type"] == "IF"}
-
-    # Nodes with no children and not IF type — treat as leaf events too
+    # Bottom-up topological order (leaves first, hazards last)
+    visited_topo = []
+    seen_topo    = set()
+    def topo_visit(nid):
+        if nid in seen_topo: return
+        seen_topo.add(nid)
+        for cid in children_of.get(nid, []):
+            topo_visit(cid)
+        visited_topo.append(nid)
     for n in nodes:
-        if n["type"] not in ("IF",) and not children_of.get(n["id"]):
-            event_ids.add(n["id"])
-            gate_ids.discard(n["id"])
+        if n["type"] == "HAZARD":
+            topo_visit(n["id"])
 
-    # ── Step 2: Build PFTA text ───────────────────────────────────────────
-    lines = ["- times: nan", ""]
+    # Forward compute: each node's forward value = combination of its children
+    fwd = {}
+    for nid in visited_topo:
+        n        = by_id[nid]
+        children = children_of.get(nid, [])
 
-    # Emit Events (leaf nodes — IF nodes and childless non-IF nodes)
-    # Use nodeId as the PFTA identifier (strip hyphens for PFTA compatibility)
-    def pfta_id(node):
-        """Generate a safe PFTA identifier from node id."""
-        raw = node.get("nodeId") or node["id"]
-        return re.sub(r'[^A-Za-z0-9_]', '_', raw) + "_" + node["id"][:5]
+        if not children:
+            # Leaf node — use calculatedValue directly
+            v = n.get("calculatedValue")
+            fwd[nid] = float(v) if v is not None else 0.0
+            continue
 
-    emitted_events = {}  # internal_id → pfta_id
-    # Track shared nodeIds so PFTA sees them as the SAME event
-    nodeid_to_pfta = {}  # nodeId → pfta_id (first occurrence wins)
+        # Collect unique child values (deduplicate shared events by nodeId)
+        seen_nids  = set()
+        child_vals = []
+        for cid in children:
+            c      = by_id.get(cid)
+            cnid   = (c.get("nodeId") or "").strip() if c else ""
+            if cnid and cnid in seen_nids:
+                continue  # shared event — count once
+            if cnid:
+                seen_nids.add(cnid)
+            cv = fwd.get(cid, 0.0)
+            child_vals.append(cv)
+
+        if not child_vals:
+            fwd[nid] = 0.0
+            continue
+
+        gate = n.get("gate", "OR")
+        if gate == "OR":
+            # Rare-event approximation: sum, clamped to 1
+            fwd[nid] = min(1.0, sum(child_vals))
+        else:  # AND
+            p = 1.0
+            for v in child_vals:
+                p *= v
+            fwd[nid] = p
+
+    # Build results
+    gate_results  = {by_id[nid]["name"]: fwd[nid] for nid in fwd}
+    hazard_results = {}
+    divergence     = {}
 
     for n in nodes:
-        if n["id"] not in event_ids:
+        if n["type"] != "HAZARD":
             continue
-        nid_key = (n.get("nodeId") or "").strip()
-        if nid_key and nid_key in nodeid_to_pfta:
-            # Shared event — reuse the same PFTA event id
-            emitted_events[n["id"]] = nodeid_to_pfta[nid_key]
-            continue
-
-        pid = pfta_id(n)
-        emitted_events[n["id"]] = pid
-        if nid_key:
-            nodeid_to_pfta[nid_key] = pid
-
-        prob = n.get("calculatedValue")
-        if prob is None or math.isnan(prob) or math.isinf(prob):
-            prob = 0.0
-        prob = max(0.0, min(1.0, float(prob)))
-
-        lines.append(f"Event: {pid}")
-        label = (n.get("name") or pid).replace("\n"," ")[:60]
-        lines.append(f"- label: {label}")
-        lines.append("- model_type: Fixed")
-        lines.append(f"- probability: {prob:.6e}")
-        lines.append("- intensity: 0")
-        lines.append("")
-
-    # Emit Gates (topological order — children before parents)
-    emitted_gates = {}
-
-    def topo_gates():
-        """Yield gate node ids in bottom-up topological order."""
-        visited = set()
-        def visit(nid):
-            if nid in visited: return
-            visited.add(nid)
-            for cid in children_of.get(nid, []):
-                if cid in gate_ids:
-                    visit(cid)
-            if nid in gate_ids:
-                yield nid
-        for n in nodes:
-            if n["type"] == "HAZARD":
-                yield from visit(n["id"])
-
-    for gid in topo_gates():
-        n   = by_id[gid]
-        pid = pfta_id(n)
-        emitted_gates[gid] = pid
-
-        gate_type = "OR" if n.get("gate","OR") == "OR" else "AND"
-        child_ids = children_of.get(gid, [])
-        if not child_ids:
-            # Childless gate — emit as a zero-probability event
-            lines.append(f"Event: {pid}")
-            lines.append(f"- label: {(n.get('name','')[:60])}")
-            lines.append("- model_type: Fixed")
-            lines.append("- probability: 0")
-            lines.append("- intensity: 0")
-            lines.append("")
-            continue
-
-        # Resolve child PFTA ids
-        child_pfta_ids = []
-        seen_pfta = set()
-        for cid in child_ids:
-            cpid = emitted_events.get(cid) or emitted_gates.get(cid)
-            if cpid and cpid not in seen_pfta:
-                child_pfta_ids.append(cpid)
-                seen_pfta.add(cpid)
-
-        if not child_pfta_ids:
-            warnings.append(f"Gate {n.get('name',gid)} has no resolvable children — skipped.")
-            continue
-
-        lines.append(f"Gate: {pid}")
-        lines.append(f"- label: {(n.get('name','')[:60])}")
-        lines.append(f"- type: {gate_type}")
-        lines.append(f"- inputs: {', '.join(child_pfta_ids)}")
-        lines.append("")
-
-    pfta_text = "\n".join(lines)
-
-    # ── Step 3: Run PFTA forward solver ──────────────────────────────────
-    try:
-        ft = FaultTree(pfta_text)
-    except Exception as e:
-        warnings.append(f"PFTA parse error: {e}")
-        return {"success": False, "warnings": warnings,
-                "top_gate_results": {}, "divergence": {}, "pfta_text": pfta_text}
-
-    # ── Step 4: Collect top-gate results and compare to targets ──────────
-    top_gate_results = {}
-    divergence       = {}
-
-    pfta_gate_map = {emitted_gates[gid]: gid for gid in emitted_gates}
-
-    for gate in ft.gates:
-        if not gate.is_top_gate:
-            continue
-        pfta_prob = gate.computed_probabilities[0] if gate.computed_probabilities else 0.0
-        top_gate_results[gate.id_] = pfta_prob
-
-        orig_id = pfta_gate_map.get(gate.id_)
-        if orig_id:
-            orig_node = by_id.get(orig_id)
-            if orig_node:
-                target = orig_node.get("targetValue")
-                calc   = orig_node.get("calculatedValue")
-                name   = orig_node.get("name","?")
-                if target and target > 0:
-                    delta_pct = abs(pfta_prob - target) / target * 100
-                    divergence[name] = {
-                        "target":    target,
-                        "inverse_calc": calc,
-                        "pfta":      pfta_prob,
-                        "delta_pct": delta_pct,
-                        "ok":        delta_pct < 5.0  # within 5% = acceptable
-                    }
+        fwd_prob = fwd.get(n["id"], 0.0)
+        hazard_results[n["name"]] = fwd_prob
+        target = n.get("targetValue")
+        calc   = n.get("calculatedValue")
+        if target and target > 0:
+            delta_pct = abs(fwd_prob - target) / target * 100
+            divergence[n["name"]] = {
+                "target":       target,
+                "forward_calc": fwd_prob,
+                "inverse_calc": calc,
+                "delta_pct":    delta_pct,
+                "ok":           delta_pct < 5.0
+            }
 
     return {
-        "success":          True,
-        "top_gate_results": top_gate_results,
-        "divergence":       divergence,
-        "warnings":         warnings,
-        "pfta_text":        pfta_text,
+        "success":        True,
+        "hazard_results": hazard_results,
+        "divergence":     divergence,
+        "warnings":       warnings,
+        "gate_results":   gate_results,
     }
 
 
 def render_pfta_verification(nodes):
     """
-    Streamlit UI component for the PFTA Verification panel.
-    Shows a 'Verify with PFTA' button, runs pfta_verify(), and
-    displays results inline: pass/fail per hazard, divergence %, warnings.
+    Streamlit UI component for the Forward Verification panel.
+    Built-in forward solver — no external dependencies required.
+    Runs a bottom-up pass using calculatedValues and compares
+    forward-computed hazard probabilities to their targets.
     """
     st.markdown("""
     <div style="background:#0a0f1a;border:1.5px solid #4fc3f744;border-radius:8px;
                 padding:10px 14px;margin-bottom:8px;">
       <div style="font-size:9px;color:#4fc3f7;font-weight:700;letter-spacing:2px;margin-bottom:4px;">
-        PFTA FORWARD VERIFICATION
+        FORWARD VERIFICATION ENGINE
       </div>
       <div style="font-size:9px;color:#666;line-height:1.6;">
-        Runs PFTA's exact Boolean algebra solver on your current assigned values
-        and compares the forward-computed top-event probabilities against your
-        hazard targets. Catches approximation errors in the inverse distribution.
+        Performs a bottom-up forward pass through the fault tree using your
+        current calculated leaf values, then compares the forward-computed
+        top-event probabilities against your hazard targets.
+        Catches approximation errors from the top-down inverse distribution.
+        OR gates use rare-event summation; AND gates use product.
+        Shared events (same Node ID) are deduplicated per gate.
       </div>
     </div>""", unsafe_allow_html=True)
 
@@ -243,7 +167,6 @@ def render_pfta_verification(nodes):
                     unsafe_allow_html=True)
         return
 
-    # Check all HAZARDs have assigned calculatedValues
     unresolved = [n for n in nodes if n.get("calculatedValue") is None]
     if unresolved:
         st.markdown(
@@ -255,28 +178,28 @@ def render_pfta_verification(nodes):
 
     col_btn, col_info = st.columns([2, 3])
     with col_btn:
-        run_verify = st.button("🔬 Verify with PFTA",
+        run_verify = st.button("🔬 Run Forward Verification",
                                use_container_width=True,
                                key="pfta_verify_btn",
-                               help="Run PFTA's exact forward solver and compare against your hazard targets")
+                               help="Bottom-up forward pass — compares computed hazard probabilities to targets")
     with col_info:
         st.markdown(
             "<div style='font-size:9px;color:#555;padding-top:6px;line-height:1.5;'>"
-            "Uses Boolean algebra — exact result even for shared events in mixed AND/OR trees.</div>",
+            "Built-in engine — no extra libraries needed. "
+            "Rare-event OR summation; AND product. Shared events deduplicated.</div>",
             unsafe_allow_html=True)
 
     if run_verify:
-        with st.spinner("Running PFTA forward solver..."):
-            result = pfta_verify(nodes)
+        with st.spinner("Running forward verification..."):
+            result = builtin_forward_verify(nodes)
 
         if not result["success"]:
-            st.error("PFTA verification failed")
+            st.error("Verification failed")
             for w in result["warnings"]:
                 st.markdown(f"<div style='font-size:10px;color:#ff4d4d;'>{esc(w)}</div>",
                             unsafe_allow_html=True)
             return
 
-        # ── Warnings ────────────────────────────────────────────────────
         if result["warnings"]:
             for w in result["warnings"]:
                 st.markdown(
@@ -289,7 +212,7 @@ def render_pfta_verification(nodes):
         if div:
             all_ok = all(v["ok"] for v in div.values())
             summary_color = "#4caf7d" if all_ok else "#ff4d4d"
-            summary_icon  = "✓ ALL WITHIN TOLERANCE" if all_ok else "✗ DIVERGENCE DETECTED"
+            summary_icon  = "✓ ALL WITHIN TOLERANCE (< 5%)" if all_ok else "✗ DIVERGENCE DETECTED"
             st.markdown(
                 f"<div style='font-size:10px;color:{summary_color};font-weight:700;"
                 f"background:{summary_color}11;border:1px solid {summary_color}44;"
@@ -302,40 +225,39 @@ def render_pfta_verification(nodes):
                 icon    = "✓" if ok else "✗"
                 delta   = d["delta_pct"]
                 target  = d["target"]
-                pfta_p  = d["pfta"]
+                fwd_p   = d["forward_calc"]
                 inv_c   = d["inverse_calc"]
+                warn_html = (
+                    f'<div style="font-size:9px;color:#ff4d4d;margin-top:5px;line-height:1.4;">'
+                    f'⚠ Divergence exceeds 5%. The inverse approximation may be inaccurate '
+                    f'for this branch. Check shared events or high-probability paths.</div>'
+                ) if not ok else ""
 
                 st.markdown(f"""
                 <div style="background:#111;border:1.5px solid {color}44;border-radius:7px;
                             padding:8px 12px;margin:4px 0;">
                   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
                     <span style="font-size:11px;font-weight:700;color:{color};">{icon} {esc(hname)}</span>
-                    <span style="font-size:9px;color:{'#4caf7d' if ok else '#ff4d4d'};
-                                 background:{'#0a1a0a' if ok else '#1a0a0a'};
+                    <span style="font-size:9px;color:{color};background:{'#0a1a0a' if ok else '#1a0a0a'};
                                  padding:1px 8px;border-radius:10px;font-weight:700;">
-                      Δ {delta:.2f}%
+                      &Delta; {delta:.2f}%
                     </span>
                   </div>
                   <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;">
                     <div style="background:#0a0a0a;border-radius:4px;padding:5px 8px;">
                       <div style="font-size:7px;color:#555;letter-spacing:1px;">TARGET</div>
-                      <div style="font-size:10px;color:#ff8c42;font-family:monospace;font-weight:700;">
-                        {target:.3e}</div>
+                      <div style="font-size:10px;color:#ff8c42;font-family:monospace;font-weight:700;">{target:.3e}</div>
                     </div>
                     <div style="background:#0a0a0a;border-radius:4px;padding:5px 8px;">
                       <div style="font-size:7px;color:#555;letter-spacing:1px;">INVERSE CALC</div>
-                      <div style="font-size:10px;color:#f5c518;font-family:monospace;font-weight:700;">
-                        {f"{inv_c:.3e}" if inv_c is not None else "—"}</div>
+                      <div style="font-size:10px;color:#f5c518;font-family:monospace;font-weight:700;">{f"{inv_c:.3e}" if inv_c is not None else "&#8212;"}</div>
                     </div>
                     <div style="background:#0a0a0a;border-radius:4px;padding:5px 8px;">
-                      <div style="font-size:7px;color:#555;letter-spacing:1px;">PFTA EXACT</div>
-                      <div style="font-size:10px;color:{color};font-family:monospace;font-weight:700;">
-                        {pfta_p:.3e}</div>
+                      <div style="font-size:7px;color:#555;letter-spacing:1px;">FORWARD COMPUTED</div>
+                      <div style="font-size:10px;color:{color};font-family:monospace;font-weight:700;">{fwd_p:.3e}</div>
                     </div>
                   </div>
-                  {"" if ok else f'<div style="font-size:9px;color:#ff4d4d;margin-top:5px;line-height:1.4;">'
-                   f'⚠ Divergence exceeds 5%. The inverse approximation (remainder/n or root) '
-                   f'may be inaccurate for this branch. Check shared events or high-probability paths.</div>'}
+                  {warn_html}
                 </div>""", unsafe_allow_html=True)
         else:
             st.markdown(
@@ -343,19 +265,15 @@ def render_pfta_verification(nodes):
                 "— set targetValue on HAZARD nodes to see divergence analysis.</div>",
                 unsafe_allow_html=True)
 
-        # ── Raw PFTA results ─────────────────────────────────────────────
-        if result["top_gate_results"]:
-            with st.expander("Raw PFTA top-gate probabilities"):
-                for gid, prob in result["top_gate_results"].items():
+        # ── All gate forward values ───────────────────────────────────────
+        if result.get("gate_results"):
+            with st.expander("All gate forward-computed values (debug)"):
+                for gname, prob in result["gate_results"].items():
                     st.markdown(
-                        f"<code style='font-size:10px;color:#4fc3f7;'>{gid}</code>"
+                        f"<code style='font-size:10px;color:#4fc3f7;'>{esc(gname)}</code>"
                         f"<span style='font-size:10px;color:#ccc;font-family:monospace;'>"
-                        f"  →  {prob:.6e}</span>",
+                        f"  &rarr;  {prob:.6e}</span>",
                         unsafe_allow_html=True)
-
-        # ── Debug: show generated PFTA text ─────────────────────────────
-        with st.expander("Generated PFTA fault tree text (debug)"):
-            st.code(result["pfta_text"], language="text")
 
 
 # ── Gist helpers ──────────────────────────────────────────────────────────
@@ -962,7 +880,7 @@ const FOCUSID=__FOCUS__;
 const LLABELS=__LLABELS__;
 const LCOLORS=__LCOLORS__;
 const GC={OR:"#4fc3f7",AND:"#ffb74d"};
-const NW=160,NH=88,HG=20,VG=140;
+const NW=180,NH=90,HG=30,VG=160;
 let selId=null,forceOn=false,forceSub=null;
 let collapsed=new Set(),sM=[],sI=0;
 let multiSel=new Set();
@@ -979,15 +897,21 @@ const zb=d3.zoom().scaleExtent([.03,6])
 svg.call(zb).on("contextmenu",e=>e.preventDefault());
 svg.on("click",()=>{closeDP();if(multiSel.size>0)clearMultiSel();});
 function getT(){return d3.zoomTransform(svg.node());}
-function layY(r){return 80+r*VG;}
+// Row → Y: HAZARD=row0, SF=row1, FF=row2, GROUP=row2.5, IF=row3
+// Using type-based strict rows for clean top-down layout
+const TYPE_ROW={HAZARD:0,SF:1,FF:2,GROUP:2,IF:3};
+function layY(n){
+  const typeRow=TYPE_ROW[n.type]??n.row??2;
+  return 80+typeRow*VG;
+}
 let sN=[],sL=[];
 const sim=d3.forceSimulation()
-  .force("link",d3.forceLink().id(d=>d.id).distance(130).strength(.4))
-  .force("charge",d3.forceManyBody().strength(-500).distanceMax(380))
-  .force("collide",d3.forceCollide(88))
-  .force("y",d3.forceY(d=>layY(d.row)).strength(.5))
-  .force("x",d3.forceX(d=>d.bx||400).strength(.06))
-  .alphaDecay(.025).velocityDecay(.42)
+  .force("link",d3.forceLink().id(d=>d.id).distance(NW+HG).strength(.3))
+  .force("charge",d3.forceManyBody().strength(-900).distanceMax(600))
+  .force("collide",d3.forceCollide(NW*0.65))
+  .force("y",d3.forceY(d=>layY(d)).strength(2.0))
+  .force("x",d3.forceX(d=>d.bx||600).strength(.15))
+  .alphaDecay(.02).velocityDecay(.5)
   .on("tick",tick);
 sim.stop();
 
@@ -1111,12 +1035,18 @@ function updateLanes(){
   });
 }
 function computeRTLayout(reset){
+  // Step 1: Assign SF columns — evenly spaced across canvas
   const sfNodes=sN.filter(n=>n.type==="SF");
-  const colW=NW+HG;
+  const totalSFs=sfNodes.length||1;
+  const canvasW=Math.max(totalSFs*(NW+HG)+200, 1200);
+  const startX=100;
+  const colStep=(canvasW-startX*2)/(totalSFs>1?totalSFs-1:1);
+
   sfNodes.forEach((sf,i)=>{
-    const cx=100+i*colW;
+    const cx=startX+i*(totalSFs>1?colStep:0);
     sf.bx=cx;
     if(reset||!uP[sf.id]?.manual){sf.x=cx;sf.fx=null;sf.fy=null;}
+    // Assign all descendants of this SF the same bx for column alignment
     const sub=subIds(sf.id);
     sN.forEach(n=>{
       if(n.id!==sf.id&&sub.has(n.id)){
@@ -1125,10 +1055,18 @@ function computeRTLayout(reset){
       }
     });
   });
+
+  // Step 2: HAZARDs sit above their SF children, centered
   sN.filter(n=>n.type==="HAZARD").forEach(n=>{
     const childSFs=sN.filter(c=>c.type==="SF"&&c.parents?.includes(n.id));
-    n.bx=childSFs.length?childSFs.reduce((a,c)=>a+c.bx,0)/childSFs.length:400;
+    n.bx=childSFs.length?childSFs.reduce((a,c)=>a+c.bx,0)/childSFs.length:canvasW/2;
     if(reset||!uP[n.id]?.manual){n.x=n.bx;n.fx=null;n.fy=null;}
+  });
+
+  // Step 3: Pin Y strictly by node type — no overlap between levels
+  sN.forEach(n=>{
+    const ty=layY(n);
+    if(reset||!uP[n.id]?.manual){n.y=ty;n.fy=null;}
   });
 }
 function doColumnLayout(reset){
@@ -1500,6 +1438,20 @@ def render_sidebar():
                         unsafe_allow_html=True)
 
     with st.expander("📥 IMPORT / EXPORT", expanded=False):
+        # ── Export scope notice ──────────────────────────────────────────
+        n_hazards = len([n for n in st.session_state.nodes if n["type"] == "HAZARD"])
+        st.markdown(
+            f"<div style='background:#0a1a0a;border:1px solid #4caf7d44;border-radius:5px;"
+            f"padding:6px 10px;margin-bottom:8px;'>"
+            f"<div style='font-size:8px;color:#4caf7d;font-weight:700;letter-spacing:1px;margin-bottom:3px;'>&#9432; EXPORT SCOPE</div>"
+            f"<div style='font-size:9px;color:#888;line-height:1.5;'>"
+            f"All exports contain the <b style='color:#ddd;'>entire fault tree</b> — all {len(st.session_state.nodes)} nodes "
+            f"across all {n_hazards} hazard(s). There is no per-hazard export; "
+            f"the tree is one connected dataset. To get per-hazard data, use the "
+            f"<b style='color:#ddd;'>HIERARCHY</b> tab filter and copy manually."
+            f"</div></div>",
+            unsafe_allow_html=True
+        )
         st.markdown("<div style='font-size:9px;color:#555;letter-spacing:1px;margin-bottom:4px;'>IMPORT</div>",
                     unsafe_allow_html=True)
         up = st.file_uploader("Upload JSON", type=["json"], key="json_up",
@@ -1950,38 +1902,31 @@ with tab_hier:
             tgt_str = fmt(node.get("targetValue")) if node.get("targetValue") else ""
             node_id = node.get("nodeId", node["id"])
             is_shared = len(node.get("parentIds") or []) > 1
-            pnames = " · ".join(by_id[p]["name"] for p in (node.get("parentIds") or []) if p in by_id) or "—"
-            cnames = " · ".join(n["name"] for n in nodes if node["id"] in (n.get("parentIds") or [])) or "—"
+            pnames = esc(" · ".join(by_id[p]["name"] for p in (node.get("parentIds") or []) if p in by_id) or "—")
+            cnames = esc(" · ".join(n["name"] for n in nodes if node["id"] in (n.get("parentIds") or [])) or "—")
             shape_style = "border-radius:50px;" if node["type"] == "GROUP" else "border-radius:6px;"
             pin_border  = "border:2px solid #e94560;" if node.get("fixedValue") is not None else f"border:1px solid {color}33;"
             ref_style   = "opacity:0.55;border-style:dashed;" if is_ref else ""
-            st.markdown(f"""
-            <div style="margin-left:{indent}px;background:#141414;{pin_border}{shape_style}{ref_style}
-                        padding:7px 12px;margin-bottom:3px;">
-              <div style="display:grid;grid-template-columns:2fr 0.6fr 0.6fr 1.2fr 1.8fr;gap:8px;align-items:center;">
-                <div>
-                  <span style="font-size:11px;font-weight:700;color:#ddd;">{esc(node['name'])}</span>
-                  {'<span style="background:#f5c518;color:#111;font-size:7px;padding:0 3px;border-radius:3px;margin-left:5px;font-weight:700;">SHR</span>' if is_shared else ''}
-                  {'<span style="background:#4444aa;color:#fff;font-size:7px;padding:0 3px;border-radius:3px;margin-left:3px;">REF</span>' if is_ref else ''}
-                </div>
-                <div style="font-size:7px;color:#444;letter-spacing:1px;margin-bottom:1px;">
-                  <div>NODE ID</div><div style="font-size:10px;color:{color};font-weight:700;font-family:monospace;">{esc(node_id)}</div>
-                </div>
-                <div>
-                  <div style="font-size:7px;color:#444;letter-spacing:1px;">TYPE</div>
-                  <div style="font-size:10px;color:{color};font-weight:700;">{esc(node['type'])}</div>
-                </div>
-                <div>
-                  <div style="font-size:7px;color:#444;letter-spacing:1px;">CALC VALUE</div>
-                  <div style="font-size:11px;color:{val_color};font-weight:700;font-family:monospace;">{val_display}</div>
-                  {f'<div style="font-size:8px;color:#555;font-family:monospace;">target: {tgt_str}</div>' if tgt_str else ''}
-                </div>
-                <div>
-                  <div style="font-size:9px;color:#555;">↑ {pnames}</div>
-                  <div style="font-size:9px;color:#444;">↓ {cnames}</div>
-                </div>
-              </div>
-            </div>""", unsafe_allow_html=True)
+            shr_badge   = '<span style="background:#f5c518;color:#111;font-size:7px;padding:0 3px;border-radius:3px;margin-left:5px;font-weight:700;">SHR</span>' if is_shared else ""
+            ref_badge   = '<span style="background:#4444aa;color:#fff;font-size:7px;padding:0 3px;border-radius:3px;margin-left:3px;">REF</span>' if is_ref else ""
+            tgt_row     = f'<div style="font-size:8px;color:#555;font-family:monospace;">target: {tgt_str}</div>' if tgt_str else ""
+            html_block = (
+                f'<div style="margin-left:{indent}px;background:#141414;{pin_border}{shape_style}{ref_style}'
+                f'padding:7px 12px;margin-bottom:3px;">'
+                f'<div style="display:grid;grid-template-columns:2fr 0.6fr 0.6fr 1.2fr 1.8fr;gap:8px;align-items:center;">'
+                f'<div><span style="font-size:11px;font-weight:700;color:#ddd;">{esc(node["name"])}</span>{shr_badge}{ref_badge}</div>'
+                f'<div><div style="font-size:7px;color:#444;letter-spacing:1px;">NODE ID</div>'
+                f'<div style="font-size:10px;color:{color};font-weight:700;font-family:monospace;">{esc(node_id)}</div></div>'
+                f'<div><div style="font-size:7px;color:#444;letter-spacing:1px;">TYPE</div>'
+                f'<div style="font-size:10px;color:{color};font-weight:700;">{esc(node["type"])}</div></div>'
+                f'<div><div style="font-size:7px;color:#444;letter-spacing:1px;">CALC VALUE</div>'
+                f'<div style="font-size:11px;color:{val_color};font-weight:700;font-family:monospace;">{val_display}</div>'
+                f'{tgt_row}</div>'
+                f'<div><div style="font-size:9px;color:#555;">&#8593; {pnames}</div>'
+                f'<div style="font-size:9px;color:#444;">&#8595; {cnames}</div></div>'
+                f'</div></div>'
+            )
+            st.markdown(html_block, unsafe_allow_html=True)
 
         st.markdown("---")
         cols = st.columns(6)
@@ -2013,38 +1958,38 @@ with tab_data:
                 val       = fmt(node.get("calculatedValue"))
                 node_id   = node.get("nodeId", node["id"])
                 ft_lbl    = node.get("ftLabel","")
-                pnames    = " · ".join(by_id[p]["name"] for p in (node.get("parentIds") or []) if p in by_id) or "—"
-                cnames    = " · ".join(n["name"] for n in nodes if node["id"] in (n.get("parentIds") or [])) or "—"
+                pnames    = esc(" · ".join(by_id[p]["name"] for p in (node.get("parentIds") or []) if p in by_id) or "—")
+                cnames    = esc(" · ".join(n["name"] for n in nodes if node["id"] in (n.get("parentIds") or [])) or "—")
                 is_shared = len(node.get("parentIds") or []) > 1
                 is_pinned = node.get("fixedValue") is not None
                 val_color = "#e94560" if is_pinned else color
                 tgt_str   = fmt(node.get("targetValue")) if node.get("targetValue") else ""
                 shape_style = "border-radius:50px;" if node["type"] == "GROUP" else "border-radius:6px;"
                 pin_border  = "border:2px solid #e94560;" if is_pinned else f"border:2px solid {color}44;"
-                badges = f'<code style="background:#1a1a2e;color:{color};font-size:9px;padding:1px 5px;border-radius:3px;font-weight:700;">{node_id}</code>'
-                if ft_lbl: badges += f' <code style="background:#1a1a2e;color:#7e57c2;font-size:9px;padding:1px 5px;border-radius:3px;">{ft_lbl}</code>'
-                if is_shared: badges += ' <span style="background:#f5c518;color:#111;font-size:7px;padding:1px 4px;border-radius:3px;font-weight:700;">SHARED</span>'
-                if is_pinned: badges += f' <span style="background:#e9456022;color:#e94560;font-size:7px;padding:1px 4px;border-radius:3px;border:1px solid #e9456044;">📌 FIXED={fmt(node.get("fixedValue"))}</span>'
-                st.markdown(f"""
-                <div style="background:#141414;{pin_border}{shape_style}padding:9px 14px;margin-bottom:5px;">
-                  <div style="display:grid;grid-template-columns:2.5fr 0.7fr 0.7fr 1.5fr 2fr;gap:10px;align-items:start;">
-                    <div>
-                      <div style="font-weight:700;font-size:11px;color:#ddd;margin-bottom:3px;">{esc(node['name'])}</div>
-                      <div>{badges}</div>
-                    </div>
-                    <div><div style="font-size:7px;color:#444;">TYPE</div><div style="font-size:10px;color:{color};font-weight:700;">{node['type']}</div></div>
-                    <div><div style="font-size:7px;color:#444;">GATE</div><div style="font-size:10px;color:{gc};font-weight:700;">{node['gate']}</div></div>
-                    <div>
-                      <div style="font-size:7px;color:#444;">CALC VALUE</div>
-                      <div style="font-size:11px;color:{val_color};font-weight:700;font-family:monospace;">{val}{'📌' if is_pinned else ''}</div>
-                      {f'<div style="font-size:8px;color:#555;font-family:monospace;">target: {tgt_str}</div>' if tgt_str else ''}
-                    </div>
-                    <div>
-                      <div style="font-size:8px;color:#444;">↑ {pnames}</div>
-                      <div style="font-size:8px;color:#333;margin-top:2px;">↓ {cnames}</div>
-                    </div>
-                  </div>
-                </div>""", unsafe_allow_html=True)
+                badges = f'<code style="background:#1a1a2e;color:{color};font-size:9px;padding:1px 5px;border-radius:3px;font-weight:700;">{esc(node_id)}</code>'
+                if ft_lbl:
+                    badges += f' <code style="background:#1a1a2e;color:#7e57c2;font-size:9px;padding:1px 5px;border-radius:3px;">{esc(ft_lbl)}</code>'
+                if is_shared:
+                    badges += ' <span style="background:#f5c518;color:#111;font-size:7px;padding:1px 4px;border-radius:3px;font-weight:700;">SHARED</span>'
+                if is_pinned:
+                    badges += f' <span style="background:#e9456022;color:#e94560;font-size:7px;padding:1px 4px;border-radius:3px;border:1px solid #e9456044;">&#128204; FIXED={fmt(node.get("fixedValue"))}</span>'
+                tgt_row = f'<div style="font-size:8px;color:#555;font-family:monospace;">target: {tgt_str}</div>' if tgt_str else ""
+                pin_icon = "&#128204;" if is_pinned else ""
+                html_block = (
+                    f'<div style="background:#141414;{pin_border}{shape_style}padding:9px 14px;margin-bottom:5px;">'
+                    f'<div style="display:grid;grid-template-columns:2.5fr 0.7fr 0.7fr 1.5fr 2fr;gap:10px;align-items:start;">'
+                    f'<div><div style="font-weight:700;font-size:11px;color:#ddd;margin-bottom:3px;">{esc(node["name"])}</div>'
+                    f'<div>{badges}</div></div>'
+                    f'<div><div style="font-size:7px;color:#444;">TYPE</div><div style="font-size:10px;color:{color};font-weight:700;">{node["type"]}</div></div>'
+                    f'<div><div style="font-size:7px;color:#444;">GATE</div><div style="font-size:10px;color:{gc};font-weight:700;">{node["gate"]}</div></div>'
+                    f'<div><div style="font-size:7px;color:#444;">CALC VALUE</div>'
+                    f'<div style="font-size:11px;color:{val_color};font-weight:700;font-family:monospace;">{val}{pin_icon}</div>'
+                    f'{tgt_row}</div>'
+                    f'<div><div style="font-size:8px;color:#444;">&#8593; {pnames}</div>'
+                    f'<div style="font-size:8px;color:#333;margin-top:2px;">&#8595; {cnames}</div></div>'
+                    f'</div></div>'
+                )
+                st.markdown(html_block, unsafe_allow_html=True)
 
 # ── TAB 5: SEARCH ─────────────────────────────────────────────────────────
 with tab_search:
@@ -2060,38 +2005,40 @@ with tab_search:
                 lq in n["gate"].lower() or lq in fmt(n.get("calculatedValue")).lower() or
                 lq in (n.get("nodeId","")).lower() or lq in (n.get("ftLabel","")).lower()
             )]
-            st.markdown(f"<div style='font-size:10px;color:#ff8c42;margin-bottom:8px;'>{len(matches)} result(s) for <b>\"{sq}\"</b></div>", unsafe_allow_html=True)
+            st.markdown(f"<div style='font-size:10px;color:#ff8c42;margin-bottom:8px;'>{len(matches)} result(s) for <b>\"{esc(sq)}\"</b></div>", unsafe_allow_html=True)
             for node in matches:
                 color    = LEVEL_COLORS.get(node["type"], "#7e57c2")
                 gc       = "#4fc3f7" if node["gate"] == "OR" else "#ffb74d"
                 val      = fmt(node.get("calculatedValue"))
                 node_id  = node.get("nodeId", node["id"])
-                pnames   = " · ".join(by_id[p]["name"] for p in (node.get("parentIds") or []) if p in by_id) or "—"
-                cnames   = " · ".join(n["name"] for n in nodes if node["id"] in (n.get("parentIds") or [])) or "—"
+                pnames   = esc(" · ".join(by_id[p]["name"] for p in (node.get("parentIds") or []) if p in by_id) or "—")
+                cnames   = esc(" · ".join(n["name"] for n in nodes if node["id"] in (n.get("parentIds") or [])) or "—")
                 is_shared = len(node.get("parentIds") or []) > 1
                 is_pinned = node.get("fixedValue") is not None
                 val_color = "#e94560" if is_pinned else color
-                display_name = node["name"]
+                display_name = esc(node["name"])
                 try:
-                    idx = display_name.lower().index(lq)
-                    display_name = (display_name[:idx] +
-                        f'<span style="background:#f5c518;color:#111;border-radius:2px;padding:0 2px;">{display_name[idx:idx+len(lq)]}</span>' +
-                        display_name[idx+len(lq):])
+                    idx = node["name"].lower().index(lq)
+                    raw = node["name"]
+                    display_name = (esc(raw[:idx]) +
+                        f'<span style="background:#f5c518;color:#111;border-radius:2px;padding:0 2px;">{esc(raw[idx:idx+len(lq)])}</span>' +
+                        esc(raw[idx+len(lq):]))
                 except ValueError:
                     pass
-                st.markdown(f"""
-                <div style="background:#141414;border:2px solid {color}44;border-radius:6px;padding:9px 14px;margin-bottom:5px;">
-                  <div style="display:grid;grid-template-columns:2.5fr 0.7fr 0.7fr 1.5fr 2fr;gap:10px;align-items:start;">
-                    <div><div style="font-weight:700;font-size:11px;color:#ddd;">{display_name}</div>
-                      <code style="font-size:9px;color:{color};">{node_id}</code>
-                      {'<span style="background:#f5c518;color:#111;font-size:7px;padding:0 3px;border-radius:3px;margin-left:4px;">SHR</span>' if is_shared else ''}
-                    </div>
-                    <div><div style="font-size:7px;color:#444;">TYPE</div><div style="font-size:10px;color:{color};font-weight:700;">{node['type']}</div></div>
-                    <div><div style="font-size:7px;color:#444;">GATE</div><div style="font-size:10px;color:{gc};font-weight:700;">{node['gate']}</div></div>
-                    <div><div style="font-size:7px;color:#444;">VALUE</div><div style="font-size:11px;color:{val_color};font-weight:700;font-family:monospace;">{val}{'📌' if is_pinned else ''}</div></div>
-                    <div><div style="font-size:8px;color:#444;">↑ {pnames}</div><div style="font-size:8px;color:#333;">↓ {cnames}</div></div>
-                  </div>
-                </div>""", unsafe_allow_html=True)
+                shr_badge = '<span style="background:#f5c518;color:#111;font-size:7px;padding:0 3px;border-radius:3px;margin-left:4px;">SHR</span>' if is_shared else ""
+                pin_icon  = "&#128204;" if is_pinned else ""
+                html_block = (
+                    f'<div style="background:#141414;border:2px solid {color}44;border-radius:6px;padding:9px 14px;margin-bottom:5px;">'
+                    f'<div style="display:grid;grid-template-columns:2.5fr 0.7fr 0.7fr 1.5fr 2fr;gap:10px;align-items:start;">'
+                    f'<div><div style="font-weight:700;font-size:11px;color:#ddd;">{display_name}</div>'
+                    f'<code style="font-size:9px;color:{color};">{esc(node_id)}</code>{shr_badge}</div>'
+                    f'<div><div style="font-size:7px;color:#444;">TYPE</div><div style="font-size:10px;color:{color};font-weight:700;">{node["type"]}</div></div>'
+                    f'<div><div style="font-size:7px;color:#444;">GATE</div><div style="font-size:10px;color:{gc};font-weight:700;">{node["gate"]}</div></div>'
+                    f'<div><div style="font-size:7px;color:#444;">VALUE</div><div style="font-size:11px;color:{val_color};font-weight:700;font-family:monospace;">{val}{pin_icon}</div></div>'
+                    f'<div><div style="font-size:8px;color:#444;">&#8593; {pnames}</div><div style="font-size:8px;color:#333;">&#8595; {cnames}</div></div>'
+                    f'</div></div>'
+                )
+                st.markdown(html_block, unsafe_allow_html=True)
         else:
             for level in DISPLAY_ORDER:
                 lvl_nodes = by_level[level]
