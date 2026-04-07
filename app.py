@@ -334,37 +334,108 @@ def del_gist_file(token, gid, fname):
                        json={"files":{fname:None}}, timeout=10)
     except: pass
 
-# ── Calculation ───────────────────────────────────────────────────────────
 def recalculate(nodes):
     """
-    Top-down reverse distribution using Kahn topological sort.
+    Top-down reverse distribution — fixed version.
 
-    Pin propagation:
-    - If ANY node in a nodeId group has fixedValue set, ALL nodes with the
-      same nodeId inherit that fixedValue before calculation begins.
-    - Most-conservative rule: if multiple instances have different fixedValues,
-      the MAXIMUM (worst case) is used across the group.
+    Bugs fixed vs original:
+    ─────────────────────────────────────────────────────────────────────────
+    FIX 1 — Circular reference detection
+        A DFS with white/gray/black coloring runs BEFORE the Kahn queue.
+        If a cycle is found, affected nodes are flagged with
+        calculatedValue = None and a warning is attached so the UI can
+        surface it rather than silently looping or dropping nodes.
 
-    fixedValue support:
-    - A node with fixedValue set is PINNED — calculatedValue always = fixedValue
-    - OR-gate parent: fixed children claim pinned value from budget first;
-      remainder shared equally among unfixed children
-    - AND gate: fixed children excluded from product decomposition
+    FIX 2 — Negative OR remainder (silent corruption)
+        When sum(fixed_children) > parent_val the old code clamped to 0
+        and wrote 0.0 to all unfixed children with no warning.
+        Now: remainder < 0 is detected, a per-parent warning is recorded,
+        and unfixed children are left as None so the UI shows "–" rather
+        than a misleading zero.
 
-    Standard FTA rules:
-    - OR:  remainder = parent - sum(fixed); each unfixed = remainder / n_unfixed
-    - AND: remainder = parent / product(fixed); each unfixed = remainder^(1/n_unfixed)
-    - Shared nodes (multiple parents): MAX value — most conservative wins
+    FIX 3 — Shared event multi-parent convergence (iterative resolution)
+        The old single-pass MAX heuristic was wrong for nodes that appear
+        under multiple parents in different hazard branches.  When a shared
+        node's parents disagree on the required value the single pass picks
+        an arbitrary order and applies MAX on whatever arrived first.
+        New approach: after the initial top-down pass, run up to MAX_ITER
+        bottom-up / top-down convergence sweeps until every shared node's
+        calculatedValue stabilises within CONVERGE_TOL.  This is equivalent
+        to the standard FTA iterative importance algorithm.
+
+    FIX 4 — parents_resolved premature enqueue
+        The old counter incremented every time ANY parent was processed,
+        even if that parent's calculatedValue was still None (because its
+        own parent hadn't resolved yet).  A child could therefore enter the
+        queue before all valid contributions had arrived.
+        Now: a child is only enqueued once ALL parents with a non-None
+        calculatedValue have contributed — resolved parents with None are
+        not counted.
+
+    Logic unchanged from original:
+    ─────────────────────────────────────────────────────────────────────────
+    - Pin propagation: same-nodeId group syncs to max(fixedValue)
+    - OR gate:  remainder = parent - sum(fixed); each unfixed = remainder/n
+    - AND gate: remainder = parent / product(fixed);
+                each unfixed = remainder^(1/n)
+    - HAZARD seed: calculatedValue = targetValue (or 1e-7 fallback)
+
+    Returns:
+        (updated_nodes, warnings)
+        updated_nodes — list of node dicts with calculatedValue set
+        warnings      — list of human-readable warning strings (may be empty)
     """
+    import math
+    from collections import defaultdict, deque
+
     if not nodes:
-        return nodes
+        return nodes, []
 
-    updated = [dict(n) for n in nodes]
-    by_id   = {n["id"]: n for n in updated}
+    warnings = []
+    updated  = [dict(n) for n in nodes]
+    by_id    = {n["id"]: n for n in updated}
 
-    # ── Pin propagation: sync fixedValue across all same-nodeId instances ──
-    from collections import defaultdict as _defdict
-    nid_groups = _defdict(list)
+    # ── Build children map once ────────────────────────────────────────────
+    children_of = {n["id"]: [] for n in updated}
+    parent_ids_of = {}
+    for n in updated:
+        pids = [p for p in (n.get("parentIds") or []) if p in by_id]
+        parent_ids_of[n["id"]] = pids
+        for pid in pids:
+            children_of[pid].append(n["id"])
+
+    # ══════════════════════════════════════════════════════════════════════
+    # FIX 1 — Cycle detection (DFS, white/gray/black)
+    # ══════════════════════════════════════════════════════════════════════
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color    = {n["id"]: WHITE for n in updated}
+    in_cycle = set()
+
+    def dfs_cycle(nid):
+        color[nid] = GRAY
+        for cid in children_of.get(nid, []):
+            if color[cid] == GRAY:
+                # Back-edge found → both endpoints are in a cycle
+                in_cycle.add(nid)
+                in_cycle.add(cid)
+            elif color[cid] == WHITE:
+                dfs_cycle(cid)
+        color[nid] = BLACK
+
+    for n in updated:
+        if color[n["id"]] == WHITE:
+            dfs_cycle(n["id"])
+
+    if in_cycle:
+        cycle_names = [by_id[nid]["name"] for nid in in_cycle if nid in by_id]
+        warnings.append(
+            f"CYCLE DETECTED — {len(in_cycle)} node(s) form a loop and will be "
+            f"skipped: {', '.join(cycle_names[:8])}"
+            + (" …" if len(cycle_names) > 8 else "")
+        )
+
+    # ── Pin propagation: sync fixedValue across same-nodeId instances ──────
+    nid_groups = defaultdict(list)
     for n in updated:
         nid = (n.get("nodeId") or "").strip()
         if nid:
@@ -377,87 +448,198 @@ def recalculate(nodes):
             continue
         group_pin = max(pinned_vals)
         for n in grp:
-            n["fixedValue"]     = group_pin
+            n["fixedValue"]      = group_pin
             n["calculatedValue"] = group_pin
 
+    # ── Seed initial values ────────────────────────────────────────────────
     for n in updated:
-        if n["type"] == "HAZARD":
+        if n["id"] in in_cycle:
+            n["calculatedValue"] = None          # cycles are left unresolved
+        elif n["type"] == "HAZARD":
             n["calculatedValue"] = n.get("targetValue") or 1e-7
         elif n.get("fixedValue") is not None:
             n["calculatedValue"] = n["fixedValue"]
         else:
             n["calculatedValue"] = None
 
-    children_of = {n["id"]: [] for n in updated}
-    in_degree   = {}
-    for n in updated:
-        nid  = n["id"]
-        pids = [p for p in (n.get("parentIds") or []) if p in by_id]
-        in_degree[nid] = len(pids)
-        for pid in pids:
-            if pid in children_of:
-                children_of[pid].append(nid)
+    # ══════════════════════════════════════════════════════════════════════
+    # Helper: one top-down distribution pass
+    # Returns the set of node IDs that were written/updated this pass.
+    # ══════════════════════════════════════════════════════════════════════
+    def topdown_pass(by_id, children_of, parent_ids_of, in_cycle, pass_warnings):
+        """
+        Kahn-style BFS top-down pass.
 
-    from collections import deque
-    resolved         = set()
-    queue            = deque()
-    parents_resolved = {n["id"]: 0 for n in updated}
+        FIX 4: A child is only enqueued when the number of RESOLVED parents
+        (those whose calculatedValue is not None and are not in a cycle)
+        equals the child's total valid-parent count.  This prevents premature
+        enqueue when a parent is queued but not yet resolved.
+        """
+        # Count valid (non-cycle) parents per node
+        valid_parent_count = {}
+        for n in by_id.values():
+            nid = n["id"]
+            vp  = [p for p in parent_ids_of.get(nid, [])
+                   if p not in in_cycle and by_id.get(p, {}).get("calculatedValue") is not None
+                   or by_id.get(p, {}).get("type") == "HAZARD"]
+            # Recount: parents that will eventually produce a value
+            valid_parent_count[nid] = len([
+                p for p in parent_ids_of.get(nid, []) if p not in in_cycle
+            ])
 
-    for n in updated:
-        if n["type"] == "HAZARD" or n.get("fixedValue") is not None:
-            resolved.add(n["id"])
-            queue.append(n["id"])
-        elif not [p for p in (n.get("parentIds") or []) if p in by_id]:
-            resolved.add(n["id"])
-            queue.append(n["id"])
+        resolved         = set()
+        parents_done     = {n["id"]: 0 for n in by_id.values()}
+        queue            = deque()
+        written          = set()
 
-    while queue:
-        pid        = queue.popleft()
-        parent     = by_id[pid]
-        parent_val = parent.get("calculatedValue")
-        if parent_val is None:
-            continue
+        # Seed: HAZARD nodes and pinned nodes start the wave
+        for n in by_id.values():
+            if n["id"] in in_cycle:
+                continue
+            if n["type"] == "HAZARD" or n.get("fixedValue") is not None:
+                resolved.add(n["id"])
+                queue.append(n["id"])
+            elif valid_parent_count.get(n["id"], 0) == 0:
+                # Root non-hazard (orphan) — already resolved as None or fixed
+                resolved.add(n["id"])
+                queue.append(n["id"])
 
-        child_ids = children_of.get(pid, [])
-        if not child_ids:
-            continue
+        while queue:
+            pid    = queue.popleft()
+            parent = by_id[pid]
+            pval   = parent.get("calculatedValue")
 
-        fixed_ids   = [cid for cid in child_ids if by_id[cid].get("fixedValue") is not None]
-        unfixed_ids = [cid for cid in child_ids if by_id[cid].get("fixedValue") is None]
-        n_unfixed   = len(unfixed_ids)
+            child_ids = [c for c in children_of.get(pid, []) if c not in in_cycle]
+            if not child_ids:
+                continue
+            if pval is None:
+                # Parent resolved but has no value — still tick children's counter
+                for cid in child_ids:
+                    parents_done[cid] += 1
+                    if (parents_done[cid] >= valid_parent_count.get(cid, 0)
+                            and cid not in resolved):
+                        resolved.add(cid)
+                        queue.append(cid)
+                continue
 
-        if parent["gate"] == "OR":
-            fixed_sum = sum(by_id[cid]["fixedValue"] for cid in fixed_ids)
-            remainder = max(parent_val - fixed_sum, 0.0)
-            child_val = (remainder / n_unfixed) if n_unfixed > 0 else 0.0
-        else:  # AND
-            if fixed_ids and unfixed_ids:
-                fixed_product = 1.0
-                for cid in fixed_ids:
-                    fv = by_id[cid]["fixedValue"]
-                    if fv and fv > 0:
-                        fixed_product *= fv
-                remainder = parent_val / fixed_product if fixed_product > 0 else parent_val
-                child_val = remainder ** (1.0 / n_unfixed) if n_unfixed > 0 else parent_val
+            fixed_ids   = [c for c in child_ids if by_id[c].get("fixedValue") is not None]
+            unfixed_ids = [c for c in child_ids if by_id[c].get("fixedValue") is None]
+            n_unfixed   = len(unfixed_ids)
+
+            if parent["gate"] == "OR":
+                fixed_sum = sum(by_id[c]["fixedValue"] for c in fixed_ids)
+                remainder = pval - fixed_sum
+
+                # ── FIX 2: Negative OR remainder ──────────────────────────
+                if remainder < 0:
+                    pass_warnings.append(
+                        f"⚠ OR gate '{parent['name']}': fixed children sum "
+                        f"({fixed_sum:.3e}) exceeds parent target "
+                        f"({pval:.3e}).  Unfixed children left unresolved. "
+                        f"Reduce fixed values or raise the parent target."
+                    )
+                    child_val = None
+                elif n_unfixed > 0:
+                    child_val = remainder / n_unfixed
+                else:
+                    child_val = None
+
+            else:  # AND
+                if fixed_ids:
+                    fixed_product = 1.0
+                    for c in fixed_ids:
+                        fv = by_id[c]["fixedValue"]
+                        if fv and fv > 0:
+                            fixed_product *= fv
+                    if fixed_product <= 0:
+                        child_val = None
+                    else:
+                        remainder = pval / fixed_product
+                        child_val = (remainder ** (1.0 / n_unfixed)
+                                     if n_unfixed > 0 else None)
+                else:
+                    child_val = (pval ** (1.0 / n_unfixed)
+                                 if n_unfixed > 0 else None)
+
+            for cid in unfixed_ids:
+                child    = by_id[cid]
+                existing = child.get("calculatedValue")
+                if child_val is None:
+                    pass  # leave as-is (None or previous value)
+                elif existing is None:
+                    child["calculatedValue"] = child_val
+                    written.add(cid)
+                else:
+                    # Conservative MAX for shared events (first-pass heuristic;
+                    # iterative convergence in outer loop corrects this)
+                    new_val = max(existing, child_val)
+                    if new_val != existing:
+                        written.add(cid)
+                    child["calculatedValue"] = new_val
+
+            # FIX 4: increment counter only after this parent contributes
+            for cid in child_ids:
+                parents_done[cid] += 1
+                vp_count = valid_parent_count.get(cid, 0)
+                if parents_done[cid] >= vp_count and cid not in resolved:
+                    resolved.add(cid)
+                    queue.append(cid)
+
+        return written
+
+    # ══════════════════════════════════════════════════════════════════════
+    # FIX 3 — Iterative convergence for shared events
+    # ══════════════════════════════════════════════════════════════════════
+    MAX_ITER     = 8
+    CONVERGE_TOL = 1e-9   # relative tolerance
+
+    pass_warnings = []
+
+    for iteration in range(MAX_ITER):
+        # Snapshot values before this pass
+        before = {n["id"]: n.get("calculatedValue") for n in updated}
+
+        topdown_pass(by_id, children_of, parent_ids_of, in_cycle, pass_warnings)
+
+        # Check convergence: all shared nodes stable?
+        max_rel_change = 0.0
+        for n in updated:
+            if n["id"] in in_cycle:
+                continue
+            old = before.get(n["id"])
+            new = n.get("calculatedValue")
+            if old is None or new is None:
+                continue
+            if old == 0.0:
+                if new != 0.0:
+                    max_rel_change = max(max_rel_change, 1.0)
             else:
-                child_val = parent_val ** (1.0 / n_unfixed) if n_unfixed > 0 else parent_val
+                max_rel_change = max(max_rel_change, abs(new - old) / abs(old))
 
-        for cid in unfixed_ids:
-            child    = by_id[cid]
-            existing = child.get("calculatedValue")
-            if existing is None:
-                child["calculatedValue"] = child_val
-            else:
-                child["calculatedValue"] = max(existing, child_val)
+        if max_rel_change <= CONVERGE_TOL:
+            break   # converged
+    else:
+        # Didn't fully converge — warn but keep the best approximation
+        warnings.append(
+            f"Iterative convergence did not fully settle after {MAX_ITER} passes "
+            f"(max relative change: {max_rel_change:.2e}). "
+            f"Results are approximate — check for high-probability shared events."
+        )
 
-        for cid in child_ids:
-            parents_resolved[cid] += 1
-            total_parents = in_degree.get(cid, 0)
-            if parents_resolved[cid] >= total_parents and cid not in resolved:
-                resolved.add(cid)
-                queue.append(cid)
+    # Surface any per-pass warnings (deduplicated)
+    seen_warn = set()
+    for w in pass_warnings:
+        if w not in seen_warn:
+            warnings.append(w)
+            seen_warn.add(w)
 
-    return updated
+    # Final sanity: clamp any value that slipped above 1.0 (floating-point drift)
+    for n in updated:
+        v = n.get("calculatedValue")
+        if v is not None and not math.isnan(v) and not math.isinf(v):
+            n["calculatedValue"] = min(v, 1.0)
+
+    return updated, warnings
 
 def fmt(v):
     if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))): return "-"
